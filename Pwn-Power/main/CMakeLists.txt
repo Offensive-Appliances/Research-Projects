@@ -1,0 +1,12 @@
+idf_component_register(
+    SRCS 
+        "pwnpower.c" 
+        "web_server.c" 
+        "wifi_scan.c" 
+        "index_content.c"
+        "deauth.c"
+        "handshake.c"
+        "ota.c"
+    INCLUDE_DIRS 
+        "."
+)
