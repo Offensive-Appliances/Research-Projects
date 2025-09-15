@@ -12,7 +12,7 @@ This firmware is a simple Scanner with Deauth and Handshake Capture built using 
 2. Select esp32 c3 as target, requires preview verison `idf.py --preview set-target esp32c3`
 3. Place firmware files in the `/main` directory of your project. (Replace the CMakeLists file that is auto generated with new one)
 4. Build the firmware `idf.py build`
-5. Flash Firmware to C5 `idf.py flash` 
+5. Flash Firmware to C3 `idf.py flash` 
 
 if you experience issues during this process, try `idf.py fullclean` and restart. 
 
