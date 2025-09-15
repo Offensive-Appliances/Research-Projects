@@ -1,6 +1,8 @@
 # PwnPower
 
-This firmware is a simple Scanner with Deauth and Handshake Capture built using ESP-IDF, made for the ESP32C3 chip.
+This firmware is a simple Scanner with Deauth and Handshake Capture built using ESP-IDF, made for the ESP32C3 chip. Designed to be implanted within a generic smart plug 
+
+<img width="1041" height="923" alt="image" src="https://github.com/user-attachments/assets/bd8689c5-099e-4823-996c-361ee6689f9f" />
 
 
 ## Requriments 
