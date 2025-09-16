@@ -1,4 +1,0 @@
-# Add directories or file patterns to ignore during indexing (e.g. foo/ or *.csv)
-build/
-.cache/
-ESP32-C5-WiFi-Scanner-main/

@@ -1,4 +1,4 @@
 /build
 checks.json
 sdkconfig.old
-sdkconfig
+.cursorignore
