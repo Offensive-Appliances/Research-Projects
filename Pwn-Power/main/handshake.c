@@ -29,6 +29,16 @@ static uint8_t s_hs_count = 0;
 static uint8_t s_hs_insert_idx = 0;
 static uint32_t s_handshake_pairs = 0;
 static bool s_capture_all = false;
+
+typedef struct {
+    uint8_t bssid[6];
+    int channel;
+    uint32_t timestamp;
+    int eapol_count;
+    bool is_auto;
+    bool valid;
+} capture_record_t;
+static capture_record_t s_current_capture = {0};
 static bool hs_addr_eq(const uint8_t *a, const uint8_t *b){ return memcmp(a,b,6)==0; }
 static void hs_process_candidate(const uint8_t *ap,const uint8_t *sta,uint16_t replay,bool from_ap){
     for(uint8_t i=0;i<s_hs_count;i++){
@@ -265,6 +275,16 @@ esp_err_t start_handshake_capture(uint8_t bssid[6], int channel, int duration_se
 
     if (eapol_count_out) *eapol_count_out = s_eapol_count;
     ESP_LOGI(TAG, "Captured %d EAPOL frames, mgmt written %lu, pcap bytes %u", s_eapol_count, (unsigned long)s_mgmt_written, (unsigned int)s_pcap_len);
+    
+    if (s_eapol_count > 0 || s_pcap_len > 100) {
+        memcpy(s_current_capture.bssid, bssid, 6);
+        s_current_capture.channel = channel;
+        s_current_capture.timestamp = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+        s_current_capture.eapol_count = s_eapol_count;
+        s_current_capture.is_auto = false;
+        s_current_capture.valid = true;
+    }
+    
     return ESP_OK;
 }
 
@@ -309,4 +329,29 @@ esp_err_t start_general_capture(int channel, int duration_seconds) {
     return ESP_OK;
 }
 
+const char* handshake_get_history_json(void) {
+    static char json_buf[256];
+    
+    if (!s_current_capture.valid) {
+        snprintf(json_buf, sizeof(json_buf), "[]");
+        return json_buf;
+    }
+    
+    capture_record_t *r = &s_current_capture;
+    snprintf(json_buf, sizeof(json_buf),
+        "[{\"bssid\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"channel\":%d,\"timestamp\":%lu,\"eapol\":%d,\"auto\":%s}]",
+        r->bssid[0], r->bssid[1], r->bssid[2], r->bssid[3], r->bssid[4], r->bssid[5],
+        r->channel, (unsigned long)r->timestamp, r->eapol_count, r->is_auto ? "true" : "false");
+    return json_buf;
+}
 
+void handshake_record_auto_capture(uint8_t bssid[6], int channel, int eapol_count) {
+    if (eapol_count <= 0) return;
+    
+    memcpy(s_current_capture.bssid, bssid, 6);
+    s_current_capture.channel = channel;
+    s_current_capture.timestamp = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    s_current_capture.eapol_count = eapol_count;
+    s_current_capture.is_auto = true;
+    s_current_capture.valid = true;
+}

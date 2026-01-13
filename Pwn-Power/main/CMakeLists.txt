@@ -3,10 +3,31 @@ idf_component_register(
         "pwnpower.c" 
         "web_server.c" 
         "wifi_scan.c" 
-        "index_content.c"
+        "web_content.c"
         "deauth.c"
         "handshake.c"
         "ota.c"
+        "scan_storage.c"
+        "background_scan.c"
+        "ap_config.c"
+        "mdns_service.c"
+        "sta_config.c"
+        "idle_scanner.c"
+        "ouis.c"
     INCLUDE_DIRS 
         "."
+    EMBED_FILES
+        "ouis.json"
+    REQUIRES 
+        mdns 
+        esp_wifi 
+        esp_http_server 
+        esp_http_client
+        nvs_flash 
+        app_update 
+        spi_flash
+        esp_partition
+        json
+        esp_timer
+        esp_driver_gpio
 )

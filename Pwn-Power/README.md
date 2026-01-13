@@ -1,36 +1,71 @@
 # PwnPower
 
-This firmware is a simple Scanner with Deauth and Handshake Capture built using ESP-IDF, made for the ESP32C3 chip. Designed to be implanted within a generic smart plug
+ESP32-C3 WiFi security audit tool with scanning, deauth attacks, handshake capture, and passive monitoring.
+All controlled via a modern web interface.
 
+## Features
 
-<table>
-  <tr>
-    <td><img src="https://github.com/user-attachments/assets/84c9a226-a1a1-460b-84f6-27a603e7ef45" width="300"/></td>
-    <td><img src="https://github.com/user-attachments/assets/bd8689c5-099e-4823-996c-361ee6689f9f" width="300"/></td>
-  </tr>
-</table>
+### Scanning & Recon
+- WiFi network scanning with vendor identification
+- Station/client detection via promiscuous mode
+- Hidden SSID detection and revelation
+- Deauth frame detection and channel analysis
+- Device tracking with timestamps
 
+### Attacks & Capture
+- Targeted deauthentication attacks
+- Handshake capture with PCAP download
+- Auto handshake capture (smart targeting)
+- Vulnerable network scoring
 
+### Connectivity
+- Configurable AP with WPA2/WPA3 support
+- Station mode with auto-reconnect
+- mDNS support (`pwnpower.local`)
+- NTP time sync
 
-## Requriments 
+### Other
+- Background scanning with flash storage
+- CSV report generation
+- Smart plug GPIO control
+- OTA firmware updates
+- Modern responsive web UI
+
+## Requirements 
 - ESP-IDF v5.5 or newer
-- ESP32C3
+- ESP32-C3
 
-## Build and Flash Instructions 
-1. Create new esp-idf project 
-2. Select esp32 c3 as target, requires preview verison `idf.py --preview set-target esp32c3`
-3. Place firmware files in the `/main` directory of your project. (Replace the CMakeLists file that is auto generated with new one)
-4. Build the firmware `idf.py build`
-5. Flash Firmware to C3 `idf.py flash` 
+## Build and Flash
+```bash
+idf.py set-target esp32c3
+idf.py build
+idf.py flash
+```
 
-if you experience issues during this process, try `idf.py fullclean` and restart. 
+If you experience issues, try `idf.py fullclean` first.
 
+## Usage
 
-## Post flash instructions
-Once your device is flashed and booted, it will host a wifi AP by the name of `PwnPower`.
-By default, the password is `password` if you wish to change this, you can modify the AP name and AP password on lines `15` & `16`
+### Direct AP Connection
+1. Connect to the `PwnPower` WiFi network (default password: `password`)
+2. Open `192.168.4.1` in your browser
 
-once connected to the pwnpower ap, open a web browser and navigate to `192.168.4.1` and click/touch `wifi recon`. info updates every 8 seconds. 
+### Home Network Connection (mDNS)
+1. Connect to PwnPower AP and open the web UI
+2. Go to **Network Connection** section
+3. Enter your home WiFi credentials and click Connect
+4. Once connected, access via `http://pwnpower.local` from any device on your network
+
+### Changing AP Settings
+The AP SSID and password can be changed from the web UI under **AP Settings**. Changes persist across reboots.
+
+## Web Interface
+The interface is split into separate files for easier development:
+- `interface/index_new.html` - HTML structure
+- `interface/styles.css` - CSS styling
+- `interface/app.js` - JavaScript functionality
+
+Run `python interface/convert_multi.py` to regenerate the C arrays after modifying the UI. 
 
 
 ## NOTICE 

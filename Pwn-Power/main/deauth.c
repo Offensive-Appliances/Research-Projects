@@ -15,7 +15,7 @@
 void wifi_deauth_task(void *param);
 
 int ieee80211_raw_frame_sanity_check(const void *frame, int len) {
-    return 0;
+  return 0; // don't give a fuck, screw you espressif
 }
 
 static const uint8_t deauth_packet_template[26] = { 

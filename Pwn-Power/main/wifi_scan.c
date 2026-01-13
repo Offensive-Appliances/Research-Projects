@@ -1,17 +1,20 @@
-#include "freertos/FreeRTOS.h"  // ADD THIS FIRST TO SATISFY DEPENDENCIES
+#include "freertos/FreeRTOS.h"
 #include "wifi_scan.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
-#include "esp_wifi_types.h"  // contains wifi_ieee80211_mac_hdr_t
+#include "esp_wifi_types.h"
 #include "freertos/semphr.h"
 #include "cJSON.h"
-#include "sdkconfig.h"  // add this FIRST before freertos
+#include "sdkconfig.h"
+#include "ouis.h"
+#include "scan_storage.h"
 
 #define TAG "WiFi_Scan"
-#define MAX_JSON_SIZE 2048  // Increased size to accommodate the new JSON structure
+#define MAX_JSON_SIZE 8192  // Increased size to accommodate the new JSON structure
 #define MAX_STATIONS 50
 
 static char scan_results_json[MAX_JSON_SIZE]; // Buffer for JSON results
@@ -20,11 +23,28 @@ static SemaphoreHandle_t stations_mutex = NULL;
 static volatile size_t stations_count = 0;
 static bool scan_in_progress = false;
 static bool new_results_available = false;
+static volatile bool station_scan_active = false;
 static SemaphoreHandle_t scan_mutex = NULL;
 static uint8_t known_ap_bssids[100][6];
 static uint8_t known_ap_channels[64];
 static int known_ap_count = 0;
 static int known_channel_count = 0;
+
+static volatile uint32_t s_deauth_count = 0;
+static volatile uint32_t s_deauth_last_seen = 0;
+static volatile uint32_t s_hidden_ap_count = 0;
+
+#define MAX_HIDDEN_APS 16
+typedef struct {
+    uint8_t bssid[6];
+    uint8_t channel;
+    char ssid[33];
+    uint32_t first_seen;
+    uint8_t probe_attempts;
+    bool revealed;
+} hidden_ap_t;
+static hidden_ap_t s_hidden_aps[MAX_HIDDEN_APS];
+static int s_hidden_ap_idx = 0;
 
 // Define 2.4 GHz and 5 GHz channels
 const uint8_t dual_band_channels[] = {
@@ -127,13 +147,43 @@ void wifi_scan() {
             cJSON_AddItemToArray(rows, cJSON_CreateObject());
             continue;
         }
+        uint32_t now_sec = (uint32_t)(esp_timer_get_time() / 1000000ULL);
         for (int j = 0; j < ap_count; j++) {
+            bool is_hidden = (ap_records[j].ssid[0] == '\0');
+            if (is_hidden) {
+                s_hidden_ap_count++;
+                bool found = false;
+                for (int h = 0; h < s_hidden_ap_idx && h < MAX_HIDDEN_APS; h++) {
+                    if (memcmp(s_hidden_aps[h].bssid, ap_records[j].bssid, 6) == 0) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found && s_hidden_ap_idx < MAX_HIDDEN_APS) {
+                    memcpy(s_hidden_aps[s_hidden_ap_idx].bssid, ap_records[j].bssid, 6);
+                    s_hidden_aps[s_hidden_ap_idx].channel = scan_config.channel;
+                    s_hidden_aps[s_hidden_ap_idx].ssid[0] = '\0';
+                    s_hidden_aps[s_hidden_ap_idx].first_seen = now_sec;
+                    s_hidden_aps[s_hidden_ap_idx].probe_attempts = 0;
+                    s_hidden_aps[s_hidden_ap_idx].revealed = false;
+                    s_hidden_ap_idx++;
+                }
+            }
+            
             cJSON *ap_entry = cJSON_CreateObject();
             cJSON_AddStringToObject(ap_entry, "SSID", (char*)ap_records[j].ssid);
             cJSON_AddStringToObject(ap_entry, "MAC", mac_to_str(ap_records[j].bssid));
             cJSON_AddNumberToObject(ap_entry, "Channel", scan_config.channel);
+            cJSON_AddNumberToObject(ap_entry, "RSSI", ap_records[j].rssi);
             cJSON_AddStringToObject(ap_entry, "Security", get_security_type(ap_records[j].authmode));
             cJSON_AddStringToObject(ap_entry, "Band", get_band(scan_config.channel));
+            cJSON_AddNumberToObject(ap_entry, "last_seen", now_sec);
+            cJSON_AddBoolToObject(ap_entry, "hidden", is_hidden);
+            
+            char vendor[48] = "Unknown";
+            ouis_lookup_vendor(ap_records[j].bssid, vendor, sizeof(vendor));
+            cJSON_AddStringToObject(ap_entry, "Vendor", vendor);
+            
             cJSON_AddItemToArray(rows, ap_entry);
             bool exists = false;
             for(int k=0;k<known_ap_count;k++){ if(memcmp(known_ap_bssids[k], ap_records[j].bssid, 6)==0){ exists=true; break; } }
@@ -150,6 +200,45 @@ void wifi_scan() {
     wifi_scan_stations();
     const char *station_json = wifi_scan_get_station_results();
     cJSON *station_root = cJSON_Parse(station_json);
+    if (!station_root) {
+        station_root = cJSON_CreateObject();
+    }
+
+    // Update device presence tracking for all found stations
+    cJSON *station_ap_entry = NULL;
+    cJSON_ArrayForEach(station_ap_entry, station_root) {
+        cJSON *stations = cJSON_GetObjectItem(station_ap_entry, "stations");
+        if (stations && cJSON_IsArray(stations)) {
+            cJSON *station = NULL;
+            cJSON_ArrayForEach(station, stations) {
+                cJSON *mac_item = cJSON_GetObjectItem(station, "mac");
+                cJSON *rssi_item = cJSON_GetObjectItem(station, "rssi");
+                if (mac_item && rssi_item) {
+                    // Parse MAC address
+                    uint8_t mac[6];
+                    if (sscanf(mac_item->valuestring, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+                              &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6) {
+                        // Find the corresponding AP entry to get SSID
+                        cJSON *ap_mac_item = cJSON_GetObjectItem(station_ap_entry, "bssid");
+                        if (ap_mac_item) {
+                            // Find AP SSID from the main scan results
+                            cJSON *scan_ap_entry = NULL;
+                            cJSON_ArrayForEach(scan_ap_entry, rows) {
+                                cJSON *scan_mac_item = cJSON_GetObjectItem(scan_ap_entry, "MAC");
+                                if (scan_mac_item && strcmp(scan_mac_item->valuestring, ap_mac_item->valuestring) == 0) {
+                                    cJSON *ssid_item = cJSON_GetObjectItem(scan_ap_entry, "SSID");
+                                    if (ssid_item) {
+                                        scan_storage_update_device_presence(mac, rssi_item->valueint, ssid_item->valuestring);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // merge station data into AP entries
     cJSON *ap_entry = NULL;
@@ -172,9 +261,20 @@ void wifi_scan() {
     // Store results in buffer with mutex protection
     xSemaphoreTake(scan_mutex, portMAX_DELAY);
     char *json_str = cJSON_PrintUnformatted(root);
-    strncpy(scan_results_json, json_str, MAX_JSON_SIZE-1);
-    scan_results_json[MAX_JSON_SIZE-1] = '\0';
-    free(json_str);
+    if (json_str) {
+        size_t json_len = strlen(json_str);
+        if (json_len >= MAX_JSON_SIZE) {
+            ESP_LOGW(TAG, "Scan JSON too large (%u bytes), returning empty result", (unsigned)json_len);
+            strncpy(scan_results_json, "{\"rows\":[]}", MAX_JSON_SIZE - 1);
+            scan_results_json[MAX_JSON_SIZE - 1] = '\0';
+        } else {
+            memcpy(scan_results_json, json_str, json_len + 1);
+        }
+        free(json_str);
+    } else {
+        strncpy(scan_results_json, "{\"rows\":[]}", MAX_JSON_SIZE - 1);
+        scan_results_json[MAX_JSON_SIZE - 1] = '\0';
+    }
     
     scan_in_progress = false;
     new_results_available = true;
@@ -183,6 +283,9 @@ void wifi_scan() {
     // cleanup
     cJSON_Delete(root);
     cJSON_Delete(station_root);
+    
+    // Sync deauth detection results to intelligence system
+    scan_storage_update_security_events(wifi_scan_get_deauth_count());
     
     ESP_LOGI(TAG, "Wi-Fi Scan Completed. Results cached.");
 }
@@ -229,6 +332,75 @@ static void stations_sniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
     uint8_t fc1 = payload[1];
     uint8_t frame_type = (fc0 >> 2) & 0x03;
     uint8_t frame_subtype = (fc0 >> 4) & 0x0F;
+    
+    if (frame_type == 0 && (frame_subtype == 0x0C || frame_subtype == 0x0A)) {
+        s_deauth_count++;
+        s_deauth_last_seen = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+        return;
+    }
+    
+    // Monitor for probe responses (0x0B) that might reveal hidden SSIDs
+    if (frame_type == 0 && frame_subtype == 0x0B) {
+        uint8_t *bssid = payload + 16;
+        uint8_t *frame_body = payload + 24;
+        
+        // Skip fixed parameters (timestamp: 8, beacon interval: 2, capabilities: 2)
+        frame_body += 12;
+        
+        // Parse parameters - look for SSID parameter (ID 0x00)
+        while (frame_body[0] != 0x00 && frame_body[0] != 0xFF && frame_body < payload + pkt->rx_ctrl.sig_len) {
+            uint8_t param_len = frame_body[1];
+            frame_body += 2 + param_len;
+        }
+        
+        if (frame_body[0] == 0x00) {
+            uint8_t ssid_len = frame_body[1];
+            if (ssid_len > 0 && ssid_len < 33) {
+                // Check if this matches any of our hidden APs
+                for (int h = 0; h < s_hidden_ap_idx && h < MAX_HIDDEN_APS; h++) {
+                    if (!s_hidden_aps[h].revealed && memcmp(s_hidden_aps[h].bssid, bssid, 6) == 0) {
+                        memcpy(s_hidden_aps[h].ssid, frame_body + 2, ssid_len);
+                        s_hidden_aps[h].ssid[ssid_len] = '\0';
+                        s_hidden_aps[h].revealed = true;
+                        ESP_LOGI(TAG, "Revealed hidden SSID from client probe: %s", s_hidden_aps[h].ssid);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    
+    // Monitor for association requests (0x00) that reveal hidden SSIDs
+    if (frame_type == 0 && frame_subtype == 0x00) {
+        uint8_t *bssid = payload + 16;
+        uint8_t *frame_body = payload + 24;
+        
+        // Skip fixed parameters
+        frame_body += 2; // Capability info
+        
+        // Parse parameters - look for SSID parameter (ID 0x00)
+        while (frame_body[0] != 0x00 && frame_body[0] != 0xFF && frame_body < payload + pkt->rx_ctrl.sig_len) {
+            uint8_t param_len = frame_body[1];
+            frame_body += 2 + param_len;
+        }
+        
+        if (frame_body[0] == 0x00) {
+            uint8_t ssid_len = frame_body[1];
+            if (ssid_len > 0 && ssid_len < 33) {
+                // Check if this matches any of our hidden APs
+                for (int h = 0; h < s_hidden_ap_idx && h < MAX_HIDDEN_APS; h++) {
+                    if (!s_hidden_aps[h].revealed && memcmp(s_hidden_aps[h].bssid, bssid, 6) == 0) {
+                        memcpy(s_hidden_aps[h].ssid, frame_body + 2, ssid_len);
+                        s_hidden_aps[h].ssid[ssid_len] = '\0';
+                        s_hidden_aps[h].revealed = true;
+                        ESP_LOGI(TAG, "Revealed hidden SSID from client association: %s", s_hidden_aps[h].ssid);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    
     bool to_ds = (fc1 & 0x01) != 0;
     bool from_ds = (fc1 & 0x02) != 0;
     uint8_t *addr1 = payload + 4;
@@ -269,18 +441,46 @@ static void stations_sniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
     xSemaphoreGive(stations_mutex);
 }
 
+bool wifi_scan_is_station_scan_active(void) {
+    return station_scan_active;
+}
+
+void wifi_scan_set_station_scan_active(bool active) {
+    station_scan_active = active;
+}
+
+static void probe_hidden_aps_internal(void);
+
 void wifi_scan_stations() {
     if(!stations_mutex) stations_mutex = xSemaphoreCreateMutex();
     
-    // store original wifi mode
+    station_scan_active = true;
+    
+    // store original wifi mode and connection state
     wifi_mode_t original_mode;
     esp_wifi_get_mode(&original_mode);
     
-    // disable AP if it was active
-    if(original_mode == WIFI_MODE_APSTA) {
-        esp_wifi_set_mode(WIFI_MODE_STA);
-        vTaskDelay(pdMS_TO_TICKS(100)); // let wifi stack adjust
+    bool was_sta_connected = false;
+    wifi_ap_record_t ap_info;
+    if(original_mode == WIFI_MODE_STA || original_mode == WIFI_MODE_APSTA) {
+        was_sta_connected = (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK);
     }
+    
+    // disconnect STA and disable AP to allow free channel switching
+    if(was_sta_connected) {
+        ESP_LOGI(TAG, "Disconnecting STA for station scan");
+        esp_wifi_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+    
+    if(original_mode == WIFI_MODE_APSTA || original_mode == WIFI_MODE_AP) {
+        ESP_LOGI(TAG, "Temporarily disabling AP for station scan");
+        esp_wifi_deauth_sta(0);
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    vTaskDelay(pdMS_TO_TICKS(300));
     
     xSemaphoreTake(stations_mutex, portMAX_DELAY);
     stations_count = 0; // reset for new scan
@@ -327,13 +527,25 @@ void wifi_scan_stations() {
 
     esp_wifi_set_promiscuous(false);
     
-    // restore original mode
-    esp_wifi_set_mode(original_mode);
-    vTaskDelay(pdMS_TO_TICKS(100)); // let AP restart
+    probe_hidden_aps_internal();
+    
+    // restore original mode and reconnect if needed
+    if(original_mode != WIFI_MODE_STA) {
+        ESP_LOGI(TAG, "Restoring original mode");
+        esp_wifi_set_mode(original_mode);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    
+    station_scan_active = false;
+    
+    if(was_sta_connected) {
+        ESP_LOGI(TAG, "Reconnecting STA");
+        esp_wifi_connect();
+    }
 }
 
 const char* wifi_scan_get_station_results() {
-    static char json_output[2048];
+    static char json_output[4096];
     cJSON *root = cJSON_CreateObject();
     
     xSemaphoreTake(stations_mutex, portMAX_DELAY);
@@ -354,25 +566,169 @@ const char* wifi_scan_get_station_results() {
         }
 
         // Add station to AP's list
+        uint32_t now_sec = (uint32_t)(esp_timer_get_time() / 1000000ULL);
         cJSON *station = cJSON_CreateObject();
         cJSON_AddStringToObject(station, "mac", 
             (char*)mac_to_str(stations[i].station_mac));
         cJSON_AddNumberToObject(station, "rssi", stations[i].rssi);
+        cJSON_AddNumberToObject(station, "last_seen", now_sec);
+        
+        char sta_vendor[48] = "Unknown";
+        ouis_lookup_vendor(stations[i].station_mac, sta_vendor, sizeof(sta_vendor));
+        cJSON_AddStringToObject(station, "vendor", sta_vendor);
+        
         cJSON_AddItemToArray(cJSON_GetObjectItem(ap_entry, "stations"), station);
     }
     xSemaphoreGive(stations_mutex);
     
     char *json = cJSON_PrintUnformatted(root);
-    strncpy(json_output, json, sizeof(json_output)-1);
-    free(json);
+    if (json) {
+        size_t json_len = strlen(json);
+        if (json_len >= sizeof(json_output)) {
+            ESP_LOGW(TAG, "Station JSON too large (%u bytes), returning empty result", (unsigned)json_len);
+            strncpy(json_output, "{}", sizeof(json_output) - 1);
+            json_output[sizeof(json_output) - 1] = '\0';
+        } else {
+            memcpy(json_output, json, json_len + 1);
+        }
+        free(json);
+    } else {
+        strncpy(json_output, "{}", sizeof(json_output) - 1);
+        json_output[sizeof(json_output) - 1] = '\0';
+    }
     cJSON_Delete(root);
     
     return json_output;
 }
 
 const char* mac_to_str(const uint8_t *mac) {
-    static char mac_str[18]; // 6 octets * 2 + 5 colons + null
+    static char mac_str[18];
     snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     return mac_str;
+}
+
+uint32_t wifi_scan_get_deauth_count(void) {
+    return s_deauth_count;
+}
+
+uint32_t wifi_scan_get_deauth_last_seen(void) {
+    return s_deauth_last_seen;
+}
+
+void wifi_scan_reset_deauth_count(void) {
+    s_deauth_count = 0;
+}
+
+void wifi_scan_register_hidden_ap(const uint8_t *bssid, uint8_t channel) {
+    if (!bssid || s_hidden_ap_idx >= MAX_HIDDEN_APS) return;
+    
+    for (int h = 0; h < s_hidden_ap_idx; h++) {
+        if (memcmp(s_hidden_aps[h].bssid, bssid, 6) == 0) {
+            return;
+        }
+    }
+    
+    memcpy(s_hidden_aps[s_hidden_ap_idx].bssid, bssid, 6);
+    s_hidden_aps[s_hidden_ap_idx].channel = channel;
+    s_hidden_aps[s_hidden_ap_idx].ssid[0] = '\0';
+    s_hidden_aps[s_hidden_ap_idx].first_seen = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    s_hidden_aps[s_hidden_ap_idx].probe_attempts = 0;
+    s_hidden_aps[s_hidden_ap_idx].revealed = false;
+    s_hidden_ap_idx++;
+}
+
+const char* wifi_scan_get_security_stats_json(void) {
+    static char buf[512];
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    int pos = 0;
+    pos += snprintf(buf + pos, sizeof(buf) - pos, 
+        "{\"deauth_count\":%lu,\"deauth_last_seen\":%lu,\"hidden_aps\":[",
+        (unsigned long)s_deauth_count, 
+        s_deauth_last_seen > 0 ? (unsigned long)(now - s_deauth_last_seen) : 0);
+    
+    for (int i = 0; i < s_hidden_ap_idx && i < MAX_HIDDEN_APS; i++) {
+        if (i > 0) pos += snprintf(buf + pos, sizeof(buf) - pos, ",");
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "{\"bssid\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"first_seen\":%lu,\"revealed\":%s,\"ssid\":\"%s\"}",
+            s_hidden_aps[i].bssid[0], s_hidden_aps[i].bssid[1], s_hidden_aps[i].bssid[2],
+            s_hidden_aps[i].bssid[3], s_hidden_aps[i].bssid[4], s_hidden_aps[i].bssid[5],
+            (unsigned long)s_hidden_aps[i].first_seen,
+            s_hidden_aps[i].revealed ? "true" : "false",
+            s_hidden_aps[i].revealed ? s_hidden_aps[i].ssid : "");
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "],\"hidden_count\":%d}", s_hidden_ap_idx);
+    return buf;
+}
+
+static void probe_hidden_aps_internal(void) {
+    int unrevealed_count = 0;
+    for (int i = 0; i < s_hidden_ap_idx && i < MAX_HIDDEN_APS; i++) {
+        if (!s_hidden_aps[i].revealed && s_hidden_aps[i].probe_attempts < 20) {
+            unrevealed_count++;
+        }
+    }
+    
+    if (unrevealed_count == 0) return;
+    
+    ESP_LOGI(TAG, "Monitoring %d hidden APs for client activity", unrevealed_count);
+    
+    // Enable promiscuous mode to monitor for client activity
+    wifi_promiscuous_filter_t filt = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT
+    };
+    esp_wifi_set_promiscuous_filter(&filt);
+    esp_wifi_set_promiscuous_rx_cb(stations_sniffer);
+    esp_wifi_set_promiscuous(true);
+    
+    // Monitor for 10 seconds to catch client activity
+    vTaskDelay(pdMS_TO_TICKS(10000));
+    
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(NULL);
+    
+    ESP_LOGI(TAG, "Hidden AP monitoring complete");
+}
+
+int wifi_scan_probe_hidden_aps(void) {
+    int revealed_count = 0;
+    int unrevealed_count = 0;
+    
+    for (int i = 0; i < s_hidden_ap_idx && i < MAX_HIDDEN_APS; i++) {
+        if (!s_hidden_aps[i].revealed && s_hidden_aps[i].probe_attempts < 20) {
+            unrevealed_count++;
+        }
+    }
+    
+    if (unrevealed_count == 0) return revealed_count;
+    
+    ESP_LOGI(TAG, "Monitoring %d hidden APs for client activity", unrevealed_count);
+    
+    // Enable promiscuous mode to monitor for client activity
+    wifi_promiscuous_filter_t filt = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT
+    };
+    esp_wifi_set_promiscuous_filter(&filt);
+    esp_wifi_set_promiscuous_rx_cb(stations_sniffer);
+    esp_wifi_set_promiscuous(true);
+    
+    // Monitor for 10 seconds to catch client activity
+    vTaskDelay(pdMS_TO_TICKS(10000));
+    
+    // Count revealed APs and increment monitoring attempts
+    for (int i = 0; i < s_hidden_ap_idx && i < MAX_HIDDEN_APS; i++) {
+        if (s_hidden_aps[i].revealed) {
+            revealed_count++;
+        }
+        // Increment probe attempts to track monitoring attempts
+        if (!s_hidden_aps[i].revealed && s_hidden_aps[i].probe_attempts < 20) {
+            s_hidden_aps[i].probe_attempts++;
+        }
+    }
+    
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(NULL);
+    
+    ESP_LOGI(TAG, "Hidden AP monitoring complete: %d/%d revealed", revealed_count, unrevealed_count);
+    return revealed_count;
 }

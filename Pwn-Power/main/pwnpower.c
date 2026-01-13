@@ -11,11 +11,105 @@
 #include <string.h>
 #include "deauth.h"
 #include "esp_ota_ops.h"
+#include "background_scan.h"
+#include "ap_config.h"
+#include "mdns_service.h"
+#include "sta_config.h"
+#include "idle_scanner.h"
+#include "esp_sntp.h"
+#include "esp_timer.h"
+#include <time.h>
 
 #define TAG "PwnPower"
-#define WIFI_SSID "PwnPower"
-#define WIFI_PASS "password"
 #define MAX_STA_CONN 4
+#define MAX_RETRY 5
+
+static int s_retry_num = 0;
+static bool s_time_synced = false;
+
+// AP reconnect system state
+static uint32_t s_last_disconnect_time = 0;
+static uint32_t s_next_retry_time = 0;
+static const uint32_t RETRY_INTERVALS[] = {30, 60, 120, 300, 600}; // 30s, 1m, 2m, 5m, 10m
+static const int RETRY_INTERVAL_COUNT = 5;
+static int s_current_retry_interval = 0;
+
+static void pwnpower_sntp_sync_time(void) {
+    if (esp_sntp_enabled()) return;
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_init();
+    ESP_LOGI(TAG, "SNTP started");
+}
+
+bool pwnpower_time_is_synced(void) {
+    if (s_time_synced) return true;
+    time_t now = 0;
+    time(&now);
+    s_time_synced = (now > 1704067200);
+    return s_time_synced;
+}
+
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                                int32_t event_id, void* event_data) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        sta_config_t sta_cfg;
+        if (sta_config_get(&sta_cfg) == ESP_OK && strlen(sta_cfg.ssid) > 0 && sta_cfg.auto_connect) {
+            ESP_LOGI(TAG, "STA started, attempting connection...");
+            esp_wifi_connect();
+        }
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        webserver_set_sta_connected(false);
+        
+        // Record disconnect time for periodic retry system
+        s_last_disconnect_time = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+        
+        if (wifi_scan_is_station_scan_active()) {
+            ESP_LOGI(TAG, "Station scan in progress, skipping auto-reconnect");
+            return;
+        }
+        
+        wifi_mode_t current_mode;
+        esp_wifi_get_mode(&current_mode);
+        if (current_mode == WIFI_MODE_STA) {
+            ESP_LOGI(TAG, "Re-enabling AP after disconnect");
+            esp_wifi_set_mode(WIFI_MODE_APSTA);
+        }
+        
+        sta_config_t sta_cfg;
+        bool should_retry = (sta_config_get(&sta_cfg) == ESP_OK && sta_cfg.auto_connect);
+        if (should_retry && s_retry_num < MAX_RETRY) {
+            esp_wifi_connect();
+            s_retry_num++;
+            ESP_LOGI(TAG, "Retry connecting to STA (%d/%d)", s_retry_num, MAX_RETRY);
+        } else if (s_retry_num >= MAX_RETRY) {
+            ESP_LOGW(TAG, "Failed to connect to STA after %d retries", MAX_RETRY);
+            // Schedule next retry with exponential backoff
+            uint32_t interval = RETRY_INTERVALS[s_current_retry_interval];
+            s_next_retry_time = s_last_disconnect_time + interval;
+            ESP_LOGI(TAG, "Scheduling next retry in %lu seconds", (unsigned long)interval);
+            if (s_current_retry_interval < RETRY_INTERVAL_COUNT - 1) {
+                s_current_retry_interval++;
+            }
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        s_retry_num = 0;
+        // Reset periodic retry state on successful connection
+        s_current_retry_interval = 0;
+        s_next_retry_time = 0;
+        webserver_set_sta_connected(true);
+        mdns_service_update_hostname("pwnpower");
+        pwnpower_sntp_sync_time();
+        
+        sta_config_t sta_cfg;
+        if (sta_config_get(&sta_cfg) == ESP_OK && !sta_cfg.ap_while_connected) {
+            ESP_LOGI(TAG, "Disabling AP (ap_while_connected=false)");
+            esp_wifi_set_mode(WIFI_MODE_STA);
+        }
+    }
+}
 
 void wifi_init_softap() {
     ESP_ERROR_CHECK(esp_netif_init());
@@ -28,35 +122,94 @@ void wifi_init_softap() {
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     
-    // enable raw 802.11 frame transmission
     wifi_promiscuous_filter_t filter = {
         .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT
     };
     
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
-    ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(NULL));  // we don't need rx callback
-    ESP_ERROR_CHECK(esp_wifi_set_promiscuous_filter(&filter)); // set proper filter
+    ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(NULL));
+    ESP_ERROR_CHECK(esp_wifi_set_promiscuous_filter(&filter));
     
-    wifi_config_t wifi_config = {
-        .ap = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASS,
-            .ssid_len = strlen(WIFI_SSID),
-            .channel = 6, //40 for 5Ghz, 6 for 2.4Ghz
-            .authmode = WIFI_AUTH_WPA2_WPA3_PSK,
-            .max_connection = MAX_STA_CONN,
-            .pmf_cfg = {
-                .required = true,
-            },
-        }
-    };
-    if (strlen(WIFI_PASS) == 0) {
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+    
+    ap_config_init();
+    sta_config_init();
+    
+    ap_config_t ap_cfg;
+    ap_config_get(&ap_cfg);
+    
+    wifi_config_t wifi_config = {0};
+    strncpy((char*)wifi_config.ap.ssid, ap_cfg.ssid, sizeof(wifi_config.ap.ssid) - 1);
+    wifi_config.ap.ssid_len = strlen(ap_cfg.ssid);
+    wifi_config.ap.channel = 6;
+    wifi_config.ap.max_connection = MAX_STA_CONN;
+    wifi_config.ap.pmf_cfg.required = true;
+    
+    if (strlen(ap_cfg.password) >= 8) {
+        strncpy((char*)wifi_config.ap.password, ap_cfg.password, sizeof(wifi_config.ap.password) - 1);
+        wifi_config.ap.authmode = WIFI_AUTH_WPA2_WPA3_PSK;
+    } else {
         wifi_config.ap.authmode = WIFI_AUTH_OPEN;
     }
+    
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+    
+    sta_config_t sta_cfg;
+    if (sta_config_get(&sta_cfg) == ESP_OK && strlen(sta_cfg.ssid) > 0) {
+        wifi_config_t sta_wifi_config = {0};
+        strncpy((char*)sta_wifi_config.sta.ssid, sta_cfg.ssid, sizeof(sta_wifi_config.sta.ssid) - 1);
+        strncpy((char*)sta_wifi_config.sta.password, sta_cfg.password, sizeof(sta_wifi_config.sta.password) - 1);
+        sta_wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+        sta_wifi_config.sta.pmf_cfg.capable = true;
+        sta_wifi_config.sta.pmf_cfg.required = false;
+        
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_wifi_config));
+        ESP_LOGI(TAG, "Auto-connecting to saved network: %s", sta_cfg.ssid);
+    }
+    
     ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_LOGI(TAG, "Wi-Fi AP+STA Started: SSID=%s", WIFI_SSID);
+    ESP_LOGI(TAG, "Wi-Fi AP+STA Started: SSID=%s", ap_cfg.ssid);
+}
+
+static void sta_reconnect_task(void *arg) {
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(30000)); // Check every 30 seconds
+        
+        sta_config_t sta_cfg;
+        if (!sta_config_get(&sta_cfg) || !sta_cfg.auto_connect || strlen(sta_cfg.ssid) == 0) {
+            continue;
+        }
+        
+        // Only attempt periodic retry if we've exhausted immediate retries
+        if (s_retry_num < MAX_RETRY) {
+            continue;
+        }
+        
+        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+        
+        // Check if it's time to retry
+        if (now >= s_next_retry_time && s_next_retry_time > 0) {
+            ESP_LOGI(TAG, "Attempting periodic reconnect to %s", sta_cfg.ssid);
+            
+            // Reset retry counter for this attempt
+            s_retry_num = 0;
+            
+            // Attempt connection
+            esp_wifi_connect();
+            
+            // Update next retry time
+            uint32_t interval = RETRY_INTERVALS[s_current_retry_interval];
+            s_next_retry_time = now + interval;
+            ESP_LOGI(TAG, "Next periodic retry in %lu seconds", (unsigned long)interval);
+            
+            // Move to next interval if not at max
+            if (s_current_retry_interval < RETRY_INTERVAL_COUNT - 1) {
+                s_current_retry_interval++;
+            }
+        }
+    }
 }
 
 void app_main() {
@@ -79,4 +232,18 @@ void app_main() {
     }
     
     start_webserver();
+    
+    mdns_service_init("pwnpower");
+    
+    if (background_scan_init() == ESP_OK) {
+        background_scan_start();
+    }
+    
+    if (idle_scanner_init() == ESP_OK) {
+        idle_scanner_start();
+    }
+    
+    // Start periodic STA reconnect task
+    xTaskCreate(sta_reconnect_task, "sta_reconnect", 2048, NULL, 5, NULL);
+    ESP_LOGI(TAG, "Started STA reconnect task");
 }

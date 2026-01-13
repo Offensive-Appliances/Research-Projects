@@ -14,5 +14,8 @@ esp_err_t start_general_capture(int channel, int duration_seconds);
 
 const char* handshake_pcap_filename(void);
 
+const char* handshake_get_history_json(void);
+void handshake_record_auto_capture(uint8_t bssid[6], int channel, int eapol_count);
+
 #endif
 

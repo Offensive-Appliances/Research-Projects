@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>PwnPower</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <header>
+        <h1>PwnPower</h1>
+        <div class="subtitle">Offensive Appliances Research</div>
+    </header>
+    
+    <main>
+        <section id="recon" class="section">
+            <div class="section-title" onclick="toggleSection('recon')">
+                <h2>WiFi Recon</h2>
+                <span class="arrow">▼</span>
+            </div>
+            <div class="section-content">
+                <div class="btn-group" style="margin-bottom:16px;">
+                    <button class="btn btn-primary" onclick="triggerScan()">Scan Networks</button>
+                    <button class="btn" onclick="loadScanData()">Refresh</button>
+                    <span id="scan-stats" class="muted" style="margin-left:auto;"></span>
+                </div>
+                
+                <div class="chart-container" id="channel-chart"></div>
+                <div class="muted" style="text-align:center;margin-bottom:16px;">Channel Distribution</div>
+                
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>SSID</th>
+                                <th>MAC</th>
+                                <th>Vendor</th>
+                                <th>Sec</th>
+                                <th>Ch</th>
+                                <th>RSSI</th>
+                                <th>Seen</th>
+                            </tr>
+                        </thead>
+                        <tbody id="recon-table"></tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <section id="attacks" class="section">
+            <div class="section-title" onclick="toggleSection('attacks')">
+                <h2>WiFi Attacks</h2>
+                <span class="arrow">▼</span>
+            </div>
+            <div class="section-content">
+                <div class="warning-banner">Select a target network below</div>
+                
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>SSID</th>
+                                <th>MAC</th>
+                                <th>Vendor</th>
+                                <th>Sec</th>
+                                <th>Ch</th>
+                                <th>RSSI</th>
+                                <th>Seen</th>
+                            </tr>
+                        </thead>
+                        <tbody id="attack-table"></tbody>
+                    </table>
+                </div>
+                
+                <div id="attack-options" style="display:none;">
+                    <div class="network-info">
+                        <h4>Target: <span id="selected-target">--</span></h4>
+                        <div class="muted">Click clients to target specific devices</div>
+                    </div>
+                    <div class="btn-group">
+                        <button class="btn btn-primary" onclick="startDeauth()">Deauth</button>
+                        <button class="btn" onclick="startHandshake()">Capture Handshake</button>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section id="gpio" class="section">
+            <div class="section-title" onclick="toggleSection('gpio')">
+                <h2>Smart Plug</h2>
+                <span class="arrow">▼</span>
+            </div>
+            <div class="section-content">
+                <div class="card">
+                    <h4>GPIO Control</h4>
+                    <div class="muted">Control GPIO4 output</div>
+                    <div class="btn-group">
+                        <button class="btn" onclick="controlGpio(1)">Turn On</button>
+                        <button class="btn" onclick="controlGpio(0)">Turn Off</button>
+                        <div class="status-badge">
+                            <span id="gpio-dot" class="status-dot offline"></span>
+                            <span id="gpio-text">Off</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section id="captures" class="section">
+            <div class="section-title" onclick="toggleSection('captures')">
+                <h2>Packet Captures</h2>
+                <span class="arrow">▼</span>
+            </div>
+            <div class="section-content">
+                <div id="handshake-list"></div>
+            </div>
+        </section>
+
+        <section id="intelligence" class="section">
+            <div class="section-title" onclick="toggleSection('intelligence')">
+                <h2>Network Intelligence</h2>
+                <span class="arrow">▼</span>
+            </div>
+            <div class="section-content">
+                <div class="card-grid">
+                    <div class="card">
+                        <h4>Who's Home?</h4>
+                        <div class="muted" style="margin-bottom:8px;">Devices seen in the last 5 minutes</div>
+                        <div style="display:flex;flex-direction:column;gap:6px;">
+                            <div style="display:flex;justify-content:space-between;">
+                                <span>Here now</span>
+                                <strong id="intel-present" style="color:#4ade80;">0</strong>
+                            </div>
+                            <div style="display:flex;justify-content:space-between;">
+                                <span>Away</span>
+                                <strong id="intel-away" style="color:#f87171;">0</strong>
+                            </div>
+                            <div style="display:flex;justify-content:space-between;">
+                                <span>New today</span>
+                                <strong id="intel-new" style="color:#60a5fa;">0</strong>
+                            </div>
+                            <div style="display:flex;justify-content:space-between;">
+                                <span>Total tracked</span>
+                                <strong id="intel-total">0</strong>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <h4>Security Alerts</h4>
+                        <div class="muted" style="margin-bottom:8px;">Potential threats detected</div>
+                        <div style="display:flex;flex-direction:column;gap:6px;">
+                            <div style="display:flex;justify-content:space-between;">
+                                <span>Deauth attacks</span>
+                                <strong id="intel-deauth">0</strong>
+                            </div>
+                            <div style="display:flex;justify-content:space-between;">
+                                <span>Fake APs (evil twin)</span>
+                                <strong id="intel-rogue">0</strong>
+                            </div>
+                            <div style="display:flex;justify-content:space-between;">
+                                <span>Open networks nearby</span>
+                                <strong id="intel-open">0</strong>
+                            </div>
+                            <div style="display:flex;justify-content:space-between;">
+                                <span>Hidden networks</span>
+                                <strong id="intel-hidden">0</strong>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <h4>Your Network</h4>
+                        <div class="muted" style="margin-bottom:8px;">Auto-detected home network</div>
+                        <div style="display:flex;flex-direction:column;gap:6px;">
+                            <div style="display:flex;justify-content:space-between;">
+                                <span>Home WiFi</span>
+                                <strong id="intel-home">--</strong>
+                            </div>
+                            <div style="display:flex;justify-content:space-between;">
+                                <span>Best signal</span>
+                                <span><strong id="intel-strongest">--</strong> (<span id="intel-rssi">--</span> dBm)</span>
+                            </div>
+                            <div style="display:flex;justify-content:space-between;">
+                                <span>Monitor uptime</span>
+                                <strong id="intel-uptime">--</strong>
+                            </div>
+                            <div style="display:flex;justify-content:space-between;">
+                                <span>Total scans</span>
+                                <strong id="intel-scans">0</strong>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="card" style="margin-top:16px;">
+                    <h4>Network Summary</h4>
+                    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:16px;text-align:center;margin-top:8px;">
+                        <div>
+                            <div style="font-size:24px;font-weight:bold;color:#4ade80;" id="intel-aps">0</div>
+                            <div class="muted">APs Found</div>
+                        </div>
+                        <div>
+                            <div style="font-size:24px;font-weight:bold;color:#60a5fa;" id="intel-clients">0</div>
+                            <div class="muted">Clients</div>
+                        </div>
+                        <div>
+                            <div style="font-size:24px;font-weight:bold;color:#fbbf24;" id="intel-channels">0</div>
+                            <div class="muted">Active Channels</div>
+                        </div>
+                        <div>
+                            <div style="font-size:24px;font-weight:bold;color:#f87171;" id="intel-threats">0</div>
+                            <div class="muted">Threats</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="btn-group" style="margin-top:16px;">
+                    <button class="btn" onclick="loadIntelligence()">Refresh</button>
+                    <button class="btn" onclick="loadDevicePresence()">Show All Devices</button>
+                </div>
+                <div id="device-list" style="margin-top:16px;"></div>
+            </div>
+        </section>
+
+        <section id="reports" class="section">
+            <div class="section-title" onclick="toggleSection('reports')">
+                <h2>Scan Reports</h2>
+                <span class="arrow">▼</span>
+            </div>
+            <div class="section-content">
+                <div class="card-grid">
+                    <div class="card">
+                        <h4>Background Scanning</h4>
+                        <div style="display:flex;align-items:center;gap:8px;margin:8px 0;">
+                            <div class="status-badge">
+                                <span id="bg-scan-dot" class="status-dot"></span>
+                                <span id="bg-scan-text">Idle</span>
+                            </div>
+                            <span class="muted">Records: <span id="bg-scan-count">0</span></span>
+                        </div>
+                        <div class="btn-group">
+                            <button class="btn" onclick="triggerBgScan()">Scan Now</button>
+                            <button class="btn" onclick="downloadReport()">Download Report</button>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <h4>Scan Settings</h4>
+                        <div style="display:flex;flex-direction:column;gap:10px;">
+                            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                                <input type="checkbox" id="bg-enabled" onchange="saveScanSettings()" checked>
+                                <span>Enable background scanning</span>
+                            </label>
+                            <div>
+                                <label class="muted">Scan interval (minutes)</label>
+                                <input type="number" id="bg-interval" min="1" max="60" value="5" style="width:80px;" onchange="saveScanSettings()">
+                            </div>
+                            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                                <input type="checkbox" id="auto-handshake" onchange="saveScanSettings()" checked>
+                                <span>Auto-capture handshakes when idle</span>
+                            </label>
+                            <div>
+                                <label class="muted">Idle threshold (seconds)</label>
+                                <input type="number" id="idle-threshold" min="30" max="600" value="60" style="width:80px;" onchange="saveScanSettings()">
+                            </div>
+                            <div>
+                                <label class="muted">Handshake capture duration (seconds)</label>
+                                <input type="number" id="hs-duration" min="10" max="120" value="30" style="width:80px;" onchange="saveScanSettings()">
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section id="network" class="section">
+            <div class="section-title" onclick="toggleSection('network')">
+                <h2>Network Connection</h2>
+                <span class="arrow">▼</span>
+            </div>
+            <div class="section-content">
+                <div class="card-grid">
+                    <div class="card">
+                        <h4>Connect to Home Network</h4>
+                        <div class="muted">Connect to WiFi for mDNS access (pwnpower.local)</div>
+                        <form id="network-form">
+                            <input type="text" id="net-ssid" placeholder="Network SSID">
+                            <input type="password" id="net-pass" placeholder="Password">
+                            <div class="btn-group">
+                                <button type="submit" class="btn btn-primary">Connect</button>
+                                <div class="status-badge">
+                                    <span id="net-status-dot" class="status-dot offline"></span>
+                                    <span id="net-status-text">Disconnected</span>
+                                </div>
+                            </div>
+                        </form>
+                        <div id="net-info" class="muted" style="margin-top:8px;"></div>
+                        <div style="margin-top:12px;display:flex;flex-direction:column;gap:8px;">
+                            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                                <input type="checkbox" id="auto-connect-toggle" onchange="toggleAutoConnect()" checked>
+                                <span>Auto-connect on boot</span>
+                            </label>
+                            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                                <input type="checkbox" id="ap-while-connected-toggle" onchange="toggleApWhileConnected()" checked>
+                                <span>Keep AP active when connected</span>
+                            </label>
+                            <button class="btn" onclick="forgetNetwork()" style="margin-top:4px;">Forget Saved Network</button>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <h4>AP Settings</h4>
+                        <div class="muted">Current: <span id="current-ssid">--</span> (<span id="current-security">--</span>)</div>
+                        <form id="ap-config-form">
+                            <input type="text" id="ap-ssid" placeholder="New SSID" maxlength="32">
+                            <input type="password" id="ap-pass" placeholder="Password (8+ chars or empty)">
+                            <button type="submit" class="btn">Save & Apply</button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section id="firmware" class="section">
+            <div class="section-title" onclick="toggleSection('firmware')">
+                <h2>Firmware Update</h2>
+                <span class="arrow">▼</span>
+            </div>
+            <div class="section-content">
+                <div class="card">
+                    <h4>Upload Firmware</h4>
+                    <div class="muted">Upload a .bin file built for this device</div>
+                    <form id="ota-form" style="margin-top:10px;">
+                        <input type="file" id="ota-file" accept=".bin" style="margin-bottom:10px;">
+                        <button type="submit" class="btn btn-primary">Upload & Flash</button>
+                    </form>
+                    <div id="ota-status" class="muted" style="margin-top:8px;"></div>
+                </div>
+            </div>
+        </section>
+
+        <section id="about" class="section">
+            <div class="section-title" onclick="toggleSection('about')">
+                <h2>About</h2>
+                <span class="arrow">▼</span>
+            </div>
+            <div class="section-content">
+                <div class="card-grid">
+                    <div class="card">
+                        <h4>PwnPower</h4>
+                        <div class="muted">ESP32-C3 WiFi Scanner</div>
+                        <div class="muted">Deauth & Handshake Capture</div>
+                    </div>
+                    <div class="card">
+                        <h4>Credits</h4>
+                        <div class="muted">Developer: Deki</div>
+                        <div class="muted">Lead + Hardware: Peaks</div>
+                        <div class="muted">Educational purposes only</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+    
+    <script src="app.js"></script>
+</body>
+</html>
