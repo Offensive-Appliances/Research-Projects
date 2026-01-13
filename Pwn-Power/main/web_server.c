@@ -477,7 +477,7 @@ static esp_err_t handshake_handler(httpd_req_t *req) {
     cJSON *channel_json = cJSON_GetObjectItem(root, "channel");
     cJSON *duration_json = cJSON_GetObjectItem(root, "duration");
     cJSON *sta_json = cJSON_GetObjectItem(root, "sta");
-    if(!cJSON_IsString(mac_json) || !cJSON_IsString(channel_json) || !cJSON_IsNumber(duration_json)) {
+    if(!cJSON_IsString(mac_json) || !(cJSON_IsString(channel_json) || cJSON_IsNumber(channel_json)) || !cJSON_IsNumber(duration_json)) {
         cJSON_Delete(root);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing fields");
         return ESP_FAIL;
@@ -490,7 +490,12 @@ static esp_err_t handshake_handler(httpd_req_t *req) {
         return ESP_FAIL;
     }
 
-    int channel = atoi(channel_json->valuestring);
+    int channel = 0;
+    if(cJSON_IsString(channel_json)) {
+        channel = atoi(channel_json->valuestring);
+    } else if(cJSON_IsNumber(channel_json)) {
+        channel = channel_json->valueint;
+    }
     int duration = duration_json->valueint;
     if(channel < 1 || channel > 165 || duration <= 0) {
         cJSON_Delete(root);
@@ -728,6 +733,13 @@ httpd_uri_t uri_attack = {
     .user_ctx = NULL
 };
 
+httpd_uri_t uri_attack_alt = {
+    .uri = "/attack",
+    .method = HTTP_POST,
+    .handler = startattack_handler,
+    .user_ctx = NULL
+};
+
 httpd_uri_t uri_stations = {
     .uri = "/scan-stations",
     .method = HTTP_GET,
@@ -736,6 +748,13 @@ httpd_uri_t uri_stations = {
 
 httpd_uri_t uri_handshake = {
     .uri = "/handshake-capture",
+    .method = HTTP_POST,
+    .handler = handshake_handler,
+    .user_ctx = NULL
+};
+
+httpd_uri_t uri_handshake_alt = {
+    .uri = "/handshake",
     .method = HTTP_POST,
     .handler = handshake_handler,
     .user_ctx = NULL
@@ -1412,7 +1431,7 @@ static esp_err_t ap_config_set_handler(httpd_req_t *req) {
 httpd_handle_t start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     /* increase available URI handler slots to allow additional routes (OTA, fetch, etc) */
-    config.max_uri_handlers = 32;
+    config.max_uri_handlers = 48;
     httpd_handle_t server = NULL;
 
     if (httpd_start(&server, &config) == ESP_OK) {
@@ -1425,8 +1444,10 @@ httpd_handle_t start_webserver(void) {
         httpd_register_uri_handler(server, &uri_scan);
         httpd_register_uri_handler(server, &uri_cached_scan);
         httpd_register_uri_handler(server, &uri_attack);
+        httpd_register_uri_handler(server, &uri_attack_alt);
         httpd_register_uri_handler(server, &uri_stations);
         httpd_register_uri_handler(server, &uri_handshake);
+        httpd_register_uri_handler(server, &uri_handshake_alt);
         httpd_register_uri_handler(server, &uri_hs_pcap);
         httpd_register_uri_handler(server, &uri_capture_history);
         httpd_register_uri_handler(server, &uri_security_stats);
