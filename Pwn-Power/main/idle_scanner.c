@@ -143,26 +143,13 @@ static bool find_vulnerable_network(uint8_t *bssid, int *channel) {
 }
 
 static void perform_deep_scan(void) {
-    ESP_LOGI(TAG, "Starting deep scan...");
-    scan_state = IDLE_SCAN_DEEP_SCAN;
+    // Deep scan updates the timestamp
+    // the background scanner updates the ui cache automatically
+    // idle scanner focuses on handshake capture only
     
-    wifi_scan();
-    
-    while (!wifi_scan_is_complete() && task_running) {
-        if (!idle_scanner_is_device_idle()) {
-            ESP_LOGI(TAG, "User active during scan");
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
-    
-    wifi_scan_stations();
-    
-    background_scan_trigger();
-    
+    ESP_LOGI(TAG, "Idle scan checkpoint - background scanner handles ui updates");
     last_deep_scan = get_uptime_sec();
     scan_state = IDLE_SCAN_WAITING;
-    ESP_LOGI(TAG, "Deep scan complete - UI tables updated");
 }
 
 static void attempt_auto_handshake(void) {

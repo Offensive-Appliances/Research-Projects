@@ -108,7 +108,7 @@ main { max-width: 800px; margin: 0 auto; padding: 16px; }
 }
 
 .card h4 { margin: 0 0 8px 0; font-size: 14px; font-weight: 600; }
-.muted { color: var(--text-muted); font-size: 12px; }
+.muted { color: var(--text-muted); font-size: 12px; padding-bottom: 8px; }
 
 .btn {
     background: var(--bg-card);
@@ -337,8 +337,372 @@ tbody tr.selected { background: rgba(179,23,23,0.15); outline: 1px solid var(--a
     to { transform: scale(1); opacity: 1; }
 }
 
+.history-card {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.history-description {
+    font-size: 13px;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+}
+
+.history-charts {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px;
+}
+
+.graph-wrapper {
+    position: relative;
+    border-radius: 12px;
+    background: var(--bg-card);
+    padding: 16px;
+    min-height: 280px;
+}
+
+.history-canvas {
+    width: 100%;
+    height: 240px;
+    display: block;
+    border-radius: 10px;
+    background: #101010;
+    touch-action: none;
+    -webkit-tap-highlight-color: transparent;
+}
+
+.graph-caption {
+    margin-top: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.graph-caption strong {
+    font-size: 15px;
+}
+
+.graph-subtitle {
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+.graph-overlay {
+    position: absolute;
+    inset: 0;
+    border-radius: 12px;
+    background: rgba(12, 12, 12, 0.85);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 14px;
+    font-size: 14px;
+    color: #f4f4f4;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.25s ease;
+    z-index: 2;
+}
+
+.graph-overlay.active {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+@media (max-width: 960px) {
+    .history-charts {
+        grid-template-columns: 1fr;
+    }
+
+    .graph-wrapper {
+        min-height: 240px;
+    }
+}
+
+@media (max-width: 640px) {
+    main {
+        padding: 12px;
+    }
+
+    header h1 {
+        font-size: 20px;
+    }
+
+    .graph-wrapper {
+        padding: 12px;
+        min-height: 220px;
+    }
+
+    .history-canvas {
+        height: 200px;
+    }
+}
+
+.trust-badge {
+    display: inline-block;
+    padding: 4px 10px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.trust-badge.trusted {
+    background: rgba(74, 222, 128, 0.15);
+    color: #4ade80;
+    border: 1px solid rgba(74, 222, 128, 0.3);
+}
+
+.trust-badge.known {
+    background: rgba(96, 165, 250, 0.15);
+    color: #60a5fa;
+    border: 1px solid rgba(96, 165, 250, 0.3);
+}
+
+.trust-badge.familiar {
+    background: rgba(251, 191, 36, 0.15);
+    color: #fbbf24;
+    border: 1px solid rgba(251, 191, 36, 0.3);
+}
+
+.trust-badge.new {
+    background: rgba(248, 113, 113, 0.15);
+    color: #f87171;
+    border: 1px solid rgba(248, 113, 113, 0.3);
+}
+
+.device-row {
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 12px;
+    margin-bottom: 8px;
+    transition: all 0.2s;
+    cursor: pointer;
+}
+
+.device-row:hover {
+    background: rgba(255,255,255,0.03);
+    border-color: rgba(179,23,23,0.3);
+}
+
+.device-row.expanded {
+    background: rgba(179,23,23,0.05);
+    border-color: var(--accent);
+}
+
+.device-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+}
+
+.device-main {
+    flex: 1;
+    min-width: 0;
+}
+
+.device-mac {
+    font-family: monospace;
+    font-size: 13px;
+    font-weight: 600;
+    margin-bottom: 2px;
+}
+
+.device-vendor {
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+.device-meta {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+.device-details {
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height 0.3s ease;
+    border-top: 1px solid transparent;
+    padding: 0;
+    margin-top: 0;
+}
+
+.device-row.expanded .device-details {
+    max-height: 500px;
+    border-top-color: var(--border-color);
+    padding-top: 12px;
+    margin-top: 12px;
+}
+
+.device-detail-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 8px;
+    font-size: 12px;
+}
+
+.device-detail-item {
+    display: flex;
+    justify-content: space-between;
+    padding: 6px 0;
+}
+
+.device-detail-label {
+    color: var(--text-muted);
+}
+
+.security-flag {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 8px;
+    background: rgba(248, 113, 113, 0.15);
+    border: 1px solid rgba(248, 113, 113, 0.3);
+    border-radius: 10px;
+    font-size: 10px;
+    color: #f87171;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+
+.security-flag::before {
+    content: '⚠';
+    font-size: 11px;
+}
+
+.device-controls {
+    margin-bottom: 16px;
+}
+
+.btn-filter {
+    background: var(--bg-card);
+    padding: 8px 14px;
+    font-size: 12px;
+}
+
+.btn-filter.active {
+    background: var(--accent);
+    border-color: var(--accent);
+}
+
+#device-list:empty::after {
+    content: 'No devices found. Start scanning to track devices.';
+    display: block;
+    text-align: center;
+    padding: 40px 20px;
+    color: var(--text-muted);
+    font-size: 13px;
+}
+
+label:hover {
+    background: rgba(255,255,255,0.03);
+}
+
 @media (max-width: 600px) {
     main { padding: 10px; }
     .card-grid { grid-template-columns: 1fr; }
     .btn { padding: 12px 16px; width: 100%; }
+    .device-header { flex-direction: column; align-items: flex-start; }
+    .device-meta { width: 100%; justify-content: flex-start; }
+}
+
+/* Device Presence Heatmap */
+.presence-heatmap {
+    display: flex;
+    gap: 2px;
+    margin: 4px 0;
+    padding: 4px;
+    background: rgba(0,0,0,0.2);
+    border-radius: 4px;
+}
+
+.presence-heatmap .hour {
+    flex: 1;
+    height: 20px;
+    background: rgba(255,255,255,0.05);
+    border-radius: 2px;
+    transition: background 0.2s;
+    cursor: help;
+}
+
+.presence-heatmap .hour.active {
+    background: linear-gradient(135deg, #4ade80, #22c55e);
+}
+
+.presence-heatmap .hour:hover {
+    transform: scaleY(1.2);
+    z-index: 1;
+}
+
+.heatmap-label {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-bottom: 2px;
+    display: flex;
+    justify-content: space-between;
+}
+
+.heatmap-hours {
+    display: flex;
+    justify-content: space-between;
+    font-size: 9px;
+    color: var(--text-muted);
+    margin-top: 2px;
+}
+
+/* Device Reliability Badge */
+.reliability-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.reliability-high {
+    background: rgba(74, 222, 128, 0.2);
+    color: #4ade80;
+}
+
+.reliability-medium {
+    background: rgba(251, 191, 36, 0.2);
+    color: #fbbf24;
+}
+
+.reliability-low {
+    background: rgba(148, 163, 184, 0.2);
+    color: #94a3b8;
+}
+
+/* AP Association List */
+.ap-associations {
+    margin-top: 8px;
+}
+
+.ap-entry {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 6px 8px;
+    background: rgba(255,255,255,0.03);
+    border-radius: 4px;
+    margin-bottom: 4px;
+    font-size: 12px;
+}
+
+.ap-entry .ap-ssid {
+    font-weight: 500;
+}
+
+.ap-entry .ap-count {
+    color: var(--text-muted);
+    font-size: 11px;
 }

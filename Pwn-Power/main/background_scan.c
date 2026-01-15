@@ -3,12 +3,17 @@
 #include "freertos/semphr.h"
 #include "background_scan.h"
 #include "scan_storage.h"
+#include "device_lifecycle.h"
 #include "wifi_scan.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "monitor_uptime.h"
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
+
+extern bool pwnpower_time_is_synced(void);
 
 #define TAG "BgScan"
 #define BG_SCAN_TASK_STACK 8192
@@ -97,8 +102,8 @@ static void populate_scan_record(scan_record_t *record) {
         .channel = 0,
         .show_hidden = true,
         .scan_type = WIFI_SCAN_TYPE_ACTIVE,
-        .scan_time.active.min = 100,
-        .scan_time.active.max = 300
+        .scan_time.active.min = 120,
+        .scan_time.active.max = 400
     };
 
     uint8_t ap_idx = 0;
@@ -199,7 +204,7 @@ static void populate_scan_record(scan_record_t *record) {
     
     for (uint8_t ch = 1; ch <= 13; ch++) {
         esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
-        vTaskDelay(pdMS_TO_TICKS(200));
+        vTaskDelay(pdMS_TO_TICKS(350));
     }
     
     esp_wifi_set_promiscuous(false);
@@ -239,10 +244,24 @@ static void populate_scan_record(scan_record_t *record) {
         }
     }
     
-    // Run analytics after each scan
+    // check for device departures
+    device_lifecycle_check_departures();
+    
+    // run analytics after each scan
     scan_storage_detect_rogue_aps();
 
     record->header.scan_duration_sec = get_uptime_sec() - start_time;
+    
+    // add epoch timestamp if time is synced
+    if (pwnpower_time_is_synced()) {
+        time_t now;
+        time(&now);
+        record->header.epoch_ts = (uint32_t)now;
+        record->header.time_valid = 1;
+    } else {
+        record->header.epoch_ts = 0;
+        record->header.time_valid = 0;
+    }
 }
 
 static void background_scan_task(void *arg) {
@@ -278,6 +297,21 @@ static void background_scan_task(void *arg) {
         
         populate_scan_record(record);
         
+        history_sample_t sample;
+        memset(&sample, 0, sizeof(sample));
+        sample.epoch_ts = record->header.epoch_ts;
+        sample.uptime_sec = record->header.uptime_sec;
+        sample.time_valid = record->header.time_valid;
+        sample.ap_count = record->header.ap_count;
+        sample.client_count = record->header.total_stations;
+        
+        for (uint8_t i = 0; i < record->header.ap_count; i++) {
+            uint8_t ch = record->aps[i].channel;
+            if (ch >= 1 && ch <= 13) {
+                sample.channel_counts[ch - 1]++;
+            }
+        }
+        
         esp_err_t err = scan_storage_save(record);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Failed to save scan: %s", esp_err_to_name(err));
@@ -285,6 +319,16 @@ static void background_scan_task(void *arg) {
             ESP_LOGI(TAG, "Scan complete: %u APs, %u stations", 
                      record->header.ap_count, record->header.total_stations);
         }
+        
+        wifi_scan_update_ui_cache_from_record(record);
+        
+        err = scan_storage_append_history_sample(&sample);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to save history sample: %s", esp_err_to_name(err));
+        }
+        
+        // flush tracked devices to nvs after each scan
+        scan_storage_flush_devices();
         
         free(record);
         

@@ -77,7 +77,7 @@ esp_err_t wifi_manager_broadcast_deauth(uint8_t bssid[6], int channel, uint8_t *
         return ESP_ERR_INVALID_ARG;
     }
     
-    // just set channel, no mode changes needed since we're already in ap mode
+    // Set channel, no mode changes needed since we're already in AP mode
     esp_err_t err = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
     if(err != ESP_OK) {
         ESP_LOGE(TAG, "failed to set channel %d: %s", channel, esp_err_to_name(err));

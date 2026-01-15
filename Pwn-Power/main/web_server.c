@@ -2,7 +2,6 @@
 #include "esp_log.h"
 #include "http_parser.h"
 #include "wifi_scan.h"
-#include "web_content.h"
 #include "cJSON.h"
 #include "deauth.h"
 #include "handshake.h"
@@ -15,13 +14,24 @@
 #include "sta_config.h"
 #include "idle_scanner.h"
 #include "ouis.h"
+#include "device_db.h"
+#include "device_lifecycle.h"
+#include "webhook.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "driver/gpio.h"
+#include "monitor_uptime.h"
+#include <stddef.h>
 #include <time.h>
+
+extern const uint8_t _binary_web_content_gz_h_start[] asm("_binary_web_content_gz_h_start");
+extern const uint8_t _binary_web_content_gz_h_end[] asm("_binary_web_content_gz_h_end");
+
+#define WEB_UI_GZ         ((const char *)_binary_web_content_gz_h_start)
+#define WEB_UI_GZ_SIZE    ((size_t)(_binary_web_content_gz_h_end - _binary_web_content_gz_h_start))
 
 extern bool pwnpower_time_is_synced(void);
 // some SDK versions expose gpio_pad_select_gpio as esp_rom_gpio_pad_select_gpio
@@ -160,19 +170,8 @@ static void hs_task(void *arg) {
 static esp_err_t index_handler(httpd_req_t *req) {
     update_last_request_time();
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, (const char *)INDEX_HTML, INDEX_HTML_SIZE);
-    return ESP_OK;
-}
-
-static esp_err_t styles_handler(httpd_req_t *req) {
-    httpd_resp_set_type(req, "text/css");
-    httpd_resp_send(req, (const char *)STYLES_CSS, STYLES_CSS_SIZE);
-    return ESP_OK;
-}
-
-static esp_err_t js_handler(httpd_req_t *req) {
-    httpd_resp_set_type(req, "application/javascript");
-    httpd_resp_send(req, (const char *)APP_JS, APP_JS_SIZE);
+    httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+    httpd_resp_send(req, (const char *)WEB_UI_GZ, WEB_UI_GZ_SIZE);
     return ESP_OK;
 }
 // Handler for scanning Wi-Fi networks
@@ -186,28 +185,19 @@ static esp_err_t wifi_scan_handler(httpd_req_t *req) {
         return ESP_FAIL;
     }
 
-    // ALWAYS return cached results first if we have them
     const char *cached_results = wifi_scan_get_results();
-    if(cached_results && strlen(cached_results) > 2) { // Check if we have valid JSON (more than just {})
+    if(cached_results && strlen(cached_results) > 2) {
         httpd_resp_set_type(req, "application/json");
         httpd_resp_send(req, cached_results, strlen(cached_results));
-        
-        // Only start a new scan if:
-        // 1. No scan is currently in progress
-        // 2. We don't have new results waiting
-        if(wifi_scan_is_complete() && !wifi_scan_has_new_results()) {
-            // Start scan in background AFTER sending response
-            wifi_scan();
-        }
         return ESP_OK;
     }
 
-    // If we have no cached results at all, we must do an initial scan
+    // no cached results, start initial scan
     if(wifi_scan_is_complete()) {
         wifi_scan();
     }
 
-    // Return empty JSON if we have nothing yet
+    // return empty json while scan runs
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"rows\":[]}");
     return ESP_OK;
@@ -274,7 +264,7 @@ static esp_err_t startattack_handler(httpd_req_t *req) {
     cJSON *sta_json = cJSON_GetObjectItem(root, "sta");
     bool has_specific_targets = false;
     
-    // We'll store up to 10 target stations
+    // Store up to 10 target stations
     #define MAX_TARGET_STATIONS 10
     uint8_t target_stas[MAX_TARGET_STATIONS][6];
     int target_sta_count = 0;
@@ -946,8 +936,10 @@ static esp_err_t wifi_status_handler(httpd_req_t *req) {
         cJSON_AddBoolToObject(res, "ap_while_connected", true);
     }
     
-    uint32_t uptime = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    uint32_t uptime = monitor_uptime_get();
+    uint32_t boot_uptime = monitor_uptime_get_boot_uptime();
     cJSON_AddNumberToObject(res, "uptime", uptime);
+    cJSON_AddNumberToObject(res, "boot_uptime", boot_uptime);
     cJSON_AddBoolToObject(res, "time_synced", pwnpower_time_is_synced());
     if (pwnpower_time_is_synced()) {
         time_t now;
@@ -1271,6 +1263,15 @@ static esp_err_t device_presence_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+static esp_err_t unified_intelligence_handler(httpd_req_t *req) {
+    update_last_request_time();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    const char *json = scan_storage_get_unified_intelligence_json();
+    httpd_resp_sendstr(req, json);
+    return ESP_OK;
+}
+
 static esp_err_t scan_status_handler(httpd_req_t *req) {
     cJSON *root = cJSON_CreateObject();
     
@@ -1426,6 +1427,395 @@ static esp_err_t ap_config_set_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+static esp_err_t history_samples_handler(httpd_req_t *req) {
+    update_last_request_time();
+    
+    // parse days parameter (default 7, max 30, min 0.1)
+    float days = 7.0f;
+    char query[64];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char days_str[16];
+        if (httpd_query_key_value(query, "days", days_str, sizeof(days_str)) == ESP_OK) {
+            days = atof(days_str);
+            if (days < 0.1f) days = 0.1f;
+            if (days > 30.0f) days = 30.0f;
+        }
+    }
+    
+    // limit samples to prevent oom (process in chunks)
+    uint32_t max_samples = (uint32_t)(days * 24.0f * 30.0f);  // 30 samples per hour
+    if (max_samples > 5040) max_samples = 5040;  // limit to 7 days worth
+    
+    uint32_t history_count = scan_storage_get_history_count();
+    ESP_LOGI(TAG, "history_samples_handler: total_count=%u, max_samples=%u", history_count, max_samples);
+    uint32_t remaining = (history_count > max_samples) ? max_samples : history_count;
+    uint32_t start_idx = (history_count > max_samples) ? (history_count - max_samples) : 0;
+    ESP_LOGI(TAG, "history_samples_handler: start_idx=%u, remaining=%u", start_idx, remaining);
+    
+    #define HISTORY_CHUNK_SIZE 100
+    history_sample_t *chunk = malloc(sizeof(history_sample_t) * HISTORY_CHUNK_SIZE);
+    if (!chunk) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        return ESP_FAIL;
+    }
+    
+    // start json response manually to avoid large cjson tree
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr_chunk(req, "{\"samples\":[");
+    
+    bool first = true;
+    while (remaining > 0) {
+        uint32_t request_count = remaining > HISTORY_CHUNK_SIZE ? HISTORY_CHUNK_SIZE : remaining;
+        uint32_t actual = 0;
+        esp_err_t err = scan_storage_get_history_samples_window(start_idx, request_count, chunk, &actual);
+        ESP_LOGI(TAG, "history_samples_handler: requested=%u, actual=%u", request_count, actual);
+        if (err != ESP_OK) {
+            free(chunk);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to read samples");
+            return ESP_FAIL;
+        }
+        
+        for (uint32_t i = 0; i < actual; i++) {
+            // Optimize: Build entire JSON object in one buffer to reduce httpd_resp_sendstr_chunk calls
+            // This reduces 15+ calls per sample to just 1 call per sample
+            char buf[300];
+            int len = snprintf(buf, sizeof(buf),
+                "%s{\"epoch_ts\":%lu,\"uptime_sec\":%lu,\"time_valid\":%s,\"ap_count\":%u,\"client_count\":%u,\"channel_counts\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u]}",
+                first ? "" : ",",
+                (unsigned long)chunk[i].epoch_ts,
+                (unsigned long)chunk[i].uptime_sec,
+                chunk[i].time_valid ? "true" : "false",
+                chunk[i].ap_count,
+                chunk[i].client_count,
+                chunk[i].channel_counts[0], chunk[i].channel_counts[1], chunk[i].channel_counts[2],
+                chunk[i].channel_counts[3], chunk[i].channel_counts[4], chunk[i].channel_counts[5],
+                chunk[i].channel_counts[6], chunk[i].channel_counts[7], chunk[i].channel_counts[8],
+                chunk[i].channel_counts[9], chunk[i].channel_counts[10], chunk[i].channel_counts[11],
+                chunk[i].channel_counts[12]);
+            first = false;
+
+            httpd_resp_sendstr_chunk(req, buf);
+        }
+        
+        // advance by request_count (items read from flash), not actual (items after sanitize)
+        start_idx += request_count;
+        remaining -= request_count;
+    }
+    
+    free(chunk);
+    httpd_resp_sendstr_chunk(req, "]}");
+    httpd_resp_sendstr_chunk(req, NULL);  // finish chunked response
+    
+    return ESP_OK;
+}
+
+static esp_err_t devices_list_handler(httpd_req_t *req) {
+    update_last_request_time();
+    
+    // get device presence data from scan_storage
+    const char *presence_json = scan_storage_get_device_presence_json();
+    
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, presence_json);
+    return ESP_OK;
+}
+
+static esp_err_t devices_update_handler(httpd_req_t *req) {
+    char buf[512];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing body");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+    
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+    
+    cJSON *mac_json = cJSON_GetObjectItem(root, "mac");
+    if (!mac_json || !cJSON_IsString(mac_json)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "MAC required");
+        return ESP_FAIL;
+    }
+    
+    device_settings_t settings;
+    memset(&settings, 0, sizeof(settings));
+    
+    // parse mac
+    if (sscanf(mac_json->valuestring, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+               &settings.mac[0], &settings.mac[1], &settings.mac[2],
+               &settings.mac[3], &settings.mac[4], &settings.mac[5]) != 6) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid MAC format");
+        return ESP_FAIL;
+    }
+    
+    // get existing settings or use defaults
+    if (device_db_get(settings.mac, &settings) != ESP_OK) {
+        settings.trust_score = 50;
+        settings.tracked = false;
+        settings.name[0] = '\0';
+    }
+    
+    // update fields if provided
+    cJSON *name_json = cJSON_GetObjectItem(root, "name");
+    if (name_json && cJSON_IsString(name_json)) {
+        strncpy(settings.name, name_json->valuestring, DEVICE_NAME_MAX_LEN - 1);
+        settings.name[DEVICE_NAME_MAX_LEN - 1] = '\0';
+    }
+    
+    cJSON *trust_json = cJSON_GetObjectItem(root, "trust_score");
+    if (trust_json && cJSON_IsNumber(trust_json)) {
+        int trust = trust_json->valueint;
+        if (trust < 0) trust = 0;
+        if (trust > 100) trust = 100;
+        settings.trust_score = (uint8_t)trust;
+    }
+    
+    cJSON *tracked_json = cJSON_GetObjectItem(root, "tracked");
+    if (tracked_json && cJSON_IsBool(tracked_json)) {
+        settings.tracked = cJSON_IsTrue(tracked_json);
+    }
+    
+    cJSON *home_json = cJSON_GetObjectItem(root, "home_device");
+    bool set_home = false;
+    bool home_value = false;
+    if (home_json && cJSON_IsBool(home_json)) {
+        set_home = true;
+        home_value = cJSON_IsTrue(home_json);
+    }
+    
+    cJSON_Delete(root);
+    
+    // save to db
+    esp_err_t err = device_db_set(&settings);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save device");
+        return ESP_FAIL;
+    }
+    
+    // set home flag in presence storage if requested
+    if (set_home) {
+        scan_storage_set_device_home(settings.mac, home_value);
+    }
+    
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+    return ESP_OK;
+}
+
+static esp_err_t webhook_config_get_handler(httpd_req_t *req) {
+    webhook_config_t config;
+    webhook_get_config(&config);
+    
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "enabled", config.enabled);
+    cJSON_AddStringToObject(root, "url", config.url);
+    cJSON_AddBoolToObject(root, "tracked_only", config.tracked_only);
+    cJSON_AddBoolToObject(root, "home_departure_alert", config.home_departure_alert);
+    cJSON_AddBoolToObject(root, "home_arrival_alert", config.home_arrival_alert);
+    cJSON_AddBoolToObject(root, "new_device_alert", config.new_device_alert);
+    cJSON_AddBoolToObject(root, "all_events", config.all_events);
+    cJSON_AddNumberToObject(root, "send_cursor", webhook_get_send_cursor());
+    cJSON_AddNumberToObject(root, "total_events", scan_storage_get_event_count());
+    
+    char *json_str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json_str);
+    free(json_str);
+    
+    return ESP_OK;
+}
+
+static esp_err_t webhook_config_set_handler(httpd_req_t *req) {
+    char buf[512];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing body");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+    
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+    
+    webhook_config_t config;
+    webhook_get_config(&config);
+    
+    cJSON *enabled_json = cJSON_GetObjectItem(root, "enabled");
+    if (enabled_json && cJSON_IsBool(enabled_json)) {
+        config.enabled = cJSON_IsTrue(enabled_json);
+    }
+    
+    cJSON *url_json = cJSON_GetObjectItem(root, "url");
+    if (url_json && cJSON_IsString(url_json)) {
+        strncpy(config.url, url_json->valuestring, WEBHOOK_URL_MAX_LEN - 1);
+        config.url[WEBHOOK_URL_MAX_LEN - 1] = '\0';
+    }
+    
+    cJSON *tracked_only_json = cJSON_GetObjectItem(root, "tracked_only");
+    if (tracked_only_json && cJSON_IsBool(tracked_only_json)) {
+        config.tracked_only = cJSON_IsTrue(tracked_only_json);
+    }
+    
+    cJSON *home_departure_json = cJSON_GetObjectItem(root, "home_departure_alert");
+    if (home_departure_json && cJSON_IsBool(home_departure_json)) {
+        config.home_departure_alert = cJSON_IsTrue(home_departure_json);
+    }
+    
+    cJSON *home_arrival_json = cJSON_GetObjectItem(root, "home_arrival_alert");
+    if (home_arrival_json && cJSON_IsBool(home_arrival_json)) {
+        config.home_arrival_alert = cJSON_IsTrue(home_arrival_json);
+    }
+    
+    cJSON *new_device_json = cJSON_GetObjectItem(root, "new_device_alert");
+    if (new_device_json && cJSON_IsBool(new_device_json)) {
+        config.new_device_alert = cJSON_IsTrue(new_device_json);
+    }
+    
+    cJSON *all_events_json = cJSON_GetObjectItem(root, "all_events");
+    if (all_events_json && cJSON_IsBool(all_events_json)) {
+        config.all_events = cJSON_IsTrue(all_events_json);
+    }
+    
+    cJSON_Delete(root);
+    
+    esp_err_t err = webhook_set_config(&config);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save config");
+        return ESP_FAIL;
+    }
+    
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+    return ESP_OK;
+}
+
+static esp_err_t webhook_test_handler(httpd_req_t *req) {
+    esp_err_t err = webhook_send_test();
+    
+    cJSON *root = cJSON_CreateObject();
+    if (err == ESP_OK) {
+        cJSON_AddStringToObject(root, "status", "ok");
+        cJSON_AddStringToObject(root, "message", "Test webhook sent successfully");
+    } else {
+        cJSON_AddStringToObject(root, "status", "error");
+        cJSON_AddStringToObject(root, "message", "Failed to send test webhook");
+    }
+    
+    char *json_str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json_str);
+    free(json_str);
+    
+    return ESP_OK;
+}
+
+static esp_err_t home_ssids_get_handler(httpd_req_t *req) {
+    cJSON *root = cJSON_CreateObject();
+    const char *connected = scan_storage_get_home_ssid();
+    cJSON_AddStringToObject(root, "connected", connected ? connected : "");
+    cJSON_AddRawToObject(root, "extra", scan_storage_get_extra_home_ssids_json());
+    
+    char *json_str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json_str);
+    free(json_str);
+    return ESP_OK;
+}
+
+static esp_err_t home_ssids_add_handler(httpd_req_t *req) {
+    char buf[128];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing body");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+    
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+    
+    cJSON *ssid_json = cJSON_GetObjectItem(root, "ssid");
+    if (!ssid_json || !cJSON_IsString(ssid_json)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID required");
+        return ESP_FAIL;
+    }
+    
+    esp_err_t err = scan_storage_add_extra_home_ssid(ssid_json->valuestring);
+    cJSON_Delete(root);
+    
+    if (err == ESP_OK) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+    } else if (err == ESP_ERR_NO_MEM) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Max 3 extra SSIDs allowed");
+        return ESP_FAIL;
+    } else {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to add SSID");
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t home_ssids_refresh_handler(httpd_req_t *req) {
+    scan_storage_refresh_home_flags();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+    return ESP_OK;
+}
+
+static esp_err_t home_ssids_remove_handler(httpd_req_t *req) {
+    char buf[128];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing body");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+    
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+    
+    cJSON *ssid_json = cJSON_GetObjectItem(root, "ssid");
+    if (!ssid_json || !cJSON_IsString(ssid_json)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID required");
+        return ESP_FAIL;
+    }
+    
+    esp_err_t err = scan_storage_remove_extra_home_ssid(ssid_json->valuestring);
+    cJSON_Delete(root);
+    
+    if (err == ESP_OK) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+    } else {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "SSID not found");
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
 
 // Start the web server and register URI handlers
 httpd_handle_t start_webserver(void) {
@@ -1436,11 +1826,6 @@ httpd_handle_t start_webserver(void) {
 
     if (httpd_start(&server, &config) == ESP_OK) {
         httpd_register_uri_handler(server, &uri_get);
-        
-        httpd_uri_t uri_styles = { .uri = "/styles.css", .method = HTTP_GET, .handler = styles_handler, .user_ctx = NULL };
-        httpd_uri_t uri_js = { .uri = "/app.js", .method = HTTP_GET, .handler = js_handler, .user_ctx = NULL };
-        httpd_register_uri_handler(server, &uri_styles);
-        httpd_register_uri_handler(server, &uri_js);
         httpd_register_uri_handler(server, &uri_scan);
         httpd_register_uri_handler(server, &uri_cached_scan);
         httpd_register_uri_handler(server, &uri_attack);
@@ -1494,6 +1879,7 @@ httpd_handle_t start_webserver(void) {
         httpd_uri_t uri_scan_clear = { .uri = "/scan/clear", .method = HTTP_POST, .handler = scan_clear_handler, .user_ctx = NULL };
         httpd_uri_t uri_intelligence = { .uri = "/intelligence", .method = HTTP_GET, .handler = intelligence_handler, .user_ctx = NULL };
         httpd_uri_t uri_device_presence = { .uri = "/devices/presence", .method = HTTP_GET, .handler = device_presence_handler, .user_ctx = NULL };
+        httpd_uri_t uri_unified_intelligence = { .uri = "/intelligence/unified", .method = HTTP_GET, .handler = unified_intelligence_handler, .user_ctx = NULL };
         httpd_register_uri_handler(server, &uri_scan_report);
         httpd_register_uri_handler(server, &uri_scan_timeline);
         httpd_register_uri_handler(server, &uri_scan_trigger);
@@ -1503,11 +1889,33 @@ httpd_handle_t start_webserver(void) {
         httpd_register_uri_handler(server, &uri_scan_clear);
         httpd_register_uri_handler(server, &uri_intelligence);
         httpd_register_uri_handler(server, &uri_device_presence);
+        httpd_register_uri_handler(server, &uri_unified_intelligence);
         
         httpd_uri_t uri_ap_config_get = { .uri = "/ap/config", .method = HTTP_GET, .handler = ap_config_get_handler, .user_ctx = NULL };
         httpd_uri_t uri_ap_config_set = { .uri = "/ap/config", .method = HTTP_POST, .handler = ap_config_set_handler, .user_ctx = NULL };
         httpd_register_uri_handler(server, &uri_ap_config_get);
         httpd_register_uri_handler(server, &uri_ap_config_set);
+        
+        httpd_uri_t uri_history_samples = { .uri = "/history/samples", .method = HTTP_GET, .handler = history_samples_handler, .user_ctx = NULL };
+        httpd_uri_t uri_devices_list = { .uri = "/devices/list", .method = HTTP_GET, .handler = devices_list_handler, .user_ctx = NULL };
+        httpd_uri_t uri_devices_update = { .uri = "/devices/update", .method = HTTP_POST, .handler = devices_update_handler, .user_ctx = NULL };
+        httpd_uri_t uri_webhook_config_get = { .uri = "/webhook/config", .method = HTTP_GET, .handler = webhook_config_get_handler, .user_ctx = NULL };
+        httpd_uri_t uri_webhook_config_set = { .uri = "/webhook/config", .method = HTTP_POST, .handler = webhook_config_set_handler, .user_ctx = NULL };
+        httpd_uri_t uri_webhook_test = { .uri = "/webhook/test", .method = HTTP_POST, .handler = webhook_test_handler, .user_ctx = NULL };
+        httpd_uri_t uri_home_ssids_get = { .uri = "/home-ssids", .method = HTTP_GET, .handler = home_ssids_get_handler, .user_ctx = NULL };
+        httpd_uri_t uri_home_ssids_add = { .uri = "/home-ssids/add", .method = HTTP_POST, .handler = home_ssids_add_handler, .user_ctx = NULL };
+        httpd_uri_t uri_home_ssids_remove = { .uri = "/home-ssids/remove", .method = HTTP_POST, .handler = home_ssids_remove_handler, .user_ctx = NULL };
+        httpd_uri_t uri_home_ssids_refresh = { .uri = "/home-ssids/refresh", .method = HTTP_POST, .handler = home_ssids_refresh_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(server, &uri_history_samples);
+        httpd_register_uri_handler(server, &uri_devices_list);
+        httpd_register_uri_handler(server, &uri_devices_update);
+        httpd_register_uri_handler(server, &uri_webhook_config_get);
+        httpd_register_uri_handler(server, &uri_webhook_config_set);
+        httpd_register_uri_handler(server, &uri_webhook_test);
+        httpd_register_uri_handler(server, &uri_home_ssids_get);
+        httpd_register_uri_handler(server, &uri_home_ssids_add);
+        httpd_register_uri_handler(server, &uri_home_ssids_remove);
+        httpd_register_uri_handler(server, &uri_home_ssids_refresh);
         
         ESP_LOGI(TAG, "Web Server started");
     } else {

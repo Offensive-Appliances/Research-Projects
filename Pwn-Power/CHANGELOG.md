@@ -3,18 +3,34 @@
 ## v2.0
 
 ### Added
-- AP Configuration via Web Interface
-- Background Scan capabilities
-- Changed to use custom partition table for extra flash storage
+- Configuration of onboard WiFi AP
 - Option to connect device to home network with access over mDNS (pwnpower.local)
-- Smart idle detection to automatically perform deep scans and capture handshakes when device is not being used
+- Device will automatically perform deep scans and capture handshakes when device is not being used
 - Added automatic OUI lookup for AP and STA vendor information
 - Added automatic SNTP sync when connecting to a network for timestamping
-- Added deauth detection and hidden SSID detection for background scan reports
-- Added a network intelligence section to the web interface
-
+- Added a network intelligence section with:
+  - Deauths seen
+  - Rouge APs detected
+  - Persistent device tracking
+- Added a Network History section with:
+  - AP and STA history
+  - Channel congestion history
+- Added ability to send configurable alerts to a webhook
 
 ### Changed
+- Merged WiFi Recon and Attack sections into a single section
+- Changed to use custom partition table for extra flash storage
 - Separated web interface into seperate js, css and html files
 - Revised web interface styling
-- Automatically populate WiFi Recon and Attack tables in the background
+- Automatically populate WiFi Recon and Attack table in the background
+
+
+## v1.0
+
+### Added
+
+- Web UI
+- Deauthentication and disassociation attack
+- Passive handshake capture (EAPOL detection) and general 802.11 capture with in-memory PCAP export (handshake.pcap)
+- OTA Firmware upload
+- Simple smart-plug GPIO control endpoints
