@@ -1,0 +1,72 @@
+name: Build PwnPower
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ESP32-C3
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: actions/cache@v4
+        id: cache-idf
+        with:
+          path: |
+            ~/esp-idf
+            ~/.espressif
+          key: esp-idf-v5.5.1-${{ runner.os }}-c3
+          restore-keys: |
+            esp-idf-v5.5.1-${{ runner.os }}-
+
+      - name: Install ESP-IDF Dependencies
+        if: steps.cache-idf.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git wget flex bison gperf python3-pip python3-venv cmake ninja-build ccache libffi-dev libssl-dev dfu-util libusb-1.0-0
+
+      - name: Install ESP-IDF
+        if: steps.cache-idf.outputs.cache-hit != 'true'
+        run: |
+          git clone -b v5.5.1 --depth 1 --recursive https://github.com/espressif/esp-idf.git ~/esp-idf
+          ~/esp-idf/install.sh esp32c3
+
+      - name: Build Project
+        run: |
+          . ~/esp-idf/export.sh
+          export IDF_TARGET=esp32c3
+          idf.py build
+
+      - name: Package Binaries
+        run: |
+          . ~/esp-idf/export.sh
+          mkdir -p release
+          cp build/bootloader/bootloader.bin release/
+          cp build/partition_table/partition-table.bin release/partitions.bin
+          cp build/pwnpower.bin release/firmware.bin
+          
+          python3 -m esptool --chip esp32c3 merge_bin \
+            --output release/pwnpower-merged.bin \
+            --flash_mode dio \
+            --flash_size 4MB \
+            0x0 release/bootloader.bin \
+            0x8000 release/partitions.bin \
+            0x10000 release/firmware.bin
+          
+          cd release && zip -j ../pwnpower-esp32c3.zip *
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pwnpower-esp32c3
+          path: pwnpower-esp32c3.zip
