@@ -24,12 +24,19 @@ All controlled via a modern web interface.
 - mDNS support (`pwnpower.local`)
 - NTP time sync
 
-### Other
+### Analytics & Monitoring
 - Background scanning with flash storage
-- CSV report generation
+- CSV report generation and download
+- Network intelligence with device presence tracking and security overview
+- Network history with activity charts and analytics (7-day trends)
+- Webhook alerts for device lifecycle events (arrival/departure/new devices)
+
+### Hardware Control
 - Smart plug GPIO control
 - OTA firmware updates
-- Modern responsive web UI
+
+### Web Interface
+- Modern responsive web UI with collapsible sections
 
 ## Requirements 
 - ESP-IDF v5.5 or newer
