@@ -1961,7 +1961,7 @@ async function loadHomeSSIDs() {
             extraEl.innerHTML = data.extra.map(ssid => `
                 <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
                     <span>${ssid}</span>
-                    <button class="btn btn-sm" onclick="removeHomeSSID('${ssid}')" style="padding:2px 8px;font-size:11px;">Remove</button>
+                    <button class="btn btn-sm" onclick="removeHomeSSID('${ssid}')" style="padding:2px 8px;font-size:11px;max-width:80px;">Remove</button>
                 </div>
             `).join('');
         }
