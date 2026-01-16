@@ -1,11 +1,50 @@
 let scanData = [];
+let accumulatedNetworks = new Map();
 let selectedAP = null;
 let selectedClients = {};
 let scanInterval = null;
 let agoTicker = null;
+let privacyMode = false;
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
+
+function togglePrivacyMode() {
+    privacyMode = !privacyMode;
+    localStorage.setItem('privacyMode', privacyMode);
+    applyPrivacyMode();
+}
+
+function applyPrivacyMode() {
+    const btn = $('#privacy-toggle');
+    if (privacyMode) {
+        document.body.classList.add('privacy-mode');
+        if (btn) btn.classList.add('active');
+        $('#privacy-icon').textContent = '⊘';
+    } else {
+        document.body.classList.remove('privacy-mode');
+        if (btn) btn.classList.remove('active');
+        $('#privacy-icon').textContent = '◉';
+    }
+    // Re-render charts to update SSID labels
+    if (chartCache.size > 0) {
+        chartCache.forEach((cached) => {
+            if (cached.canvasId === '#ssid-clients-chart') {
+                drawSSIDClientsChart(cached.canvasId, cached.samples, cached.config);
+            }
+        });
+    }
+}
+
+function initPrivacyMode() {
+    privacyMode = localStorage.getItem('privacyMode') === 'true';
+    applyPrivacyMode();
+}
+
+function pii(value, type) {
+    if (!value) return value;
+    return `<span class="pii-${type}">${value}</span>`;
+}
 
 function toggleSection(id) {
     const section = document.getElementById(id);
@@ -57,6 +96,31 @@ async function loadScanData() {
     const status = await fetchJSON('/wifi/status');
     if (data && data.rows) {
         scanData = data.rows;
+        
+        data.rows.forEach(ap => {
+            const existing = accumulatedNetworks.get(ap.MAC);
+            if (existing) {
+                existing.RSSI = ap.RSSI;
+                existing.last_seen = ap.last_seen;
+                existing.Channel = ap.Channel;
+                existing.Security = ap.Security;
+                
+                if (!existing.stations) existing.stations = [];
+                const clientMap = new Map(existing.stations.map(s => [s.mac, s]));
+                if (ap.stations && ap.stations.length > 0) {
+                    ap.stations.forEach(sta => {
+                        clientMap.set(sta.mac, sta);
+                    });
+                }
+                existing.stations = Array.from(clientMap.values());
+            } else {
+                accumulatedNetworks.set(ap.MAC, {
+                    ...ap,
+                    stations: ap.stations ? [...ap.stations] : []
+                });
+            }
+        });
+        
         renderNetworkTable('wifi-table', true, status);
         renderChannelChart();
         updateStats();
@@ -90,16 +154,18 @@ function renderNetworkTable(tableId, selectable, status) {
     tbody.innerHTML = '';
     const nowMs = Date.now();
     
-    scanData.forEach(ap => {
+    const dataToRender = Array.from(accumulatedNetworks.values());
+    
+    dataToRender.forEach(ap => {
         const row = document.createElement('tr');
         row.dataset.mac = ap.MAC;
         row.dataset.channel = ap.Channel;
         const uptime = status?.uptime || 0;
         const age = (ap.last_seen && uptime && ap.last_seen <= uptime) ? (uptime - ap.last_seen) : null;
         row.innerHTML = `
-            <td>${ap.SSID || '(Hidden)'}</td>
-            <td><code>${ap.MAC}</code></td>
-            <td class="muted">${ap.Vendor || 'Unknown'}</td>
+            <td>${pii(ap.SSID || '(Hidden)', 'ssid')}</td>
+            <td><code>${pii(ap.MAC, 'mac')}</code></td>
+            <td class="muted">${pii(ap.Vendor || 'Unknown', 'vendor')}</td>
             <td>${ap.Security}</td>
             <td>${ap.Channel}</td>
             <td>${ap.RSSI || '--'}</td>
@@ -121,8 +187,8 @@ function renderNetworkTable(tableId, selectable, status) {
                 const staAge = (sta.last_seen && uptime && sta.last_seen <= uptime) ? (uptime - sta.last_seen) : null;
                 clientRow.innerHTML = `
                     <td>↳ Client</td>
-                    <td><code>${sta.mac}</code></td>
-                    <td class="muted">${sta.vendor || 'Unknown'}</td>
+                    <td><code>${pii(sta.mac, 'mac')}</code></td>
+                    <td class="muted">${pii(sta.vendor || 'Unknown', 'vendor')}</td>
                     <td></td>
                     <td></td>
                     <td>${sta.rssi}</td>
@@ -204,14 +270,17 @@ function renderChannelChart() {
 }
 
 function updateStats() {
-    const apCount = scanData.length;
+    const apCount = accumulatedNetworks.size;
     let clientCount = 0;
-    scanData.forEach(ap => {
+    const dataSource = Array.from(accumulatedNetworks.values());
+    dataSource.forEach(ap => {
         if (ap.stations) clientCount += ap.stations.length;
     });
     
     const statEl = $('#scan-stats');
-    if (statEl) statEl.textContent = `${apCount} APs, ${clientCount} clients`;
+    if (statEl) {
+        statEl.textContent = `${apCount} APs, ${clientCount} clients`;
+    }
 }
 
 let scanInProgress = false;
@@ -518,7 +587,10 @@ async function loadApConfig() {
     const data = await fetchJSON('/ap/config');
     if (!data) return;
     
-    $('#current-ssid').textContent = data.ssid || '--';
+    const ssidEl = $('#current-ssid');
+    if (ssidEl) {
+        ssidEl.innerHTML = pii(data.ssid || '--', 'ssid');
+    }
     $('#current-security').textContent = data.has_password ? 'WPA2/WPA3' : 'Open';
     $('#ap-ssid').placeholder = data.ssid || 'SSID';
 }
@@ -556,13 +628,13 @@ async function loadNetworkStatus() {
     if (data && data.status === 'connected') {
         if (dot) dot.className = 'status-dot online';
         if (text) text.textContent = 'Connected';
-        if (info) info.textContent = data.saved_ssid || '';
+        if (info) info.innerHTML = pii(data.saved_ssid || '', 'ssid');
     } else {
         if (dot) dot.className = 'status-dot offline';
         if (text) text.textContent = 'Disconnected';
         if (info) {
             if (data && data.has_saved && data.saved_ssid) {
-                info.textContent = `Saved: ${data.saved_ssid}`;
+                info.innerHTML = `Saved: ${pii(data.saved_ssid, 'ssid')}`;
             } else {
                 info.textContent = 'No network saved';
             }
@@ -673,7 +745,7 @@ async function loadHandshakes() {
             <div class="card" style="display:flex;justify-content:space-between;align-items:center;">
                 <div>
                     <strong>${typeLabel}</strong>
-                    <div class="muted">${h.bssid} • ch ${h.channel} • ${h.eapol} EAPOL</div>
+                    <div class="muted"><span class="pii-bssid">${h.bssid}</span> • ch ${h.channel} • ${h.eapol} EAPOL</div>
                     <div class="muted"><span class="js-ago" data-ago-base="${ago}" data-ago-start="${nowMs}">${formatUptime(ago)}</span></div>
                 </div>
                 <a href="/handshake.pcap" class="btn">Download</a>
@@ -832,7 +904,6 @@ function populateAPFilter() {
     const apFilter = $('#ap-filter');
     if (!apFilter) return;
 
-    // Get unique APs from devices
     const aps = new Set();
     deviceIntelligenceData.devices.forEach(d => {
         if (d.last_ap && d.last_ap !== 'unknown') {
@@ -840,10 +911,9 @@ function populateAPFilter() {
         }
     });
 
-    // Keep the "All APs" option and add each unique AP
     const sortedAPs = Array.from(aps).sort();
     apFilter.innerHTML = '<option value="all">All APs</option>' +
-        sortedAPs.map(ap => `<option value="${ap}">${ap}</option>`).join('');
+        sortedAPs.map(ap => `<option value="${ap}" class="pii-ssid">${ap}</option>`).join('');
 }
 
 function updateIntelligenceSummary() {
@@ -956,8 +1026,8 @@ function renderAPAssociations(associatedAps) {
         const bssid = ap.bssid ? `${ap.bssid.slice(0, 8)}...` : '';
         html += `
             <div class="ap-entry">
-                <span class="ap-ssid">${ssid}</span>
-                <span class="ap-count" style="font-size:10px;color:#666;" title="${ap.bssid || ''}">${bssid}</span>
+                <span class="ap-ssid pii-ssid">${ssid}</span>
+                <span class="ap-count pii-bssid" style="font-size:10px;color:#666;" title="${ap.bssid || ''}">${bssid}</span>
             </div>
         `;
     });
@@ -1069,8 +1139,8 @@ function renderDeviceList(immediate = false) {
             <div class="device-row" data-mac="${d.mac}" onclick="toggleDeviceDetails(this)">
                 <div class="device-header">
                     <div class="device-main">
-                        <div class="device-mac">${d.mac}</div>
-                        <div class="device-vendor">${d.vendor || 'Unknown'}</div>
+                        <div class="device-mac">${pii(d.mac, 'mac')}</div>
+                        <div class="device-vendor">${pii(d.vendor || 'Unknown', 'vendor')}</div>
                     </div>
                     <div class="device-meta">
                         ${d.home_device ? '<span class="trust-badge" style="background:#10b981;color:#fff;">Home</span>' : ''}
@@ -1097,7 +1167,7 @@ function renderDeviceList(immediate = false) {
                         </div>
                         <div class="device-detail-item">
                             <span class="device-detail-label">Last AP</span>
-                            <strong>${d.last_ap || 'Unknown'}</strong>
+                            <strong>${pii(d.last_ap || 'Unknown', 'ssid')}</strong>
                         </div>
                     </div>
                     <div class="device-details-lazy" data-mac="${d.mac}">
@@ -1793,12 +1863,30 @@ function renderCharts(samples) {
 
             // Build series only for active channels
             const series = [];
+            const windowSize = samples.length > 150 ? 7 : (samples.length > 60 ? 5 : (samples.length > 20 ? 3 : 1));
             activeChannels.forEach(ch => {
                 const channelNum = ch + 1;
-                const data = samples.map(s => ({
-                    label: formatHistoryLabel(s),
-                    value: s.channel_counts && s.channel_counts[ch] ? s.channel_counts[ch] : 0
-                }));
+                const data = [];
+                let sum = 0;
+
+                samples.forEach((s, idx) => {
+                    const value = s.channel_counts && s.channel_counts[ch] ? s.channel_counts[ch] : 0;
+                    sum += value;
+                    if (idx >= windowSize) {
+                        const prev = samples[idx - windowSize].channel_counts && samples[idx - windowSize].channel_counts[ch]
+                            ? samples[idx - windowSize].channel_counts[ch]
+                            : 0;
+                        sum -= prev;
+                    }
+
+                    const currentWindowSize = Math.min(idx + 1, windowSize);
+                    const avg = windowSize === 1 ? value : Math.round(sum / currentWindowSize);
+
+                    data.push({
+                        label: formatHistoryLabel(s),
+                        value: avg
+                    });
+                });
 
                 series.push({
                     label: `Ch ${channelNum}`,
@@ -1811,30 +1899,48 @@ function renderCharts(samples) {
         }
     });
 
-    // Clients per SSID - show top networks by client count
-    drawSSIDClientsChart('#ssid-clients-chart');
+    // Clients per SSID - show top networks by client count from history
+    drawSSIDClientsChart('#ssid-clients-chart', samples);
 }
 
-async function drawSSIDClientsChart(canvasId) {
-    const data = await fetchJSON('/scan/report');
-    if (!data || !data.networks) return;
+async function drawSSIDClientsChart(canvasId, samples) {
+    if (!samples || samples.length === 0) return;
 
-    // Get top 10 networks by client count
-    const networks = data.networks
-        .filter(n => n.stations > 0)
+    const data = await fetchJSON('/scan/report');
+    const hashToSsid = new Map();
+    if (data && data.networks) {
+        data.networks.forEach(net => {
+            const hash = hashSsid(net.ssid || '');
+            hashToSsid.set(hash, net.ssid || '(Hidden)');
+        });
+    }
+
+    const ssidAggregates = new Map();
+    samples.forEach(sample => {
+        if (sample.ssid_clients) {
+            sample.ssid_clients.forEach(entry => {
+                const current = ssidAggregates.get(entry.hash) || { hash: entry.hash, total: 0, count: 0, max: 0 };
+                current.total += entry.count;
+                current.count++;
+                current.max = Math.max(current.max, entry.count);
+                ssidAggregates.set(entry.hash, current);
+            });
+        }
+    });
+
+    const networks = Array.from(ssidAggregates.values())
+        .map(agg => ({
+            ssid: hashToSsid.get(agg.hash) || `Unknown (${agg.hash})`,
+            stations: Math.round(agg.total / agg.count)
+        }))
         .sort((a, b) => b.stations - a.stations)
         .slice(0, 10);
 
-    if (networks.length === 0) {
-        // Show "no data" message
-        return;
-    }
+    if (networks.length === 0) return;
 
-    // Use a simple bar chart visualization
     const canvas = $(canvasId);
     if (!canvas) return;
 
-    // Cache for resize observer
     addToChartCache(canvas, { canvasId, networks });
     setupChartResize(canvas, (id, cachedData) => {
         if (cachedData && cachedData.networks) {
@@ -1843,6 +1949,14 @@ async function drawSSIDClientsChart(canvasId) {
     });
 
     drawSSIDClientsChartImpl(canvasId, networks);
+}
+
+function hashSsid(ssid) {
+    let hash = 5381;
+    for (let i = 0; i < ssid.length; i++) {
+        hash = ((hash << 5) + hash) + ssid.charCodeAt(i);
+    }
+    return hash >>> 0;
 }
 
 function drawSSIDClientsChartImpl(canvasId, networks) {
@@ -1899,8 +2013,8 @@ function drawSSIDClientsChartImpl(canvasId, networks) {
         ctx.font = '11px system-ui, sans-serif';
         ctx.textAlign = 'right';
         const ssid = net.ssid || `Hidden`;
-        const truncated = ssid.length > 15 ? ssid.slice(0, 15) + '...' : ssid;
-        ctx.fillText(truncated, 0, 0);
+        const displaySsid = privacyMode ? '••••••••' : (ssid.length > 15 ? ssid.slice(0, 15) + '...' : ssid);
+        ctx.fillText(displaySsid, 0, 0);
         ctx.restore();
     });
 
@@ -1950,7 +2064,7 @@ async function loadHomeSSIDs() {
     
     const connectedEl = $('#home-ssid-connected');
     if (connectedEl) {
-        connectedEl.textContent = data.connected || 'Not connected';
+        connectedEl.innerHTML = pii(data.connected || 'Not connected', 'ssid');
     }
     
     const extraEl = $('#extra-home-ssids');
@@ -1960,7 +2074,7 @@ async function loadHomeSSIDs() {
         } else {
             extraEl.innerHTML = data.extra.map(ssid => `
                 <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
-                    <span>${ssid}</span>
+                    ${pii(ssid, 'ssid')}
                     <button class="btn btn-sm" onclick="removeHomeSSID('${ssid}')" style="padding:2px 8px;font-size:11px;max-width:80px;">Remove</button>
                 </div>
             `).join('');
@@ -2071,6 +2185,7 @@ async function testWebhook(e) {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
+    initPrivacyMode();
     loadScanData();
     loadApConfig();
     loadNetworkStatus();

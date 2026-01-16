@@ -1459,7 +1459,9 @@ static esp_err_t history_samples_handler(httpd_req_t *req) {
         return ESP_FAIL;
     }
     
-    // start json response manually to avoid large cjson tree
+    extern uint32_t scan_storage_get_history_base_epoch(void);
+    uint32_t base_epoch = scan_storage_get_history_base_epoch();
+    
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr_chunk(req, "{\"samples\":[");
     
@@ -1476,15 +1478,21 @@ static esp_err_t history_samples_handler(httpd_req_t *req) {
         }
         
         for (uint32_t i = 0; i < actual; i++) {
-            // Optimize: Build entire JSON object in one buffer to reduce httpd_resp_sendstr_chunk calls
-            // This reduces 15+ calls per sample to just 1 call per sample
-            char buf[300];
-            int len = snprintf(buf, sizeof(buf),
-                "%s{\"epoch_ts\":%lu,\"uptime_sec\":%lu,\"time_valid\":%s,\"ap_count\":%u,\"client_count\":%u,\"channel_counts\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u]}",
+            uint32_t epoch_ts = 0;
+            uint32_t uptime_sec = chunk[i].timestamp_delta_sec;
+            bool time_valid = HISTORY_IS_TIME_VALID(chunk[i].flags);
+            
+            if (time_valid && base_epoch > 0) {
+                epoch_ts = base_epoch + chunk[i].timestamp_delta_sec;
+            }
+            
+            char buf[512];
+            snprintf(buf, sizeof(buf),
+                "%s{\"epoch_ts\":%lu,\"uptime_sec\":%lu,\"time_valid\":%s,\"ap_count\":%u,\"client_count\":%u,\"channel_counts\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u],\"ssid_clients\":[",
                 first ? "" : ",",
-                (unsigned long)chunk[i].epoch_ts,
-                (unsigned long)chunk[i].uptime_sec,
-                chunk[i].time_valid ? "true" : "false",
+                (unsigned long)epoch_ts,
+                (unsigned long)uptime_sec,
+                time_valid ? "true" : "false",
                 chunk[i].ap_count,
                 chunk[i].client_count,
                 chunk[i].channel_counts[0], chunk[i].channel_counts[1], chunk[i].channel_counts[2],
@@ -1495,6 +1503,18 @@ static esp_err_t history_samples_handler(httpd_req_t *req) {
             first = false;
 
             httpd_resp_sendstr_chunk(req, buf);
+            
+            uint8_t ssid_count = HISTORY_GET_SSID_COUNT(chunk[i].flags);
+            for (uint8_t j = 0; j < ssid_count; j++) {
+                char ssid_buf[64];
+                snprintf(ssid_buf, sizeof(ssid_buf), "%s{\"hash\":%lu,\"count\":%u}",
+                    j > 0 ? "," : "",
+                    (unsigned long)chunk[i].ssid_clients[j].ssid_hash,
+                    chunk[i].ssid_clients[j].client_count);
+                httpd_resp_sendstr_chunk(req, ssid_buf);
+            }
+            
+            httpd_resp_sendstr_chunk(req, "]}");
         }
         
         // advance by request_count (items read from flash), not actual (items after sanitize)

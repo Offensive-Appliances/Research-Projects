@@ -14,6 +14,8 @@
 #include <time.h>
 
 extern bool pwnpower_time_is_synced(void);
+extern uint32_t scan_storage_get_history_base_epoch(void);
+extern void scan_storage_set_history_base_epoch(uint32_t epoch);
 
 #define TAG "BgScan"
 #define BG_SCAN_TASK_STACK 8192
@@ -36,6 +38,14 @@ static bool trigger_pending = false;
 
 static uint32_t get_uptime_sec(void) {
     return (uint32_t)(esp_timer_get_time() / 1000000ULL);
+}
+
+static uint32_t hash_ssid(const uint8_t *ssid, size_t len) {
+    uint32_t hash = 5381;
+    for (size_t i = 0; i < len && ssid[i] != 0; i++) {
+        hash = ((hash << 5) + hash) + ssid[i];
+    }
+    return hash;
 }
 
 typedef struct {
@@ -299,17 +309,61 @@ static void background_scan_task(void *arg) {
         
         history_sample_t sample;
         memset(&sample, 0, sizeof(sample));
-        sample.epoch_ts = record->header.epoch_ts;
-        sample.uptime_sec = record->header.uptime_sec;
-        sample.time_valid = record->header.time_valid;
+        
+        uint32_t base_epoch = scan_storage_get_history_base_epoch();
+        if (base_epoch == 0 && record->header.time_valid && record->header.epoch_ts > 0) {
+            base_epoch = record->header.epoch_ts;
+            scan_storage_set_history_base_epoch(base_epoch);
+        }
+        
+        if (record->header.time_valid && base_epoch > 0 && record->header.epoch_ts >= base_epoch) {
+            uint32_t delta = record->header.epoch_ts - base_epoch;
+            sample.timestamp_delta_sec = (delta > 65535) ? 65535 : delta;
+            sample.flags = HISTORY_FLAG_TIME_VALID;
+        } else {
+            sample.timestamp_delta_sec = (uint16_t)(record->header.uptime_sec & 0xFFFF);
+            sample.flags = 0;
+        }
         sample.ap_count = record->header.ap_count;
-        sample.client_count = record->header.total_stations;
+        sample.client_count = record->header.total_stations > 255 ? 255 : record->header.total_stations;
         
         for (uint8_t i = 0; i < record->header.ap_count; i++) {
             uint8_t ch = record->aps[i].channel;
             if (ch >= 1 && ch <= 13) {
                 sample.channel_counts[ch - 1]++;
             }
+        }
+        
+        typedef struct {
+            uint32_t hash;
+            uint8_t count;
+        } ssid_temp_t;
+        ssid_temp_t ssid_temps[MAX_APS_PER_SCAN];
+        uint8_t temp_count = 0;
+        
+        for (uint8_t i = 0; i < record->header.ap_count && temp_count < MAX_APS_PER_SCAN; i++) {
+            if (record->aps[i].station_count > 0) {
+                ssid_temps[temp_count].hash = hash_ssid(record->aps[i].ssid, 33);
+                ssid_temps[temp_count].count = record->aps[i].station_count;
+                temp_count++;
+            }
+        }
+        
+        for (uint8_t i = 0; i < temp_count - 1; i++) {
+            for (uint8_t j = i + 1; j < temp_count; j++) {
+                if (ssid_temps[j].count > ssid_temps[i].count) {
+                    ssid_temp_t tmp = ssid_temps[i];
+                    ssid_temps[i] = ssid_temps[j];
+                    ssid_temps[j] = tmp;
+                }
+            }
+        }
+        
+        uint8_t ssid_count = temp_count > MAX_SSID_CLIENTS_PER_SAMPLE ? MAX_SSID_CLIENTS_PER_SAMPLE : temp_count;
+        HISTORY_SET_SSID_COUNT(sample.flags, ssid_count);
+        for (uint8_t i = 0; i < ssid_count; i++) {
+            sample.ssid_clients[i].ssid_hash = ssid_temps[i].hash;
+            sample.ssid_clients[i].client_count = ssid_temps[i].count;
         }
         
         esp_err_t err = scan_storage_save(record);

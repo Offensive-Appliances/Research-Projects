@@ -245,6 +245,7 @@ esp_err_t scan_storage_init(void) {
         storage_index.history_count = 0;
         storage_index.event_write_idx = 0;
         storage_index.event_count = 0;
+        storage_index.history_base_epoch = 0;
         
         // erase data partition on fresh init
         err = flash_manager_erase_range(&flash_mgr, DATA_OFFSET, flash_mgr.partition->size - DATA_OFFSET);
@@ -282,9 +283,8 @@ esp_err_t scan_storage_init(void) {
             history_sample_t test_sample;
             uint32_t offset = history_ring.base_offset + (oldest_idx * history_ring.item_size);
             if (flash_manager_read(&flash_mgr, offset, &test_sample, sizeof(test_sample)) == ESP_OK) {
-                if (test_sample.ap_count == 255 || test_sample.client_count == 65535 ||
-                    (test_sample.uptime_sec == 0 && test_sample.epoch_ts == 0) ||
-                    test_sample.uptime_sec == 0xFFFFFFFF) {
+                if (test_sample.ap_count == 255 || test_sample.client_count == 255 ||
+                    test_sample.timestamp_delta_sec == 0xFFFF) {
                     ESP_LOGW(TAG, "history ring oldest sample invalid (flash erased?), resetting count from %lu to 0",
                              (unsigned long)history_ring.count);
                     history_ring.count = 0;
@@ -782,26 +782,20 @@ static uint32_t get_uptime_sec(void) {
     return (uint32_t)(esp_timer_get_time() / 1000000ULL);
 }
 
-// Calculate priority score for device eviction
-// Higher score = higher priority = less likely to be evicted
 static uint32_t calculate_device_priority(const device_presence_t *dev, uint32_t now, uint32_t epoch_now, bool time_ok) {
     uint32_t priority = 0;
 
-    // Base priority from sightings (0-1000 points, capped at 100 sightings)
     uint32_t sightings = (dev->total_sightings > 100) ? 100 : dev->total_sightings;
     priority += sightings * 10;
 
-    // Home device bonus (MASSIVE: +10,000 points)
     if (DEVICE_IS_HOME(dev->flags)) {
         priority += 10000;
     }
 
-    // Known device bonus (+500 points)
     if (DEVICE_IS_KNOWN(dev->flags)) {
         priority += 500;
     }
 
-    // Recently seen bonus (0-500 points based on recency)
     uint32_t last_seen_ago = UINT32_MAX;
     if (time_ok && DEVICE_EPOCH_VALID(dev->flags) && dev->last_seen_epoch > 0 && dev->last_seen_epoch <= epoch_now) {
         last_seen_ago = epoch_now - dev->last_seen_epoch;
@@ -809,15 +803,14 @@ static uint32_t calculate_device_priority(const device_presence_t *dev, uint32_t
         last_seen_ago = now - dev->last_seen;
     }
 
-    if (last_seen_ago < 300) {          // <5 min: currently present
+    if (last_seen_ago < 300) {
         priority += 500;
-    } else if (last_seen_ago < 3600) {  // <1 hour: recently away
+    } else if (last_seen_ago < 3600) {
         priority += 300;
-    } else if (last_seen_ago < 86400) { // <1 day: seen today
+    } else if (last_seen_ago < 86400) {
         priority += 100;
     }
 
-    // Age bonus - longer tracked = more valuable (0-200 points)
     if (dev->first_seen > 0 && dev->first_seen <= now) {
         uint32_t age_days = (now - dev->first_seen) / 86400;
         priority += (age_days > 20) ? 200 : (age_days * 10);
@@ -1620,34 +1613,43 @@ const char* scan_storage_get_unified_intelligence_json(void) {
 static uint32_t last_history_epoch = 0;
 static uint32_t last_history_uptime = 0;
 
+uint32_t scan_storage_get_history_base_epoch(void) {
+    return storage_index.history_base_epoch;
+}
+
+void scan_storage_set_history_base_epoch(uint32_t epoch) {
+    storage_index.history_base_epoch = epoch;
+    write_storage_index();
+}
+
 esp_err_t scan_storage_append_history_sample(const history_sample_t *sample) {
     if (!sample) return ESP_ERR_INVALID_ARG;
     
-    // deduplicate: skip if same timestamp as last sample
-    if (sample->time_valid && sample->epoch_ts == last_history_epoch && sample->epoch_ts != 0) {
-        ESP_LOGD(TAG, "skipping duplicate history sample epoch=%lu", (unsigned long)sample->epoch_ts);
+    uint32_t current_epoch = 0;
+    if (HISTORY_IS_TIME_VALID(sample->flags) && storage_index.history_base_epoch > 0) {
+        current_epoch = storage_index.history_base_epoch + sample->timestamp_delta_sec;
+    }
+    
+    if (current_epoch > 0 && current_epoch == last_history_epoch) {
+        ESP_LOGD(TAG, "skipping duplicate history sample epoch=%lu", (unsigned long)current_epoch);
         return ESP_OK;
     }
-    if (!sample->time_valid && sample->uptime_sec == last_history_uptime && sample->uptime_sec != 0) {
-        ESP_LOGD(TAG, "skipping duplicate history sample uptime=%lu", (unsigned long)sample->uptime_sec);
+    if (current_epoch == 0 && sample->timestamp_delta_sec == last_history_uptime && sample->timestamp_delta_sec != 0) {
+        ESP_LOGD(TAG, "skipping duplicate history sample delta=%u", sample->timestamp_delta_sec);
         return ESP_OK;
     }
     
-    ESP_LOGI(TAG, "writing history sample: epoch=%lu uptime=%lu aps=%u clients=%u",
-             (unsigned long)sample->epoch_ts, (unsigned long)sample->uptime_sec,
-             sample->ap_count, sample->client_count);
+    ESP_LOGI(TAG, "writing history sample: delta=%u aps=%u clients=%u flags=0x%02x",
+             sample->timestamp_delta_sec, sample->ap_count, sample->client_count, sample->flags);
     
-    // use flash manager ring buffer helper
     esp_err_t err = flash_manager_ring_write(&flash_mgr, &history_ring, sample);
     if (err != ESP_OK) {
         return err;
     }
     
-    // track last written sample for deduplication
-    last_history_epoch = sample->epoch_ts;
-    last_history_uptime = sample->uptime_sec;
+    last_history_epoch = current_epoch;
+    last_history_uptime = sample->timestamp_delta_sec;
     
-    // update index and persist
     storage_index.history_write_idx = history_ring.write_idx;
     storage_index.history_count = history_ring.count;
     err = write_storage_index();
@@ -1665,20 +1667,21 @@ static uint32_t sanitize_history_samples(history_sample_t *samples, uint32_t cou
     uint32_t last_uptime = 0;
     bool last_time_valid = false;
     bool have_prev = false;
+    uint32_t base_epoch = storage_index.history_base_epoch;
 
     for (uint32_t i = 0; i < count; i++) {
         history_sample_t *src = &samples[i];
 
-        if (src->ap_count >= 200 || src->client_count >= 10000) {
+        if (src->ap_count >= 200 || src->client_count >= 250) {
             ESP_LOGD(TAG, "filter sample %u: garbage data (ap=%u, clients=%u)", i, src->ap_count, src->client_count);
             continue;
         }
-        if (src->uptime_sec == 0 && src->epoch_ts == 0) {
-            ESP_LOGD(TAG, "filter sample %u: zero timestamps", i);
+        if (src->timestamp_delta_sec == 0 && !HISTORY_IS_TIME_VALID(src->flags)) {
+            ESP_LOGD(TAG, "filter sample %u: zero timestamp delta", i);
             continue;
         }
-        if (src->uptime_sec == 0xFFFFFFFF || src->epoch_ts == 0xFFFFFFFF) {
-            ESP_LOGD(TAG, "filter sample %u: FF timestamps", i);
+        if (src->timestamp_delta_sec == 0xFFFF) {
+            ESP_LOGD(TAG, "filter sample %u: FF timestamp delta", i);
             continue;
         }
 
@@ -1694,16 +1697,22 @@ static uint32_t sanitize_history_samples(history_sample_t *samples, uint32_t cou
             continue;
         }
 
-        if (src->time_valid && src->epoch_ts > 0 && src->epoch_ts < 1700000000) {
-            ESP_LOGD(TAG, "filter sample %u: stale epoch %lu", i, (unsigned long)src->epoch_ts);
-            src->time_valid = 0;
+        uint32_t epoch_ts = 0;
+        bool time_valid = HISTORY_IS_TIME_VALID(src->flags);
+        if (time_valid && base_epoch > 0) {
+            epoch_ts = base_epoch + src->timestamp_delta_sec;
+        }
+        if (time_valid && epoch_ts > 0 && epoch_ts < 1700000000) {
+            ESP_LOGD(TAG, "filter sample %u: stale epoch %lu", i, (unsigned long)epoch_ts);
+            src->flags &= ~HISTORY_FLAG_TIME_VALID;
+            time_valid = false;
         }
 
         bool is_dup = false;
         if (have_prev) {
-            if (src->time_valid && last_time_valid && src->epoch_ts == last_epoch) {
+            if (time_valid && last_time_valid && epoch_ts == last_epoch) {
                 is_dup = true;
-            } else if (!src->time_valid && !last_time_valid && src->uptime_sec == last_uptime) {
+            } else if (!time_valid && !last_time_valid && src->timestamp_delta_sec == last_uptime) {
                 is_dup = true;
             }
         }
@@ -1717,9 +1726,9 @@ static uint32_t sanitize_history_samples(history_sample_t *samples, uint32_t cou
             src = &samples[valid_count];
         }
 
-        last_epoch = src->epoch_ts;
-        last_uptime = src->uptime_sec;
-        last_time_valid = src->time_valid;
+        last_epoch = epoch_ts;
+        last_uptime = src->timestamp_delta_sec;
+        last_time_valid = time_valid;
         have_prev = true;
         valid_count++;
     }

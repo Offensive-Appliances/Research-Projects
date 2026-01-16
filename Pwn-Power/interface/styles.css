@@ -706,3 +706,68 @@ label:hover {
     color: var(--text-muted);
     font-size: 11px;
 }
+
+/* Privacy Mode */
+.privacy-btn {
+    position: absolute;
+    right: 16px;
+    top: 50%;
+    transform: translateY(-50%);
+    background: rgba(255,255,255,0.1);
+    border: 1px solid rgba(255,255,255,0.2);
+    border-radius: 8px;
+    padding: 8px 12px;
+    cursor: pointer;
+    font-size: 16px;
+    transition: all 0.2s;
+}
+
+.privacy-btn:hover {
+    background: rgba(255,255,255,0.15);
+}
+
+.privacy-btn.active {
+    background: var(--accent);
+    border-color: var(--accent);
+}
+
+header {
+    position: relative;
+}
+
+body.privacy-mode .pii-mac,
+body.privacy-mode .pii-ssid,
+body.privacy-mode .pii-vendor,
+body.privacy-mode .pii-bssid,
+body.privacy-mode .pii-url {
+    filter: blur(5px);
+    user-select: none;
+    transition: filter 0.2s;
+}
+
+body.privacy-mode .pii-mac:hover,
+body.privacy-mode .pii-ssid:hover,
+body.privacy-mode .pii-vendor:hover,
+body.privacy-mode .pii-bssid:hover,
+body.privacy-mode .pii-url:hover {
+    filter: blur(0);
+}
+
+.privacy-indicator {
+    position: fixed;
+    bottom: 16px;
+    right: 16px;
+    background: var(--accent);
+    color: #fff;
+    padding: 8px 16px;
+    border-radius: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    z-index: 1000;
+    display: none;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+}
+
+body.privacy-mode .privacy-indicator {
+    display: block;
+}

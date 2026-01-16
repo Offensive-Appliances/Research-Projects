@@ -9,18 +9,17 @@
 #define SCAN_STORAGE_PARTITION "scandata"
 #define SCAN_MAGIC 0x50574E53  // "PWNS"
 #define SCAN_VERSION 2
-#define MAX_APS_PER_SCAN 16
+#define MAX_APS_PER_SCAN 32
 #define MAX_STATIONS_PER_AP 8
 #define MAX_SCAN_HISTORY 1
-
-// Optimized storage allocation in 896KB scandata partition:
-// - Scan record: ~11KB (reusable)
-// - History samples: 30 days at 2-min cadence = ~21600 samples × 32 bytes = ~691KB
-// - Device events: 512 events × 44 bytes = ~22KB
-// - Device tracking: Moved to dedicated offset for better flash utilization
-// Total: ~724KB used, ~172KB free
-#define MAX_HISTORY_SAMPLES 21600
+#define MAX_HISTORY_SAMPLES 14400
 #define MAX_DEVICE_EVENTS 512
+#define MAX_SSID_CLIENTS_PER_SAMPLE 6
+
+typedef struct __attribute__((packed)) {
+    uint32_t ssid_hash;
+    uint8_t client_count;
+} ssid_client_entry_t;
 
 typedef struct __attribute__((packed)) {
     uint8_t mac[6];
@@ -81,18 +80,27 @@ typedef struct __attribute__((packed)) {
     uint32_t history_count;
     uint32_t event_write_idx;
     uint32_t event_count;
+    uint32_t history_base_epoch;  // base epoch for history delta timestamps
 } storage_index_t;
 
 // compact history sample for charts (fixed size ring buffer)
+// Optimized to 48 bytes per sample for ~20 days in 768KB partition
 typedef struct __attribute__((packed)) {
-    uint32_t epoch_ts;      // unix epoch timestamp
-    uint32_t uptime_sec;    // uptime in seconds
-    uint8_t time_valid;     // 1 if epoch_ts is valid
+    uint16_t timestamp_delta_sec;  // seconds since ring base epoch
+    uint8_t flags;                 // bit0=time_valid, bits1-3=ssid_count (0-6), bits4-7=reserved
     uint8_t ap_count;
-    uint16_t client_count;
-    uint8_t channel_counts[13];  // ap count per channel 1-13
-    uint8_t _reserved[3];
+    uint8_t client_count;          // clamped to 255
+    uint8_t channel_counts[13];    // ap count per channel 1-13
+    ssid_client_entry_t ssid_clients[MAX_SSID_CLIENTS_PER_SAMPLE];
 } history_sample_t;
+
+// Helper macros for history_sample_t flags
+#define HISTORY_FLAG_TIME_VALID     (1 << 0)
+#define HISTORY_FLAG_SSID_COUNT_MASK 0x0E
+#define HISTORY_FLAG_SSID_COUNT_SHIFT 1
+#define HISTORY_GET_SSID_COUNT(flags) (((flags) & HISTORY_FLAG_SSID_COUNT_MASK) >> HISTORY_FLAG_SSID_COUNT_SHIFT)
+#define HISTORY_SET_SSID_COUNT(flags, count) ((flags) = ((flags) & ~HISTORY_FLAG_SSID_COUNT_MASK) | (((count) & 0x07) << HISTORY_FLAG_SSID_COUNT_SHIFT))
+#define HISTORY_IS_TIME_VALID(flags) ((flags) & HISTORY_FLAG_TIME_VALID)
 
 // device lifecycle event (fixed size ring buffer)
 typedef struct __attribute__((packed)) {
@@ -139,23 +147,21 @@ typedef struct {
     char last_ap_ssid[33];        // Last seen AP SSID
 } device_presence_v1_t;
 
-// Optimized device presence tracking structure
-// Reduced from 235 bytes to 131 bytes per device (44% smaller!)
 typedef struct __attribute__((packed)) {
-    uint8_t mac[6];                     // 6 bytes - Device MAC address
-    uint32_t first_seen;                // 4 bytes - First seen uptime
-    uint32_t last_seen;                 // 4 bytes - Last seen uptime
-    uint16_t total_sightings;           // 2 bytes - Total sightings (was 4, max 65k is plenty)
-    int8_t rssi_avg;                    // 1 byte - Average RSSI
-    uint8_t flags;                      // 1 byte - Packed: device_type(4bit) | is_known(1bit) | epoch_valid(1bit) | reserved(2bit)
-    char vendor[16];                    // 16 bytes - Vendor string (reduced from 24)
-    uint8_t presence_hours[3];          // 3 bytes - Bit-packed hourly presence (1 bit per hour, 0-23)
-    uint8_t associated_ap_count;        // 1 byte - Number of associated APs
-    uint8_t associated_aps[8][6];       // 48 bytes - Up to 8 APs this device connects to
-    char last_ap_ssid[33];              // 33 bytes - Last seen AP SSID
-    uint32_t first_seen_epoch;          // 4 bytes - First seen epoch timestamp
-    uint32_t last_seen_epoch;           // 4 bytes - Last seen epoch timestamp
-} device_presence_t;                    // Total: 131 bytes (was 235)
+    uint8_t mac[6];
+    uint32_t first_seen;
+    uint32_t last_seen;
+    uint16_t total_sightings;
+    int8_t rssi_avg;
+    uint8_t flags;
+    char vendor[16];
+    uint8_t presence_hours[3];
+    uint8_t associated_ap_count;
+    uint8_t associated_aps[8][6];
+    char last_ap_ssid[33];
+    uint32_t first_seen_epoch;
+    uint32_t last_seen_epoch;
+} device_presence_t;
 
 // Flag bit positions
 #define DEVICE_FLAG_IS_KNOWN        (1 << 0)

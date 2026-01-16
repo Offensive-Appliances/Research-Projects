@@ -10,6 +10,9 @@
     <header>
         <h1>PwnPower</h1>
         <div class="subtitle">Offensive Appliances Research</div>
+        <button id="privacy-toggle" class="privacy-btn" onclick="togglePrivacyMode()" title="Toggle Privacy Mode for demos">
+            <span id="privacy-icon">◉</span>
+        </button>
     </header>
     
     <main>
@@ -49,7 +52,7 @@
                 
                 <div id="attack-options" style="display:none;">
                     <div class="network-info">
-                        <h4>Target: <span id="selected-target">--</span></h4>
+                        <h4>Target: <span id="selected-target" class="pii-ssid">--</span></h4>
                         <div class="muted">Click clients to target specific devices</div>
                     </div>
                     <div class="btn-group">
@@ -214,7 +217,7 @@
                         <button class="btn btn-filter" data-filter="present" onclick="filterDevices('present')">Present</button>
                         <button class="btn btn-filter" data-filter="away" onclick="filterDevices('away')">Away</button>
                         <button class="btn btn-filter" data-filter="new" onclick="filterDevices('new')">New</button>
-                        <select id="ap-filter" class="btn" onchange="filterByAP(this.value)" style="padding:8px 12px;">
+                        <select id="ap-filter" class="btn pii-ssid" onchange="filterByAP(this.value)" style="padding:8px 12px;">
                             <option value="all">All APs</option>
                         </select>
                         <div style="margin-left:auto;">
@@ -255,7 +258,7 @@
                             <input type="checkbox" id="webhook-enabled">
                             <span>Enable webhook alerts</span>
                         </label>
-                        <input type="url" id="webhook-url" placeholder="https://example.com/webhook" style="margin-bottom:12px;">
+                        <input type="url" id="webhook-url" class="pii-url" placeholder="https://example.com/webhook" style="margin-bottom:12px;">
                         
                         <div style="margin-bottom:12px;">
                             <div class="muted" style="margin-bottom:6px;font-weight:500;">Alert Filters:</div>
@@ -354,7 +357,7 @@
                         <h4>Connect to Home Network</h4>
                         <div class="muted">Connect to WiFi for mDNS access (pwnpower.local)</div>
                         <form id="network-form">
-                            <input type="text" id="net-ssid" placeholder="Network SSID">
+                            <input type="text" id="net-ssid" class="pii-ssid" placeholder="Network SSID">
                             <input type="password" id="net-pass" placeholder="Password">
                             <div class="btn-group">
                                 <button type="submit" class="btn btn-primary">Connect</button>
@@ -385,7 +388,7 @@
                         </div>
                         <div id="extra-home-ssids" style="margin-bottom:8px;"></div>
                         <div style="display:flex;gap:8px;">
-                            <input type="text" id="new-home-ssid" placeholder="Add SSID..." style="flex:1;">
+                            <input type="text" id="new-home-ssid" class="pii-ssid" placeholder="Add SSID..." style="flex:1;">
                             <button class="btn btn-sm" onclick="addHomeSSID()" style="max-width:120px;">Add</button>
                         </div>
                         <div class="muted" style="margin-top:8px;font-size:11px;">Up to 3 additional SSIDs can be added.</div>
@@ -394,7 +397,7 @@
                         <h4>AP Settings</h4>
                         <div class="muted">Current: <span id="current-ssid">--</span> (<span id="current-security">--</span>)</div>
                         <form id="ap-config-form">
-                            <input type="text" id="ap-ssid" placeholder="New SSID" maxlength="32">
+                            <input type="text" id="ap-ssid" class="pii-ssid" placeholder="New SSID" maxlength="32">
                             <input type="password" id="ap-pass" placeholder="Password (8+ chars or empty)">
                             <button type="submit" class="btn">Save & Apply</button>
                         </form>
@@ -444,6 +447,7 @@
         </section>
     </main>
     
+    <div class="privacy-indicator">Privacy Mode Active</div>
     <script src="app.js"></script>
 </body>
 </html>
