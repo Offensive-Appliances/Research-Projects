@@ -16,8 +16,13 @@
 #include "mdns_service.h"
 #include "sta_config.h"
 #include "idle_scanner.h"
+#include "device_db.h"
+#include "device_lifecycle.h"
+#include "webhook.h"
+#include "scan_storage.h"
 #include "esp_sntp.h"
 #include "esp_timer.h"
+#include "monitor_uptime.h"
 #include <time.h>
 
 #define TAG "PwnPower"
@@ -26,6 +31,7 @@
 
 static int s_retry_num = 0;
 static bool s_time_synced = false;
+static bool s_sntp_started = false;
 
 // AP reconnect system state
 static uint32_t s_last_disconnect_time = 0;
@@ -39,11 +45,13 @@ static void pwnpower_sntp_sync_time(void) {
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "pool.ntp.org");
     esp_sntp_init();
+    s_sntp_started = true;
     ESP_LOGI(TAG, "SNTP started");
 }
 
 bool pwnpower_time_is_synced(void) {
     if (s_time_synced) return true;
+    if (!s_sntp_started) return false;
     time_t now = 0;
     time(&now);
     s_time_synced = (now > 1704067200);
@@ -102,11 +110,16 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         webserver_set_sta_connected(true);
         mdns_service_update_hostname("pwnpower");
         pwnpower_sntp_sync_time();
-        
+
+        // Set home network to the connected SSID for device prioritization
         sta_config_t sta_cfg;
-        if (sta_config_get(&sta_cfg) == ESP_OK && !sta_cfg.ap_while_connected) {
-            ESP_LOGI(TAG, "Disabling AP (ap_while_connected=false)");
-            esp_wifi_set_mode(WIFI_MODE_STA);
+        if (sta_config_get(&sta_cfg) == ESP_OK && strlen(sta_cfg.ssid) > 0) {
+            scan_storage_set_home_ssid(sta_cfg.ssid);
+
+            if (!sta_cfg.ap_while_connected) {
+                ESP_LOGI(TAG, "Disabling AP (ap_while_connected=false)");
+                esp_wifi_set_mode(WIFI_MODE_STA);
+            }
         }
     }
 }
@@ -220,6 +233,9 @@ void app_main() {
     }
     ESP_ERROR_CHECK(ret);
 
+    // initialize monitor uptime tracking (early to capture boot time)
+    monitor_uptime_init();
+
     // mark app valid so rollback doesn't screw us after ota
     esp_ota_mark_app_valid_cancel_rollback();
     attack_mutex = xSemaphoreCreateMutex();
@@ -235,6 +251,14 @@ void app_main() {
     
     mdns_service_init("pwnpower");
     
+    // initialize device tracking
+    device_db_init();
+    device_lifecycle_init();
+    
+    // initialize and start webhook dispatcher
+    webhook_init();
+    webhook_start();
+    
     if (background_scan_init() == ESP_OK) {
         background_scan_start();
     }
@@ -243,7 +267,7 @@ void app_main() {
         idle_scanner_start();
     }
     
-    // Start periodic STA reconnect task
+    // start periodic sta reconnect task
     xTaskCreate(sta_reconnect_task, "sta_reconnect", 2048, NULL, 5, NULL);
     ESP_LOGI(TAG, "Started STA reconnect task");
 }

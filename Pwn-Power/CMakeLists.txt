@@ -10,5 +10,5 @@ set(SDKCONFIG_DEFAULTS "${CMAKE_CURRENT_SOURCE_DIR}/sdkconfig.defaults")
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(pwnpower)
 
-# allow multiple definitions of 80211_raw_frame_sanity_check to bypass espressif stupidity
+# allow multiple definitions of 80211_raw_frame_sanity_check for raw frame operations
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-zmuldefs")

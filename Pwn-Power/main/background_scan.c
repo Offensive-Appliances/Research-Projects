@@ -3,12 +3,19 @@
 #include "freertos/semphr.h"
 #include "background_scan.h"
 #include "scan_storage.h"
+#include "device_lifecycle.h"
 #include "wifi_scan.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "monitor_uptime.h"
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
+
+extern bool pwnpower_time_is_synced(void);
+extern uint32_t scan_storage_get_history_base_epoch(void);
+extern void scan_storage_set_history_base_epoch(uint32_t epoch);
 
 #define TAG "BgScan"
 #define BG_SCAN_TASK_STACK 8192
@@ -31,6 +38,14 @@ static bool trigger_pending = false;
 
 static uint32_t get_uptime_sec(void) {
     return (uint32_t)(esp_timer_get_time() / 1000000ULL);
+}
+
+static uint32_t hash_ssid(const uint8_t *ssid, size_t len) {
+    uint32_t hash = 5381;
+    for (size_t i = 0; i < len && ssid[i] != 0; i++) {
+        hash = ((hash << 5) + hash) + ssid[i];
+    }
+    return hash;
 }
 
 typedef struct {
@@ -97,8 +112,8 @@ static void populate_scan_record(scan_record_t *record) {
         .channel = 0,
         .show_hidden = true,
         .scan_type = WIFI_SCAN_TYPE_ACTIVE,
-        .scan_time.active.min = 100,
-        .scan_time.active.max = 300
+        .scan_time.active.min = 120,
+        .scan_time.active.max = 400
     };
 
     uint8_t ap_idx = 0;
@@ -199,7 +214,7 @@ static void populate_scan_record(scan_record_t *record) {
     
     for (uint8_t ch = 1; ch <= 13; ch++) {
         esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
-        vTaskDelay(pdMS_TO_TICKS(200));
+        vTaskDelay(pdMS_TO_TICKS(350));
     }
     
     esp_wifi_set_promiscuous(false);
@@ -239,10 +254,24 @@ static void populate_scan_record(scan_record_t *record) {
         }
     }
     
-    // Run analytics after each scan
+    // check for device departures
+    device_lifecycle_check_departures();
+    
+    // run analytics after each scan
     scan_storage_detect_rogue_aps();
 
     record->header.scan_duration_sec = get_uptime_sec() - start_time;
+    
+    // add epoch timestamp if time is synced
+    if (pwnpower_time_is_synced()) {
+        time_t now;
+        time(&now);
+        record->header.epoch_ts = (uint32_t)now;
+        record->header.time_valid = 1;
+    } else {
+        record->header.epoch_ts = 0;
+        record->header.time_valid = 0;
+    }
 }
 
 static void background_scan_task(void *arg) {
@@ -278,6 +307,65 @@ static void background_scan_task(void *arg) {
         
         populate_scan_record(record);
         
+        history_sample_t sample;
+        memset(&sample, 0, sizeof(sample));
+        
+        uint32_t base_epoch = scan_storage_get_history_base_epoch();
+        if (base_epoch == 0 && record->header.time_valid && record->header.epoch_ts > 0) {
+            base_epoch = record->header.epoch_ts;
+            scan_storage_set_history_base_epoch(base_epoch);
+        }
+        
+        if (record->header.time_valid && base_epoch > 0 && record->header.epoch_ts >= base_epoch) {
+            uint32_t delta = record->header.epoch_ts - base_epoch;
+            sample.timestamp_delta_sec = (delta > 65535) ? 65535 : delta;
+            sample.flags = HISTORY_FLAG_TIME_VALID;
+        } else {
+            sample.timestamp_delta_sec = (uint16_t)(record->header.uptime_sec & 0xFFFF);
+            sample.flags = 0;
+        }
+        sample.ap_count = record->header.ap_count;
+        sample.client_count = record->header.total_stations > 255 ? 255 : record->header.total_stations;
+        
+        for (uint8_t i = 0; i < record->header.ap_count; i++) {
+            uint8_t ch = record->aps[i].channel;
+            if (ch >= 1 && ch <= 13) {
+                sample.channel_counts[ch - 1]++;
+            }
+        }
+        
+        typedef struct {
+            uint32_t hash;
+            uint8_t count;
+        } ssid_temp_t;
+        ssid_temp_t ssid_temps[MAX_APS_PER_SCAN];
+        uint8_t temp_count = 0;
+        
+        for (uint8_t i = 0; i < record->header.ap_count && temp_count < MAX_APS_PER_SCAN; i++) {
+            if (record->aps[i].station_count > 0) {
+                ssid_temps[temp_count].hash = hash_ssid(record->aps[i].ssid, 33);
+                ssid_temps[temp_count].count = record->aps[i].station_count;
+                temp_count++;
+            }
+        }
+        
+        for (uint8_t i = 0; i < temp_count - 1; i++) {
+            for (uint8_t j = i + 1; j < temp_count; j++) {
+                if (ssid_temps[j].count > ssid_temps[i].count) {
+                    ssid_temp_t tmp = ssid_temps[i];
+                    ssid_temps[i] = ssid_temps[j];
+                    ssid_temps[j] = tmp;
+                }
+            }
+        }
+        
+        uint8_t ssid_count = temp_count > MAX_SSID_CLIENTS_PER_SAMPLE ? MAX_SSID_CLIENTS_PER_SAMPLE : temp_count;
+        HISTORY_SET_SSID_COUNT(sample.flags, ssid_count);
+        for (uint8_t i = 0; i < ssid_count; i++) {
+            sample.ssid_clients[i].ssid_hash = ssid_temps[i].hash;
+            sample.ssid_clients[i].client_count = ssid_temps[i].count;
+        }
+        
         esp_err_t err = scan_storage_save(record);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Failed to save scan: %s", esp_err_to_name(err));
@@ -285,6 +373,16 @@ static void background_scan_task(void *arg) {
             ESP_LOGI(TAG, "Scan complete: %u APs, %u stations", 
                      record->header.ap_count, record->header.total_stations);
         }
+        
+        wifi_scan_update_ui_cache_from_record(record);
+        
+        err = scan_storage_append_history_sample(&sample);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to save history sample: %s", esp_err_to_name(err));
+        }
+        
+        // flush tracked devices to nvs after each scan
+        scan_storage_flush_devices();
         
         free(record);
         

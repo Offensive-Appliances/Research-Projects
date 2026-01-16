@@ -225,7 +225,20 @@ void wifi_scan() {
                             cJSON *scan_ap_entry = NULL;
                             cJSON_ArrayForEach(scan_ap_entry, rows) {
                                 cJSON *scan_mac_item = cJSON_GetObjectItem(scan_ap_entry, "MAC");
-                                if (scan_mac_item && strcmp(scan_mac_item->valuestring, ap_mac_item->valuestring) == 0) {
+                                if (scan_mac_item && scan_mac_item->valuestring && ap_mac_item->valuestring) {
+                                    char scan_mac_upper[18];
+                                    char ap_mac_upper[18];
+                                    strncpy(scan_mac_upper, scan_mac_item->valuestring, sizeof(scan_mac_upper));
+                                    scan_mac_upper[sizeof(scan_mac_upper) - 1] = '\0';
+                                    strncpy(ap_mac_upper, ap_mac_item->valuestring, sizeof(ap_mac_upper));
+                                    ap_mac_upper[sizeof(ap_mac_upper) - 1] = '\0';
+
+                                    for (int m = 0; scan_mac_upper[m]; m++) scan_mac_upper[m] = toupper((unsigned char)scan_mac_upper[m]);
+                                    for (int m = 0; ap_mac_upper[m]; m++) ap_mac_upper[m] = toupper((unsigned char)ap_mac_upper[m]);
+
+                                    if (strcmp(scan_mac_upper, ap_mac_upper) != 0) {
+                                        continue;
+                                    }
                                     cJSON *ssid_item = cJSON_GetObjectItem(scan_ap_entry, "SSID");
                                     if (ssid_item) {
                                         scan_storage_update_device_presence(mac, rssi_item->valueint, ssid_item->valuestring);
@@ -288,6 +301,78 @@ void wifi_scan() {
     scan_storage_update_security_events(wifi_scan_get_deauth_count());
     
     ESP_LOGI(TAG, "Wi-Fi Scan Completed. Results cached.");
+}
+
+// update ui cache from background scan record
+void wifi_scan_update_ui_cache_from_record(const scan_record_t *record) {
+    if (!record) return;
+    if (!scan_mutex) scan_mutex = xSemaphoreCreateMutex();
+    
+    cJSON *root = cJSON_CreateObject();
+    cJSON *rows = cJSON_AddArrayToObject(root, "rows");
+    
+    uint32_t now_sec = record->header.time_valid ? record->header.epoch_ts : record->header.uptime_sec;
+    
+    for (int i = 0; i < record->header.ap_count; i++) {
+        const stored_ap_t *ap = &record->aps[i];
+        
+        cJSON *ap_entry = cJSON_CreateObject();
+        cJSON_AddStringToObject(ap_entry, "SSID", (char*)ap->ssid);
+        cJSON_AddStringToObject(ap_entry, "MAC", mac_to_str(ap->bssid));
+        cJSON_AddNumberToObject(ap_entry, "Channel", ap->channel);
+        cJSON_AddNumberToObject(ap_entry, "RSSI", ap->rssi);
+        cJSON_AddStringToObject(ap_entry, "Security", get_security_type(ap->auth_mode));
+        cJSON_AddStringToObject(ap_entry, "Band", get_band(ap->channel));
+        cJSON_AddNumberToObject(ap_entry, "last_seen", now_sec);
+        cJSON_AddBoolToObject(ap_entry, "hidden", ap->hidden);
+        
+        char vendor[48] = "Unknown";
+        ouis_lookup_vendor(ap->bssid, vendor, sizeof(vendor));
+        cJSON_AddStringToObject(ap_entry, "Vendor", vendor);
+        
+        // add stations if present
+        if (ap->station_count > 0) {
+            cJSON *stations_array = cJSON_AddArrayToObject(ap_entry, "stations");
+            for (int s = 0; s < ap->station_count; s++) {
+                const stored_station_t *sta = &ap->stations[s];
+                cJSON *sta_obj = cJSON_CreateObject();
+                cJSON_AddStringToObject(sta_obj, "mac", mac_to_str(sta->mac));
+                cJSON_AddNumberToObject(sta_obj, "rssi", sta->rssi);
+                cJSON_AddNumberToObject(sta_obj, "last_seen", now_sec);
+                
+                char sta_vendor[48] = "Unknown";
+                ouis_lookup_vendor(sta->mac, sta_vendor, sizeof(sta_vendor));
+                cJSON_AddStringToObject(sta_obj, "vendor", sta_vendor);
+                
+                cJSON_AddItemToArray(stations_array, sta_obj);
+            }
+        }
+        
+        cJSON_AddItemToArray(rows, ap_entry);
+    }
+    
+    // update cache with mutex protection
+    xSemaphoreTake(scan_mutex, portMAX_DELAY);
+    char *json_str = cJSON_PrintUnformatted(root);
+    if (json_str) {
+        size_t json_len = strlen(json_str);
+        if (json_len >= MAX_JSON_SIZE) {
+            ESP_LOGW(TAG, "Background scan JSON too large (%u bytes)", (unsigned)json_len);
+            strncpy(scan_results_json, "{\"rows\":[]}", MAX_JSON_SIZE - 1);
+        } else {
+            memcpy(scan_results_json, json_str, json_len + 1);
+        }
+        free(json_str);
+    } else {
+        strncpy(scan_results_json, "{\"rows\":[]}", MAX_JSON_SIZE - 1);
+    }
+    scan_results_json[MAX_JSON_SIZE - 1] = '\0';
+    new_results_available = true;
+    xSemaphoreGive(scan_mutex);
+    
+    cJSON_Delete(root);
+    ESP_LOGI(TAG, "UI cache updated from background scan (%u APs, %u stations)", 
+             record->header.ap_count, record->header.total_stations);
 }
 
 const char* wifi_scan_get_results() {

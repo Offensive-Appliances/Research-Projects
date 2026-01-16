@@ -6,11 +6,13 @@
 #include <stdbool.h>  // Needed for bool
 #include "esp_wifi_types.h"
 #include "freertos/semphr.h"
+#include "scan_storage.h"
 
 void wifi_scan();
 const char* wifi_scan_get_results();
 bool wifi_scan_is_complete();
 bool wifi_scan_has_new_results();
+void wifi_scan_update_ui_cache_from_record(const scan_record_t *record);
 extern const uint8_t dual_band_channels[];
 extern const size_t dual_band_channels_size;
 
