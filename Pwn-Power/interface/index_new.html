@@ -222,9 +222,9 @@
                         </select>
                         <div style="margin-left:auto;">
                             <select id="device-sort" class="btn" onchange="sortDevices(this.value)" style="padding:8px 12px;">
+                                <option value="last_seen">Sort by Last Seen</option>
                                 <option value="trust">Sort by Trust</option>
                                 <option value="presence">Sort by Presence</option>
-                                <option value="last_seen">Sort by Last Seen</option>
                                 <option value="sightings">Sort by Sightings</option>
                             </select>
                         </div>
@@ -449,6 +449,7 @@
     
     <div class="privacy-indicator">Privacy Mode Active</div>
     <script src="app.js"></script>
+    <script src="csv_generator.js"></script>
 </body>
 </html>
 

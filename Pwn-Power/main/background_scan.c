@@ -13,9 +13,18 @@
 #include <stdlib.h>
 #include <time.h>
 
+// External variables for channel tracking
+extern uint32_t channel_scan_counts[14];
+extern uint32_t channel_discovery_counts[14];
+extern void update_channel_activity(uint8_t channel, uint32_t devices_found, int8_t *rssi_values, uint32_t rssi_count);
+
 extern bool pwnpower_time_is_synced(void);
 extern uint32_t scan_storage_get_history_base_epoch(void);
 extern void scan_storage_set_history_base_epoch(uint32_t epoch);
+
+// External functions from wifi_scan.c for deauth detection
+extern uint32_t wifi_scan_get_deauth_count(void);
+extern void wifi_scan_increment_deauth_count(void);
 
 #define TAG "BgScan"
 #define BG_SCAN_TASK_STACK 8192
@@ -48,6 +57,12 @@ static uint32_t hash_ssid(const uint8_t *ssid, size_t len) {
     return hash;
 }
 
+// Smart channel weighting for background scans
+uint32_t get_background_channel_dwell_time(uint8_t channel) {
+    // Call the smart dwell time function from wifi_scan module
+    return get_channel_dwell_time(channel, true);
+}
+
 typedef struct {
     uint8_t bssid[6];
     uint8_t mac[6];
@@ -66,8 +81,19 @@ static void promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     
     uint8_t *frame = pkt->payload;
     uint8_t frame_ctrl = frame[0];
-    uint8_t to_ds = (frame[1] >> 0) & 1;
-    uint8_t from_ds = (frame[1] >> 1) & 1;
+    uint8_t fc1 = frame[1];
+    uint8_t frame_type = (frame_ctrl >> 2) & 0x03;
+    uint8_t frame_subtype = (frame_ctrl >> 4) & 0x0F;
+    
+    // Check for deauthentication frames (same logic as stations_sniffer)
+    if (frame_type == 0 && (frame_subtype == 0x0C || frame_subtype == 0x0A)) {
+        wifi_scan_increment_deauth_count();
+        ESP_LOGI(TAG, "Deauth frame detected during background scan, total: %lu", (unsigned long)wifi_scan_get_deauth_count());
+        return; // Don't process as regular station data
+    }
+    
+    uint8_t to_ds = (fc1 >> 0) & 1;
+    uint8_t from_ds = (fc1 >> 1) & 1;
     
     uint8_t *bssid = NULL;
     uint8_t *sta_mac = NULL;
@@ -119,19 +145,50 @@ static void populate_scan_record(scan_record_t *record) {
     uint8_t ap_idx = 0;
     
     for (uint8_t ch = 1; ch <= 13 && ap_idx < MAX_APS_PER_SCAN; ch++) {
+        // Get smart dwell time for this channel
+        uint32_t dwell_time = get_background_channel_dwell_time(ch);
+        
+        // Track that we're scanning this channel
+        channel_scan_counts[ch]++;
+        
         scan_cfg.channel = ch;
+        scan_cfg.scan_time.active.min = dwell_time / 2;
+        scan_cfg.scan_time.active.max = dwell_time;
         
         if (esp_wifi_scan_start(&scan_cfg, true) != ESP_OK) continue;
         
         uint16_t ap_count = 0;
         esp_wifi_scan_get_ap_num(&ap_count);
         
-        if (ap_count == 0) continue;
+        if (ap_count == 0) {
+            // Update channel activity with zero results
+            update_channel_activity(ch, 0, NULL, 0);
+            continue;
+        }
         
         wifi_ap_record_t *ap_list = malloc(sizeof(wifi_ap_record_t) * ap_count);
-        if (!ap_list) continue;
+        if (!ap_list) {
+            // Update channel activity with count but no RSSI data
+            update_channel_activity(ch, ap_count, NULL, 0);
+            continue;
+        }
         
         if (esp_wifi_scan_get_ap_records(&ap_count, ap_list) == ESP_OK) {
+            // Collect RSSI values for filtering
+            int8_t *rssi_values = malloc(sizeof(int8_t) * ap_count);
+            if (rssi_values) {
+                for (uint16_t i = 0; i < ap_count; i++) {
+                    rssi_values[i] = ap_list[i].rssi;
+                }
+            }
+            
+            // Update channel activity with RSSI filtering
+            update_channel_activity(ch, ap_count, rssi_values, ap_count);
+            
+            if (rssi_values) {
+                free(rssi_values);
+            }
+            
             for (uint16_t i = 0; i < ap_count && ap_idx < MAX_APS_PER_SCAN; i++) {
                 bool exists = false;
                 for (uint8_t j = 0; j < ap_idx; j++) {
@@ -343,12 +400,32 @@ static void background_scan_task(void *arg) {
         
         for (uint8_t i = 0; i < record->header.ap_count && temp_count < MAX_APS_PER_SCAN; i++) {
             if (record->aps[i].station_count > 0) {
+                // Clamp individual AP client counts to prevent overflow
+                uint8_t client_count = record->aps[i].station_count > 50 ? 50 : record->aps[i].station_count;
                 ssid_temps[temp_count].hash = hash_ssid(record->aps[i].ssid, 33);
-                ssid_temps[temp_count].count = record->aps[i].station_count;
+                ssid_temps[temp_count].count = client_count;
                 temp_count++;
             }
         }
         
+        // Deduplicate SSIDs by hash and sum client counts
+        for (uint8_t i = 0; i < temp_count; i++) {
+            for (uint8_t j = i + 1; j < temp_count; j++) {
+                if (ssid_temps[i].hash == ssid_temps[j].hash) {
+                    // Sum client counts for duplicate SSIDs
+                    ssid_temps[i].count += ssid_temps[j].count;
+                    // Clamp to reasonable maximum to prevent overflow
+                    if (ssid_temps[i].count > 50) {
+                        ssid_temps[i].count = 50;
+                    }
+                    // Remove duplicate entry
+                    ssid_temps[j] = ssid_temps[--temp_count];
+                    j--;
+                }
+            }
+        }
+        
+        // Sort by total client count (descending)
         for (uint8_t i = 0; i < temp_count - 1; i++) {
             for (uint8_t j = i + 1; j < temp_count; j++) {
                 if (ssid_temps[j].count > ssid_temps[i].count) {

@@ -34,8 +34,11 @@ def generate_web_bundle():
     html = (script_dir / 'index_new.html').read_text(encoding='utf-8')
     css = (script_dir / 'styles.css').read_text(encoding='utf-8')
     js = (script_dir / 'app.js').read_text(encoding='utf-8')
+    csv_js = (script_dir / 'csv_generator.js').read_text(encoding='utf-8')
 
-    combined_html = inline_assets(html, css, js)
+    # Combine CSV generator with main app.js
+    combined_js = csv_js + '\n\n' + js
+    combined_html = inline_assets(html, css, combined_js)
     print(f"Combined size before gzip: {len(combined_html)} bytes")
     compressed = gzip.compress(combined_html.encode('utf-8'), compresslevel=9)
 

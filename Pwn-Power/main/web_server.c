@@ -13,6 +13,7 @@
 #include "ap_config.h"
 #include "sta_config.h"
 #include "idle_scanner.h"
+#include "nvs_flash.h"
 #include "ouis.h"
 #include "device_db.h"
 #include "device_lifecycle.h"
@@ -609,9 +610,22 @@ static esp_err_t ota_upload_handler(httpd_req_t *req) {
 		return ESP_FAIL;
 	}
 
-	ESP_LOGI(TAG, "OTA upload complete, rebooting soon");
+	ESP_LOGI(TAG, "OTA upload complete, erasing data and rebooting soon");
+	
+	// Erase scan data partition for clean update
+	esp_err_t scan_clear_err = scan_storage_clear();
+	if (scan_clear_err != ESP_OK) {
+		ESP_LOGE(TAG, "Failed to clear scan data: %s", esp_err_to_name(scan_clear_err));
+	}
+	
+	// Erase NVS partition for clean configuration
+	esp_err_t nvs_err = nvs_flash_erase();
+	if (nvs_err != ESP_OK) {
+		ESP_LOGE(TAG, "Failed to erase NVS: %s", esp_err_to_name(nvs_err));
+	}
+	
 	httpd_resp_set_type(req, "application/json");
-	httpd_resp_sendstr(req, "{\"status\":\"ok\",\"message\":\"Firmware uploaded. Rebooting in 3 seconds...\"}");
+	httpd_resp_sendstr(req, "{\"status\":\"ok\",\"message\":\"Firmware uploaded. Data erased. Rebooting in 3 seconds...\"}");
 	free(buf);
 	ota_schedule_reboot_ms(3000);
 	return ESP_OK;
@@ -689,8 +703,23 @@ static esp_err_t ota_fetch_handler(httpd_req_t *req) {
 		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA finish failed");
 		return ESP_FAIL;
 	}
+	
+	ESP_LOGI(TAG, "OTA fetch complete, erasing data and rebooting soon");
+	
+	// Erase scan data partition for clean update
+	esp_err_t scan_clear_err = scan_storage_clear();
+	if (scan_clear_err != ESP_OK) {
+		ESP_LOGE(TAG, "Failed to clear scan data: %s", esp_err_to_name(scan_clear_err));
+	}
+	
+	// Erase NVS partition for clean configuration
+	esp_err_t nvs_err = nvs_flash_erase();
+	if (nvs_err != ESP_OK) {
+		ESP_LOGE(TAG, "Failed to erase NVS: %s", esp_err_to_name(nvs_err));
+	}
+	
 	httpd_resp_set_type(req, "application/json");
-	httpd_resp_sendstr(req, "{\"status\":\"ok\",\"message\":\"Update downloaded. Rebooting...\"}");
+	httpd_resp_sendstr(req, "{\"status\":\"ok\",\"message\":\"Update downloaded. Data erased. Rebooting...\"}");
 	ota_schedule_reboot_ms(3000);
 	return ESP_OK;
 }
@@ -936,7 +965,7 @@ static esp_err_t wifi_status_handler(httpd_req_t *req) {
         cJSON_AddBoolToObject(res, "ap_while_connected", true);
     }
     
-    uint32_t uptime = monitor_uptime_get();
+    uint32_t uptime = monitor_uptime_get_boot_uptime();
     uint32_t boot_uptime = monitor_uptime_get_boot_uptime();
     cJSON_AddNumberToObject(res, "uptime", uptime);
     cJSON_AddNumberToObject(res, "boot_uptime", boot_uptime);
@@ -1090,30 +1119,36 @@ httpd_uri_t uri_wifi_status = {
 };
 
 static esp_err_t scan_report_handler(httpd_req_t *req) {
-    cJSON *root = cJSON_CreateObject();
+    char chunk[512];
+    int len;
     
     network_stats_t stats;
     scan_storage_get_stats(&stats);
     
-    cJSON *summary = cJSON_AddObjectToObject(root, "summary");
-    cJSON_AddNumberToObject(summary, "total_scans", stats.scan_count);
-    cJSON_AddNumberToObject(summary, "unique_aps", stats.total_aps_seen);
-    cJSON_AddNumberToObject(summary, "unique_stations", stats.total_stations_seen);
-    cJSON_AddNumberToObject(summary, "monitoring_hours", stats.monitoring_duration_sec / 3600.0);
-    cJSON_AddNumberToObject(summary, "deauth_events_last_hour", stats.deauth_events_last_hour);
-    cJSON_AddNumberToObject(summary, "rogue_aps_detected", stats.rogue_aps_detected);
-    cJSON_AddNumberToObject(summary, "known_devices_present", stats.known_devices_present);
+    httpd_resp_set_type(req, "application/json");
     
-    // Add intelligence data to report
+    // Send summary
+    len = snprintf(chunk, sizeof(chunk),
+        "{\"summary\":{\"total_scans\":%lu,\"unique_aps\":%lu,\"unique_stations\":%lu,"
+        "\"monitoring_hours\":%.1f,\"deauth_events_last_hour\":%lu,"
+        "\"rogue_aps_detected\":%lu,\"known_devices_present\":%lu},",
+        (unsigned long)stats.scan_count, (unsigned long)stats.total_aps_seen,
+        (unsigned long)stats.total_stations_seen, stats.monitoring_duration_sec / 3600.0,
+        (unsigned long)stats.deauth_events_last_hour, (unsigned long)stats.rogue_aps_detected,
+        (unsigned long)stats.known_devices_present);
+    if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) return ESP_FAIL;
+    
+    // Send intelligence data if available
     const char *intel_json = scan_storage_get_intelligence_json();
-    if (intel_json) {
-        cJSON *intel_obj = cJSON_Parse(intel_json);
-        if (intel_obj) {
-            cJSON_AddItemToObject(root, "intelligence", intel_obj);
-        }
+    if (intel_json && strlen(intel_json) > 2) {
+        len = snprintf(chunk, sizeof(chunk), "\"intelligence\":");
+        if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) return ESP_FAIL;
+        if (httpd_resp_send_chunk(req, intel_json, strlen(intel_json)) != ESP_OK) return ESP_FAIL;
+        if (httpd_resp_send_chunk(req, ",", 1) != ESP_OK) return ESP_FAIL;
     }
     
-    scan_record_t *latest = malloc(sizeof(scan_record_t));
+scan_record_t *latest = malloc(sizeof(scan_record_t));
+    
     if (latest && scan_storage_get_latest(latest) == ESP_OK) {
         uint8_t channel_usage[14] = {0};
         uint8_t security_counts[6] = {0};
@@ -1121,115 +1156,97 @@ static esp_err_t scan_report_handler(httpd_req_t *req) {
         
         for (uint8_t i = 0; i < latest->header.ap_count; i++) {
             stored_ap_t *ap = &latest->aps[i];
-            if (ap->channel > 0 && ap->channel <= 14) {
-                channel_usage[ap->channel - 1]++;
-            }
-            if (ap->auth_mode < 6) {
-                security_counts[ap->auth_mode]++;
-            }
+            if (ap->channel > 0 && ap->channel <= 14) channel_usage[ap->channel - 1]++;
+            if (ap->auth_mode < 6) security_counts[ap->auth_mode]++;
             total_stations += ap->station_count;
         }
         
-        cJSON *channels = cJSON_AddObjectToObject(root, "channel_analysis");
-        cJSON *channel_data = cJSON_AddArrayToObject(channels, "channels");
-        uint8_t most_congested = 0;
-        uint8_t max_aps = 0;
+        // Send channel analysis
+        len = snprintf(chunk, sizeof(chunk), "\"channel_analysis\":{\"channels\":[");
+        if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) { free(latest); return ESP_FAIL; }
         
+        uint8_t most_congested = 0, max_aps = 0;
+        bool first_ch = true;
         for (uint8_t i = 0; i < 14; i++) {
             if (channel_usage[i] > 0) {
-                cJSON *ch = cJSON_CreateObject();
-                cJSON_AddNumberToObject(ch, "channel", i + 1);
-                cJSON_AddNumberToObject(ch, "ap_count", channel_usage[i]);
-                cJSON_AddItemToArray(channel_data, ch);
-                
-                if (channel_usage[i] > max_aps) {
-                    max_aps = channel_usage[i];
-                    most_congested = i + 1;
-                }
+                len = snprintf(chunk, sizeof(chunk), "%s{\"channel\":%d,\"ap_count\":%d}",
+                    first_ch ? "" : ",", i + 1, channel_usage[i]);
+                if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) { free(latest); return ESP_FAIL; }
+                first_ch = false;
+                if (channel_usage[i] > max_aps) { max_aps = channel_usage[i]; most_congested = i + 1; }
             }
         }
-        cJSON_AddNumberToObject(channels, "most_congested", most_congested);
-        cJSON_AddNumberToObject(channels, "max_ap_count", max_aps);
         
-        cJSON *security = cJSON_AddObjectToObject(root, "security_analysis");
-        cJSON_AddNumberToObject(security, "open", security_counts[0]);
-        cJSON_AddNumberToObject(security, "wep", security_counts[1]);
-        cJSON_AddNumberToObject(security, "wpa2", security_counts[2] + security_counts[3]);
-        cJSON_AddNumberToObject(security, "wpa3", security_counts[4]);
-        cJSON_AddNumberToObject(security, "wpa2_wpa3", security_counts[5]);
+        float open_percent = latest->header.ap_count > 0 ? (security_counts[0] * 100.0f / latest->header.ap_count) : 0;
+        float avg_stations = latest->header.ap_count > 0 ? (float)total_stations / latest->header.ap_count : 0;
         
-        float open_percent = latest->header.ap_count > 0 ? 
-            (security_counts[0] * 100.0f / latest->header.ap_count) : 0;
-        cJSON_AddNumberToObject(security, "open_percent", open_percent);
+        len = snprintf(chunk, sizeof(chunk),
+            "],\"most_congested\":%d,\"max_ap_count\":%d},"
+            "\"security_analysis\":{\"open\":%d,\"wep\":%d,\"wpa2\":%d,\"wpa3\":%d,\"wpa2_wpa3\":%d,\"open_percent\":%.1f},"
+            "\"network_activity\":{\"current_aps\":%d,\"total_stations\":%d,\"avg_stations_per_ap\":%.1f},\"networks\":[",
+            most_congested, max_aps, security_counts[0], security_counts[1], 
+            security_counts[2] + security_counts[3], security_counts[4], security_counts[5], open_percent,
+            latest->header.ap_count, total_stations, avg_stations);
+        if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) { free(latest); return ESP_FAIL; }
         
-        cJSON *activity = cJSON_AddObjectToObject(root, "network_activity");
-        cJSON_AddNumberToObject(activity, "current_aps", latest->header.ap_count);
-        cJSON_AddNumberToObject(activity, "total_stations", total_stations);
-        cJSON_AddNumberToObject(activity, "avg_stations_per_ap", 
-            latest->header.ap_count > 0 ? (float)total_stations / latest->header.ap_count : 0);
-        
-        cJSON *networks = cJSON_AddArrayToObject(root, "networks");
+        // Stream networks
         for (uint8_t i = 0; i < latest->header.ap_count; i++) {
             stored_ap_t *ap = &latest->aps[i];
-            cJSON *net = cJSON_CreateObject();
-            
-            char mac[18];
-            snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
-                    ap->bssid[0], ap->bssid[1], ap->bssid[2],
-                    ap->bssid[3], ap->bssid[4], ap->bssid[5]);
-            
-            cJSON_AddStringToObject(net, "bssid", mac);
-            cJSON_AddStringToObject(net, "ssid", (char*)ap->ssid);
-            cJSON_AddNumberToObject(net, "channel", ap->channel);
-            cJSON_AddNumberToObject(net, "rssi", ap->rssi);
-            cJSON_AddNumberToObject(net, "stations", ap->station_count);
-            cJSON_AddNumberToObject(net, "last_seen", ap->last_seen);
-            
-            const char *auth;
+            const char *auth = "Unknown";
             switch (ap->auth_mode) {
                 case 0: auth = "Open"; break;
                 case 1: auth = "WEP"; break;
                 case 2: case 3: auth = "WPA2"; break;
                 case 4: auth = "WPA3"; break;
                 case 5: auth = "WPA2/WPA3"; break;
-                default: auth = "Unknown"; break;
             }
-            cJSON_AddStringToObject(net, "security", auth);
             
             char ap_vendor[48] = "Unknown";
             ouis_lookup_vendor(ap->bssid, ap_vendor, sizeof(ap_vendor));
-            cJSON_AddStringToObject(net, "vendor", ap_vendor);
             
-            if (ap->station_count > 0) {
-                cJSON *stas = cJSON_AddArrayToObject(net, "clients");
-                for (uint8_t s = 0; s < ap->station_count && s < MAX_STATIONS_PER_AP; s++) {
-                    cJSON *sta = cJSON_CreateObject();
-                    char sta_mac[18];
-                    snprintf(sta_mac, sizeof(sta_mac), "%02X:%02X:%02X:%02X:%02X:%02X",
-                            ap->stations[s].mac[0], ap->stations[s].mac[1], ap->stations[s].mac[2],
-                            ap->stations[s].mac[3], ap->stations[s].mac[4], ap->stations[s].mac[5]);
-                    cJSON_AddStringToObject(sta, "mac", sta_mac);
-                    cJSON_AddNumberToObject(sta, "rssi", ap->stations[s].rssi);
-                    cJSON_AddNumberToObject(sta, "last_seen", ap->stations[s].last_seen);
-                    
-                    char sta_vendor[48] = "Unknown";
-                    ouis_lookup_vendor(ap->stations[s].mac, sta_vendor, sizeof(sta_vendor));
-                    cJSON_AddStringToObject(sta, "vendor", sta_vendor);
-                    
-                    cJSON_AddItemToArray(stas, sta);
-                }
+            len = snprintf(chunk, sizeof(chunk),
+                "%s{\"bssid\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"ssid\":\"%s\",\"channel\":%d,"
+                "\"rssi\":%d,\"stations\":%d,\"last_seen\":%lu,\"security\":\"%s\",\"vendor\":\"%s\",\"clients\":[",
+                i > 0 ? "," : "", ap->bssid[0], ap->bssid[1], ap->bssid[2], ap->bssid[3], ap->bssid[4], ap->bssid[5],
+                ap->ssid, ap->channel, ap->rssi, ap->station_count, (unsigned long)ap->last_seen, auth, ap_vendor);
+            if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) { free(latest); return ESP_FAIL; }
+            
+            // Stream clients
+            for (uint8_t s = 0; s < ap->station_count && s < MAX_STATIONS_PER_AP; s++) {
+                char sta_vendor[48] = "Unknown";
+                ouis_lookup_vendor(ap->stations[s].mac, sta_vendor, sizeof(sta_vendor));
+                
+                len = snprintf(chunk, sizeof(chunk),
+                    "%s{\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"rssi\":%d,\"last_seen\":%lu,\"vendor\":\"%s\"}",
+                    s > 0 ? "," : "", ap->stations[s].mac[0], ap->stations[s].mac[1], ap->stations[s].mac[2],
+                    ap->stations[s].mac[3], ap->stations[s].mac[4], ap->stations[s].mac[5],
+                    ap->stations[s].rssi, (unsigned long)ap->stations[s].last_seen, sta_vendor);
+                if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) { free(latest); return ESP_FAIL; }
             }
             
-            cJSON_AddItemToArray(networks, net);
+            if (httpd_resp_send_chunk(req, "]}", 2) != ESP_OK) { free(latest); return ESP_FAIL; }
+        }
+        
+        if (httpd_resp_send_chunk(req, "]}", 2) != ESP_OK) { free(latest); return ESP_FAIL; }
+    } else {
+        // No scan data - send empty defaults
+        const char *empty = "\"channel_analysis\":{\"channels\":[],\"most_congested\":0,\"max_ap_count\":0},"
+            "\"security_analysis\":{\"open\":0,\"wep\":0,\"wpa2\":0,\"wpa3\":0,\"wpa2_wpa3\":0,\"open_percent\":0},"
+            "\"network_activity\":{\"current_aps\":0,\"total_stations\":0,\"avg_stations_per_ap\":0},\"networks\":[]}";
+        if (httpd_resp_send_chunk(req, empty, strlen(empty)) != ESP_OK) { 
+            if (latest) free(latest);
+            return ESP_FAIL;
         }
     }
+    
     if (latest) free(latest);
     
-    char *json = cJSON_PrintUnformatted(root);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, json);
-    free(json);
-    cJSON_Delete(root);
+    // End chunked response
+    if (httpd_resp_send_chunk(req, NULL, 0) != ESP_OK) return ESP_FAIL;
+    
+    ESP_LOGI(TAG, "Streamed scan report: %lu APs, %lu stations", 
+             (unsigned long)stats.total_aps_seen, (unsigned long)stats.total_stations_seen);
+    
     return ESP_OK;
 }
 
@@ -1267,8 +1284,14 @@ static esp_err_t unified_intelligence_handler(httpd_req_t *req) {
     update_last_request_time();
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    const char *json = scan_storage_get_unified_intelligence_json();
-    httpd_resp_sendstr(req, json);
+    
+    // Use chunked encoding to stream response without large buffers
+    esp_err_t ret = scan_storage_send_unified_intelligence_chunked(req);
+    if (ret != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to generate response");
+        return ESP_FAIL;
+    }
+    
     return ESP_OK;
 }
 

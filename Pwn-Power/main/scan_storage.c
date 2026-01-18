@@ -10,6 +10,7 @@
 #include "esp_timer.h"
 #include "cJSON.h"
 #include "ouis.h"
+#include "esp_http_server.h"
 #include <string.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -1401,43 +1402,34 @@ const char* scan_storage_get_intelligence_json(void) {
     return intelligence_json;
 }
 
-const char* scan_storage_get_unified_intelligence_json(void) {
-    static char unified_buf[6144];
+esp_err_t scan_storage_send_unified_intelligence_chunked(httpd_req_t *req) {
+    char chunk[512];
     uint32_t now = get_uptime_sec();
-    int pos = 0;
     
-    // calculate presence stats
-    int devices_present = 0;
-    int devices_away = 0;
-    int new_devices_today = 0;
+    // Calculate presence stats
+    int devices_present = 0, devices_away = 0, new_devices_today = 0;
     bool time_ok = pwnpower_time_is_synced();
-    uint32_t epoch_now = 0;
-    uint32_t today_start = 0;
+    uint32_t epoch_now = 0, today_start = 0;
+    
     if (time_ok) {
         time_t t;
         time(&t);
         if (t > 0) epoch_now = (uint32_t)t;
         else time_ok = false;
     }
-    if (time_ok) {
-        today_start = (epoch_now / 86400) * 86400;
-    } else {
-        today_start = (now / 86400) * 86400;
-    }
+    if (time_ok) today_start = (epoch_now / 86400) * 86400;
+    else today_start = (now / 86400) * 86400;
     
     for (int i = 0; i < tracked_device_count; i++) {
         device_presence_t *dev = &tracked_devices[i];
-
         if (time_ok && DEVICE_EPOCH_VALID(dev->flags) && dev->last_seen_epoch > 0 && dev->last_seen_epoch <= epoch_now) {
             if ((epoch_now - dev->last_seen_epoch) < 300) devices_present++;
             else devices_away++;
         } else if (dev->last_seen > 0 && dev->last_seen <= now) {
             if ((now - dev->last_seen) < 300) devices_present++;
             else devices_away++;
-        } else {
-            devices_away++;
-        }
-
+        } else devices_away++;
+        
         if (time_ok && DEVICE_EPOCH_VALID(dev->flags) && dev->first_seen_epoch > 0 && dev->first_seen_epoch <= epoch_now) {
             if (dev->first_seen_epoch >= today_start) new_devices_today++;
         } else if (!time_ok && dev->first_seen > 0 && dev->first_seen <= now) {
@@ -1445,54 +1437,40 @@ const char* scan_storage_get_unified_intelligence_json(void) {
         }
     }
     
-    // get network info and security stats
+    // Get network stats
     scan_record_t *rec = malloc(sizeof(scan_record_t));
-    int hidden_count = 0;
-    int open_count = 0;
-    int unique_aps = 0;
-    int unique_stations = 0;
-    int active_channels = 0;
+    int hidden_count = 0, open_count = 0, unique_aps = 0, unique_stations = 0, active_channels = 0;
     
     if (rec && scan_storage_get_latest(rec) == ESP_OK) {
         unique_aps = rec->header.ap_count;
         unique_stations = rec->header.total_stations;
-        
         bool channels[14] = {false};
         for (uint8_t i = 0; i < rec->header.ap_count; i++) {
             if (rec->aps[i].hidden) hidden_count++;
             if (rec->aps[i].auth_mode == 0) open_count++;
-            if (rec->aps[i].channel > 0 && rec->aps[i].channel < 14) {
-                channels[rec->aps[i].channel] = true;
-            }
+            if (rec->aps[i].channel > 0 && rec->aps[i].channel < 14) channels[rec->aps[i].channel] = true;
         }
-        for (int i = 1; i < 14; i++) {
-            if (channels[i]) active_channels++;
-        }
+        for (int i = 1; i < 14; i++) if (channels[i]) active_channels++;
     }
     if (rec) free(rec);
     
-    // build unified json response
-    pos += snprintf(unified_buf + pos, sizeof(unified_buf) - pos,
-        "{"
-        "\"summary\":{"
-        "\"presence\":{\"devices_present\":%d,\"devices_away\":%d,\"new_today\":%d},"
+    // Send summary
+    int len = snprintf(chunk, sizeof(chunk),
+        "{\"summary\":{\"presence\":{\"devices_present\":%d,\"devices_away\":%d,\"new_today\":%d},"
         "\"security\":{\"deauth_events\":%lu,\"rogue_aps\":%lu,\"open_networks\":%d,\"hidden_networks\":%d},"
         "\"network\":{\"unique_aps\":%d,\"unique_stations\":%d,\"active_channels\":%d},"
-        "\"uptime_hours\":%.1f,"
-        "\"time_synced\":%s,"
-        "\"epoch_now\":%lu"
-        "},",
+        "\"uptime_hours\":%.1f,\"time_synced\":%s,\"epoch_now\":%lu},\"devices\":[",
         devices_present, devices_away, new_devices_today,
         (unsigned long)deauth_events_hour, (unsigned long)rogue_ap_count, open_count, hidden_count,
-        unique_aps, unique_stations, active_channels,
-        now / 3600.0,
-        time_ok ? "true" : "false",
-        (unsigned long)epoch_now);
+        unique_aps, unique_stations, active_channels, now / 3600.0,
+        time_ok ? "true" : "false", (unsigned long)epoch_now);
+    if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) return ESP_FAIL;
     
-    // add devices array
-    pos += snprintf(unified_buf + pos, sizeof(unified_buf) - pos, "\"devices\":[");
+    // Stream devices one at a time
+    scan_record_t *ap_rec = malloc(sizeof(scan_record_t));
+    bool has_aps = (ap_rec && scan_storage_get_latest(ap_rec) == ESP_OK);
     
-    for (int i = 0; i < tracked_device_count && pos < (int)sizeof(unified_buf) - 400; i++) {
+    for (int i = 0; i < tracked_device_count; i++) {
         device_presence_t *dev = &tracked_devices[i];
         
         uint32_t last_seen_ago;
@@ -1508,104 +1486,71 @@ const char* scan_storage_get_unified_intelligence_json(void) {
             is_present = false;
         }
         
-        // calculate trust score based on device history
-        // use sighting count as primary indicator (survives reboot)
-        uint8_t trust_score = 10;  // base score for unknown
-        
-        // trust based on total sightings (persists across reboots)
+        uint8_t trust_score = 10;
         if (dev->total_sightings > 100) trust_score += 40;
         else if (dev->total_sightings > 50) trust_score += 30;
         else if (dev->total_sightings > 20) trust_score += 20;
         else if (dev->total_sightings > 10) trust_score += 10;
-
-        // if we've seen it at least twice, it's not "new" anymore
         if (dev->total_sightings >= 2 && trust_score <= 30) trust_score = 35;
-        
-        // bonus for marked as known
         if (DEVICE_IS_KNOWN(dev->flags)) trust_score += 30;
-        
-        // days_known calculation only works if first_seen is from current boot
-        // after reboot, first_seen timestamps are stale so skip this
         if (dev->first_seen > 0 && dev->first_seen <= now) {
-            uint32_t days_known = (now - dev->first_seen) / 86400;
-            if (days_known >= 7) trust_score += 20;
-            else if (days_known >= 3) trust_score += 10;
+            uint32_t days = (now - dev->first_seen) / 86400;
+            if (days >= 7) trust_score += 20;
+            else if (days >= 3) trust_score += 10;
         }
-        
         if (trust_score > 100) trust_score = 100;
         
-        // Calculate days tracked for reliability score
         uint32_t days_tracked = 1;
-        if (dev->first_seen > 0 && dev->first_seen <= now) {
-            days_tracked = ((now - dev->first_seen) / 86400) + 1;
-        }
-
-        if (i > 0) pos += snprintf(unified_buf + pos, sizeof(unified_buf) - pos, ",");
-        pos += snprintf(unified_buf + pos, sizeof(unified_buf) - pos,
-            "{\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\","
-            "\"vendor\":\"%s\","
-            "\"trust_score\":%u,"
-            "\"present\":%s,"
-            "\"rssi\":%d,"
-            "\"sightings\":%lu,"
-            "\"last_seen_ago\":%lu,"
-            "\"last_seen_epoch\":%lu,"
-            "\"epoch_valid\":%u,"
-            "\"last_ap\":\"%s\","
-            "\"tracked\":%s,"
-            "\"home_device\":%s,"
-            "\"days_tracked\":%lu,"
-            "\"presence_hours\":[%u,%u,%u],"
-            "\"associated_ap_count\":%u,"
-            "\"associated_aps\":[",
-            dev->mac[0], dev->mac[1], dev->mac[2],
-            dev->mac[3], dev->mac[4], dev->mac[5],
-            dev->vendor,
-            trust_score,
-            is_present ? "true" : "false",
-            dev->rssi_avg,
-            (unsigned long)dev->total_sightings,
-            (unsigned long)last_seen_ago,
-            (unsigned long)dev->last_seen_epoch,
-            (unsigned)DEVICE_EPOCH_VALID(dev->flags),
-            dev->last_ap_ssid[0] ? dev->last_ap_ssid : "unknown",
-            DEVICE_IS_KNOWN(dev->flags) ? "true" : "false",
-            DEVICE_IS_HOME(dev->flags) ? "true" : "false",
-            (unsigned long)days_tracked,
-            dev->presence_hours[0], dev->presence_hours[1], dev->presence_hours[2],
+        if (dev->first_seen > 0 && dev->first_seen <= now) days_tracked = ((now - dev->first_seen) / 86400) + 1;
+        
+        len = snprintf(chunk, sizeof(chunk),
+            "%s{\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"vendor\":\"%s\",\"trust_score\":%u,"
+            "\"present\":%s,\"rssi\":%d,\"sightings\":%lu,\"last_seen_ago\":%lu,\"last_seen_epoch\":%lu,"
+            "\"epoch_valid\":%u,\"last_ap\":\"%s\",\"tracked\":%s,\"home_device\":%s,\"days_tracked\":%lu,"
+            "\"presence_hours\":[%u,%u,%u],\"associated_ap_count\":%u,\"associated_aps\":[",
+            i > 0 ? "," : "",
+            dev->mac[0], dev->mac[1], dev->mac[2], dev->mac[3], dev->mac[4], dev->mac[5],
+            dev->vendor, trust_score, is_present ? "true" : "false", dev->rssi_avg,
+            (unsigned long)dev->total_sightings, (unsigned long)last_seen_ago, (unsigned long)dev->last_seen_epoch,
+            (unsigned)DEVICE_EPOCH_VALID(dev->flags), dev->last_ap_ssid[0] ? dev->last_ap_ssid : "unknown",
+            DEVICE_IS_KNOWN(dev->flags) ? "true" : "false", DEVICE_IS_HOME(dev->flags) ? "true" : "false",
+            (unsigned long)days_tracked, dev->presence_hours[0], dev->presence_hours[1], dev->presence_hours[2],
             dev->associated_ap_count);
-
-        // Add associated APs with SSIDs by looking them up in current scan
-        scan_record_t *ap_rec = malloc(sizeof(scan_record_t));
-        if (ap_rec && scan_storage_get_latest(ap_rec) == ESP_OK) {
-            for (uint8_t ap_idx = 0; ap_idx < dev->associated_ap_count && ap_idx < 8; ap_idx++) {
-                if (ap_idx > 0) pos += snprintf(unified_buf + pos, sizeof(unified_buf) - pos, ",");
-
-                // Find SSID for this BSSID
-                char ssid[33] = "Unknown";
-                for (uint8_t scan_idx = 0; scan_idx < ap_rec->header.ap_count; scan_idx++) {
-                    if (memcmp(ap_rec->aps[scan_idx].bssid, dev->associated_aps[ap_idx], 6) == 0) {
-                        strncpy(ssid, (char*)ap_rec->aps[scan_idx].ssid, 32);
+        if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) { if (ap_rec) free(ap_rec); return ESP_FAIL; }
+        
+        // Send associated APs
+        for (uint8_t ap_idx = 0; ap_idx < dev->associated_ap_count && ap_idx < 8; ap_idx++) {
+            char ssid[33] = "Unknown";
+            if (has_aps) {
+                for (uint8_t s = 0; s < ap_rec->header.ap_count; s++) {
+                    if (memcmp(ap_rec->aps[s].bssid, dev->associated_aps[ap_idx], 6) == 0) {
+                        strncpy(ssid, (char*)ap_rec->aps[s].ssid, 32);
                         ssid[32] = '\0';
                         break;
                     }
                 }
-
-                pos += snprintf(unified_buf + pos, sizeof(unified_buf) - pos,
-                    "{\"ssid\":\"%s\",\"bssid\":\"%02X:%02X:%02X:%02X:%02X:%02X\"}",
-                    ssid,
-                    dev->associated_aps[ap_idx][0], dev->associated_aps[ap_idx][1],
-                    dev->associated_aps[ap_idx][2], dev->associated_aps[ap_idx][3],
-                    dev->associated_aps[ap_idx][4], dev->associated_aps[ap_idx][5]);
             }
+            len = snprintf(chunk, sizeof(chunk), "%s{\"ssid\":\"%s\",\"bssid\":\"%02X:%02X:%02X:%02X:%02X:%02X\"}",
+                ap_idx > 0 ? "," : "", ssid,
+                dev->associated_aps[ap_idx][0], dev->associated_aps[ap_idx][1], dev->associated_aps[ap_idx][2],
+                dev->associated_aps[ap_idx][3], dev->associated_aps[ap_idx][4], dev->associated_aps[ap_idx][5]);
+            if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) { if (ap_rec) free(ap_rec); return ESP_FAIL; }
         }
-        if (ap_rec) free(ap_rec);
-
-        pos += snprintf(unified_buf + pos, sizeof(unified_buf) - pos, "]}");
+        
+        if (httpd_resp_send_chunk(req, "]}", 2) != ESP_OK) { if (ap_rec) free(ap_rec); return ESP_FAIL; }
     }
+    if (ap_rec) free(ap_rec);
     
-    pos += snprintf(unified_buf + pos, sizeof(unified_buf) - pos, "]}");
+    // Close JSON
+    if (httpd_resp_send_chunk(req, "]}", 2) != ESP_OK) return ESP_FAIL;
+    if (httpd_resp_send_chunk(req, NULL, 0) != ESP_OK) return ESP_FAIL;
     
+    return ESP_OK;
+}
+
+const char* scan_storage_get_unified_intelligence_json(void) {
+    static char unified_buf[6144];
+    snprintf(unified_buf, sizeof(unified_buf), "{\"error\":\"deprecated - use chunked endpoint\"}");
     return unified_buf;
 }
 

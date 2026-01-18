@@ -130,7 +130,8 @@ static void sanitize_text(char *out, size_t out_size, const char *in) {
     }
     while (*in && pos < out_size - 1) {
         unsigned char c = (unsigned char)*in++;
-        if (c < 32 || c == 127) {
+        // Filter out control characters, high-bit characters, and invalid UTF-8
+        if (c < 32 || c == 127 || c > 127) {
             if (!last_space && pos > 0) {
                 out[pos++] = ' ';
                 last_space = true;
@@ -345,6 +346,14 @@ static esp_err_t send_event(const device_event_t *event) {
     
     if (!json_str) return ESP_ERR_NO_MEM;
     
+    if (is_discord) {
+        ESP_LOGI(TAG, "Discord payload length: %d", (int)strlen(json_str));
+        if (strlen(json_str) > 6000) {
+            ESP_LOGW(TAG, "Discord payload may be too long for Discord (6000+ chars)");
+        }
+        ESP_LOGI(TAG, "Discord payload: %s", json_str);
+    }
+    
     // send http post
     esp_http_client_handle_t client = get_webhook_client();
     if (!client) {
@@ -357,12 +366,27 @@ static esp_err_t send_event(const device_event_t *event) {
     
     esp_err_t err = esp_http_client_perform(client);
     int status_code = esp_http_client_get_status_code(client);
+    int content_length = esp_http_client_get_content_length(client);
 
-    if (err == ESP_OK && (status_code < 200 || status_code >= 300)) {
-        char resp[256];
+    ESP_LOGI(TAG, "HTTP response: status=%d, content_length=%d, err=%d", status_code, content_length, err);
+
+    // Read response body if available
+    char resp[256] = {0};
+    if (content_length > 0 && content_length < sizeof(resp)) {
         int rlen = esp_http_client_read(client, resp, sizeof(resp) - 1);
         if (rlen > 0) {
             resp[rlen] = '\0';
+        }
+    }
+
+    if (err == ESP_OK && status_code == 400) {
+        if (strlen(resp) > 0) {
+            ESP_LOGW(TAG, "Webhook 400 response body: %s", resp);
+        } else {
+            ESP_LOGW(TAG, "Webhook 400 response body: empty (content_length=%d)", content_length);
+        }
+    } else if (err == ESP_OK && (status_code < 200 || status_code >= 300)) {
+        if (strlen(resp) > 0) {
             ESP_LOGW(TAG, "Webhook response body: %s", resp);
         }
     }

@@ -124,6 +124,10 @@ void handshake_clear_pcap(void) {
     s_pcap_len = 0;
 }
 
+bool handshake_has_eapol_frames(void) {
+    return s_eapol_count > 0;
+}
+
 const char* handshake_pcap_filename(void) {
     return s_pcap_name;
 }
@@ -275,6 +279,100 @@ esp_err_t start_handshake_capture(uint8_t bssid[6], int channel, int duration_se
 
     if (eapol_count_out) *eapol_count_out = s_eapol_count;
     ESP_LOGI(TAG, "Captured %d EAPOL frames, mgmt written %lu, pcap bytes %u", s_eapol_count, (unsigned long)s_mgmt_written, (unsigned int)s_pcap_len);
+    
+    if (s_eapol_count > 0 || s_pcap_len > 100) {
+        memcpy(s_current_capture.bssid, bssid, 6);
+        s_current_capture.channel = channel;
+        s_current_capture.timestamp = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+        s_current_capture.eapol_count = s_eapol_count;
+        s_current_capture.is_auto = false;
+        s_current_capture.valid = true;
+    }
+    
+    return ESP_OK;
+}
+
+esp_err_t start_handshake_capture_preserve(uint8_t bssid[6], int channel, int duration_seconds, uint8_t (*stas)[6], int sta_count, int *eapol_count_out, bool preserve_eapol) {
+    strncpy(s_pcap_name, "handshake.pcap", sizeof(s_pcap_name)-1);
+    s_pcap_name[sizeof(s_pcap_name)-1] = '\0';
+    if (!bssid || channel < 1 || channel > 165 || duration_seconds <= 0) return ESP_ERR_INVALID_ARG;
+    if (eapol_count_out) *eapol_count_out = 0;
+
+    ESP_LOGI(TAG, "start_preserve: channel=%d duration=%ds sta_count=%d preserve_eapol=%s", 
+             channel, duration_seconds, sta_count, preserve_eapol ? "true" : "false");
+
+    wifi_mode_t original_mode;
+    esp_wifi_get_mode(&original_mode);
+    ESP_LOGI(TAG, "original mode=%d", (int)original_mode);
+    if (original_mode == WIFI_MODE_APSTA) {
+        ESP_LOGI(TAG, "switching to STA for capture");
+        esp_wifi_set_mode(WIFI_MODE_STA);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    // Check if we should preserve existing EAPOL frames
+    bool had_eapol = preserve_eapol && handshake_has_eapol_frames();
+    uint32_t prev_eapol_count = s_eapol_count;
+    
+    if (!preserve_eapol || !had_eapol) {
+        s_eapol_count = 0;
+        handshake_clear_pcap();
+    } else {
+        ESP_LOGI(TAG, "Preserving existing %d EAPOL frames and %u PCAP bytes", 
+                 (int)s_eapol_count, (unsigned int)s_pcap_len);
+    }
+    
+    s_mgmt_written = 0;
+    wifi_promiscuous_filter_t filter = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA
+    };
+    
+    if (!preserve_eapol || !had_eapol) {
+        s_hs_count = 0;
+        s_hs_insert_idx = 0;
+        s_handshake_pairs = 0;
+        s_beacon_count = 0;
+        s_beacon_insert_idx = 0;
+    }
+    
+    wifi_promiscuous_filter_t cur_filter;
+    if (esp_wifi_get_promiscuous_filter(&cur_filter) == ESP_OK) {
+        s_prev_filter = cur_filter;
+        s_prev_filter_valid = true;
+    }
+    s_prev_cb = NULL; // not retrievable; track only our set
+
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_promiscuous_filter(&filter);
+    esp_wifi_set_promiscuous_rx_cb(sniff_cb);
+    esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    ESP_LOGI(TAG, "promisc enabled on ch %d", channel);
+
+    // passive capture only; do not trigger deauth during handshake capture
+
+    int ms = duration_seconds * 1000;
+    const int step = 50;
+    for (int t = 0; t < ms; t += step) {
+        vTaskDelay(pdMS_TO_TICKS(step));
+    }
+
+    // end passive capture window
+
+    esp_wifi_set_promiscuous(false);
+    if (s_prev_filter_valid) {
+        esp_wifi_set_promiscuous_filter(&s_prev_filter);
+    }
+    esp_wifi_set_promiscuous_rx_cb(NULL);
+    ESP_LOGI(TAG, "promisc disabled");
+
+    esp_wifi_set_mode(original_mode);
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    if (eapol_count_out) *eapol_count_out = s_eapol_count;
+    
+    uint32_t new_eapol_count = s_eapol_count - prev_eapol_count;
+    ESP_LOGI(TAG, "Capture complete: %d total EAPOL frames (%d new), mgmt written %lu, pcap bytes %u", 
+             s_eapol_count, (int)new_eapol_count, (unsigned long)s_mgmt_written, (unsigned int)s_pcap_len);
     
     if (s_eapol_count > 0 || s_pcap_len > 100) {
         memcpy(s_current_capture.bssid, bssid, 6);

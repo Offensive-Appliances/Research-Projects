@@ -173,7 +173,7 @@ static void attempt_auto_handshake(void) {
     scan_state = IDLE_SCAN_HANDSHAKE;
     
     int eapol_count = 0;
-    start_handshake_capture(bssid, channel, config.handshake_duration_sec, NULL, 0, &eapol_count);
+    start_handshake_capture_preserve(bssid, channel, config.handshake_duration_sec, NULL, 0, &eapol_count, true);
     
     if (eapol_count > 0) {
         handshake_record_auto_capture(bssid, channel, eapol_count);

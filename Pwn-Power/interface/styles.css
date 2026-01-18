@@ -213,6 +213,59 @@ tbody tr.selected { background: rgba(179,23,23,0.15); outline: 1px solid var(--a
 .client-row td { padding: 6px 12px 6px 24px; color: var(--text-muted); }
 .client-row.selected { background: rgba(179,23,23,0.1); }
 
+/* Expandable AP rows */
+.has-clients { cursor: pointer; }
+.expand-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    font-size: 16px;
+    line-height: 0;
+    font-weight: normal;
+    color: var(--text-muted);
+    margin-right: 8px;
+    border: 1px solid var(--border-color);
+    border-radius: 50%;
+    background: rgba(255,255,255,0.05);
+    transition: all 0.2s ease;
+    user-select: none;
+    flex-shrink: 0;
+    position: relative;
+}
+.expand-icon::before {
+    content: '';
+    position: absolute;
+    width: 10px;
+    height: 2px;
+    background: currentColor;
+    border-radius: 1px;
+}
+.expand-icon::after {
+    content: '';
+    position: absolute;
+    width: 10px;
+    height: 2px;
+    background: currentColor;
+    border-radius: 1px;
+    transform: rotate(90deg);
+}
+tr.expanded .expand-icon::after {
+    transform: rotate(0deg);
+}
+.expand-icon:hover {
+    background: rgba(255,255,255,0.1);
+    border-color: var(--accent);
+    color: var(--accent);
+}
+tr.expanded .expand-icon {
+    transform: rotate(180deg);
+}
+.has-clients:hover {
+    background: rgba(255,255,255,0.05);
+}
+
 .chart-container {
     height: 200px;
     display: flex;

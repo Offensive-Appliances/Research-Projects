@@ -5,6 +5,7 @@
 #include "esp_timer.h"
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
 #include <ctype.h>
 #include "esp_wifi_types.h"
 #include "freertos/semphr.h"
@@ -12,6 +13,10 @@
 #include "sdkconfig.h"
 #include "ouis.h"
 #include "scan_storage.h"
+
+// Forward declarations
+extern bool pwnpower_time_is_synced(void);
+static uint32_t get_current_timestamp(void);
 
 #define TAG "WiFi_Scan"
 #define MAX_JSON_SIZE 8192  // Increased size to accommodate the new JSON structure
@@ -33,6 +38,18 @@ static int known_channel_count = 0;
 static volatile uint32_t s_deauth_count = 0;
 static volatile uint32_t s_deauth_last_seen = 0;
 static volatile uint32_t s_hidden_ap_count = 0;
+static volatile uint32_t s_probe_request_count = 0;
+
+// Smart channel weighting system
+uint32_t channel_scan_counts[14] = {0};     // Times each channel was scanned
+uint32_t channel_discovery_counts[14] = {0}; // Devices found per channel
+uint32_t last_channel_update = 0;
+
+#define CHANNEL_LEARNING_RATE 0.2f
+#define MIN_SCANS_FOR_LEARNING 5
+#define MAX_CHANNEL_WEIGHT 2.0f
+#define MIN_CHANNEL_WEIGHT 0.5f
+#define RSSI_CUTOFF_THRESHOLD -85  // Ignore networks weaker than -85 dBm
 
 #define MAX_HIDDEN_APS 16
 typedef struct {
@@ -94,6 +111,80 @@ const char* get_band(uint8_t channel) {
     return "Unknown Band";
 }
 
+// Smart channel weighting functions
+uint32_t get_channel_dwell_time(uint8_t channel, bool is_background_scan) {
+    // Default dwell times
+    uint32_t base_ap_dwell = is_background_scan ? 80 : 120;
+    uint32_t base_station_dwell = is_background_scan ? 300 : 500;
+    
+    // Only apply weighting after we have enough data
+    if (channel_scan_counts[channel] >= MIN_SCANS_FOR_LEARNING) {
+        // Calculate discovery rate (devices per scan)
+        float discovery_rate = channel_scan_counts[channel] > 0 ? 
+            (float)channel_discovery_counts[channel] / channel_scan_counts[channel] : 0;
+        
+        // Calculate weight multiplier based on discovery rate
+        float weight_multiplier = MIN_CHANNEL_WEIGHT + (discovery_rate * (MAX_CHANNEL_WEIGHT - MIN_CHANNEL_WEIGHT));
+        if (weight_multiplier > MAX_CHANNEL_WEIGHT) weight_multiplier = MAX_CHANNEL_WEIGHT;
+        if (weight_multiplier < MIN_CHANNEL_WEIGHT) weight_multiplier = MIN_CHANNEL_WEIGHT;
+        
+        // Apply weighting
+        base_ap_dwell = (uint32_t)(base_ap_dwell * weight_multiplier);
+        base_station_dwell = (uint32_t)(base_station_dwell * weight_multiplier);
+        
+        // Ensure reasonable bounds
+        if (base_ap_dwell < 60) base_ap_dwell = 60;
+        if (base_ap_dwell > 240) base_ap_dwell = 240;
+        if (base_station_dwell < 250) base_station_dwell = 250;
+        if (base_station_dwell > 1000) base_station_dwell = 1000;
+        
+        ESP_LOGD(TAG, "Channel %d: discovery_rate=%.2f, multiplier=%.2f, dwell=%d ms", 
+                 channel, discovery_rate, weight_multiplier, base_ap_dwell);
+    }
+    
+    return base_ap_dwell;
+}
+
+void update_channel_activity(uint8_t channel, uint32_t devices_found, int8_t *rssi_values, uint32_t rssi_count) {
+    if (channel < 1 || channel > 13) return;
+    
+    // Apply RSSI cutoff threshold - only count devices within useful range
+    uint32_t valid_devices = 0;
+    if (rssi_values && rssi_count > 0) {
+        for (uint32_t i = 0; i < rssi_count && i < devices_found; i++) {
+            if (rssi_values[i] >= RSSI_CUTOFF_THRESHOLD) {
+                valid_devices++;
+            }
+        }
+    } else {
+        // Fallback if no RSSI data provided
+        valid_devices = devices_found;
+    }
+    
+    // Update discovery counts with filtered results
+    channel_discovery_counts[channel] += valid_devices;
+    
+    ESP_LOGD(TAG, "Channel %d: %d valid devices (RSSI>=%d), %d total filtered, %d discoveries in %d scans", 
+             channel, valid_devices, RSSI_CUTOFF_THRESHOLD, devices_found, 
+             channel_discovery_counts[channel], channel_scan_counts[channel]);
+}
+
+static void maintain_channel_learning(void) {
+    uint32_t now = get_current_timestamp();
+    
+    // Reset counters if they get too old (every 24 hours)
+    if (now - last_channel_update > 86400) {
+        // Decay the discovery counts slightly to adapt to changes
+        for (int ch = 1; ch <= 13; ch++) {
+            channel_discovery_counts[ch] = (uint32_t)(channel_discovery_counts[ch] * 0.8);
+            channel_scan_counts[ch] = (uint32_t)(channel_scan_counts[ch] * 0.8);
+        }
+        last_channel_update = now;
+        
+        ESP_LOGI(TAG, "Channel learning data decayed for adaptation");
+    }
+}
+
 void wifi_scan() {
     if(!scan_mutex) {
         scan_mutex = xSemaphoreCreateMutex();
@@ -101,12 +192,19 @@ void wifi_scan() {
 
     scan_in_progress = true;
     
-    // calculate estimate first
-    const uint32_t ap_dwell_ms = 120;  // ap scan time per channel
-    const uint32_t station_dwell_ms = 500;  // increased from 250
-    const uint32_t total_estimate_ms = (ap_dwell_ms + station_dwell_ms) * dual_band_channels_size;
+    // Run maintenance to adapt to changing conditions
+    maintain_channel_learning();
     
-    ESP_LOGI(TAG, "Starting scan - estimated %.1f seconds (%d channels)", 
+    // Calculate estimate using adaptive timing
+    uint32_t total_estimate_ms = 0;
+    for (size_t i = 0; i < sizeof(dual_band_channels) / sizeof(dual_band_channels[0]); i++) {
+        uint8_t channel = dual_band_channels[i];
+        uint32_t ap_dwell = get_channel_dwell_time(channel, false);
+        uint32_t station_dwell = (uint32_t)(ap_dwell * 4.17); // Maintain 500/120 ratio
+        total_estimate_ms += ap_dwell + station_dwell;
+    }
+    
+    ESP_LOGI(TAG, "Starting smart scan - estimated %.1f seconds (%d channels)", 
             total_estimate_ms / 1000.0f, dual_band_channels_size);
 
     cJSON *root = cJSON_CreateObject();
@@ -120,10 +218,18 @@ void wifi_scan() {
     };
 
     for (size_t i = 0; i < sizeof(dual_band_channels) / sizeof(dual_band_channels[0]); i++) {
-        scan_config.channel = dual_band_channels[i];
+        uint8_t channel = dual_band_channels[i];
+        
+        // Get smart dwell time for this channel
+        uint32_t ap_dwell = get_channel_dwell_time(channel, false);
+        
+        // Track that we're scanning this channel
+        channel_scan_counts[channel]++;
+        
+        scan_config.channel = channel;
         esp_err_t err = esp_wifi_scan_start(&scan_config, true);
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Wi-Fi scan failed on channel %d: %s", scan_config.channel, esp_err_to_name(err));
+            ESP_LOGE(TAG, "Wi-Fi scan failed on channel %d: %s", channel, esp_err_to_name(err));
             cJSON_AddItemToArray(rows, cJSON_CreateObject());
             continue;
         }
@@ -131,23 +237,45 @@ void wifi_scan() {
         esp_wifi_scan_get_ap_num(&ap_count);
 
         if (ap_count == 0) {
+            // Update channel activity with zero results
+            update_channel_activity(channel, 0, NULL, 0);
             continue;  // Skip silently if no APs
         }
-        ESP_LOGI(TAG, "Found %d Wi-Fi networks on channel %d", ap_count, scan_config.channel);
+        
+        ESP_LOGI(TAG, "Found %d Wi-Fi networks on channel %d (dwell: %d ms)", ap_count, channel, ap_dwell);
         wifi_ap_record_t *ap_records = (wifi_ap_record_t *)malloc(sizeof(wifi_ap_record_t) * ap_count);
         if (!ap_records) {
             ESP_LOGE(TAG, "Memory allocation failed!");
+            // Update channel activity with count but no RSSI data
+            update_channel_activity(channel, ap_count, NULL, 0);
             cJSON_AddItemToArray(rows, cJSON_CreateObject());
             continue;
         }
         err = esp_wifi_scan_get_ap_records(&ap_count, ap_records);
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to get scan results on channel %d: %s", scan_config.channel, esp_err_to_name(err));
+            ESP_LOGE(TAG, "Failed to get scan results on channel %d: %s", channel, esp_err_to_name(err));
             free(ap_records);
+            // Update channel activity with count but no RSSI data
+            update_channel_activity(channel, ap_count, NULL, 0);
             cJSON_AddItemToArray(rows, cJSON_CreateObject());
             continue;
         }
-        uint32_t now_sec = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+        
+        // Collect RSSI values for filtering
+        int8_t *rssi_values = malloc(sizeof(int8_t) * ap_count);
+        if (rssi_values) {
+            for (int j = 0; j < ap_count; j++) {
+                rssi_values[j] = ap_records[j].rssi;
+            }
+        }
+        
+        // Update channel activity with RSSI filtering
+        update_channel_activity(channel, ap_count, rssi_values, ap_count);
+        
+        if (rssi_values) {
+            free(rssi_values);
+        }
+        uint32_t now_sec = get_current_timestamp();
         for (int j = 0; j < ap_count; j++) {
             bool is_hidden = (ap_records[j].ssid[0] == '\0');
             if (is_hidden) {
@@ -199,9 +327,13 @@ void wifi_scan() {
     // NOW DO STATION SCAN
     wifi_scan_stations();
     const char *station_json = wifi_scan_get_station_results();
+    ESP_LOGI(TAG, "Station scan complete. Station JSON: %s", station_json);
     cJSON *station_root = cJSON_Parse(station_json);
     if (!station_root) {
+        ESP_LOGE(TAG, "Failed to parse station JSON");
         station_root = cJSON_CreateObject();
+    } else {
+        ESP_LOGI(TAG, "Station JSON parsed successfully, merging with AP data");
     }
 
     // Update device presence tracking for all found stations
@@ -254,6 +386,8 @@ void wifi_scan() {
     }
 
     // merge station data into AP entries
+    ESP_LOGI(TAG, "Merging station data into AP entries...");
+    int merge_count = 0;
     cJSON *ap_entry = NULL;
     cJSON_ArrayForEach(ap_entry, rows) {
         cJSON *mac_item = cJSON_GetObjectItem(ap_entry, "MAC");
@@ -261,15 +395,25 @@ void wifi_scan() {
             // convert to uppercase for key matching
             char upper_mac[18];
             strncpy(upper_mac, mac_item->valuestring, sizeof(upper_mac));
+            upper_mac[sizeof(upper_mac) - 1] = '\0';
             for(int i=0; upper_mac[i]; i++) upper_mac[i] = toupper(upper_mac[i]);
             
+            ESP_LOGI(TAG, "Looking for stations for AP: %s", upper_mac);
             cJSON *station_data = cJSON_GetObjectItem(station_root, upper_mac);
             if(station_data) {
                 cJSON *stations = cJSON_DetachItemFromObject(station_data, "stations");
-                cJSON_AddItemToObject(ap_entry, "stations", stations);
+                if (stations) {
+                    int station_count = cJSON_GetArraySize(stations);
+                    ESP_LOGI(TAG, "Found %d stations for AP %s", station_count, upper_mac);
+                    cJSON_AddItemToObject(ap_entry, "stations", stations);
+                    merge_count++;
+                } else {
+                    ESP_LOGW(TAG, "No stations array in station_data for %s", upper_mac);
+                }
             }
         }
     }
+    ESP_LOGI(TAG, "Merged stations for %d APs", merge_count);
 
     // Store results in buffer with mutex protection
     xSemaphoreTake(scan_mutex, portMAX_DELAY);
@@ -407,6 +551,22 @@ bool wifi_scan_has_new_results() {
     return has_new;
 }
 
+// Probe request fingerprinting functions
+static void parse_probe_request_fingerprint(const uint8_t *frame_body, int frame_len, station_info_t *station);
+static void extract_device_capabilities(const uint8_t *ie_data, uint8_t ie_len, char *fingerprint, size_t fp_len);
+static const char* get_vendor_from_oui(const uint8_t *mac);
+static bool fingerprints_match(const char *fp1, const char *fp2, int channel1, int channel2);
+static bool try_group_with_existing_station(station_info_t *new_station);
+
+static uint32_t get_current_timestamp(void) {
+    if (pwnpower_time_is_synced()) {
+        time_t now;
+        time(&now);
+        return (uint32_t)now;
+    }
+    return (uint32_t)(esp_timer_get_time() / 1000000ULL);
+}
+
 static void stations_sniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
     if(type != WIFI_PKT_MGMT && type != WIFI_PKT_DATA) return;
 
@@ -418,9 +578,19 @@ static void stations_sniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
     uint8_t frame_type = (fc0 >> 2) & 0x03;
     uint8_t frame_subtype = (fc0 >> 4) & 0x0F;
     
+    // Debug: Log all management frame types we see
+    if (frame_type == 0) {
+        s_probe_request_count++;
+        if (frame_subtype == 0x04) {
+            ESP_LOGI(TAG, "PROBE_DEBUG: Probe request detected! Total probe requests seen: %lu", (unsigned long)s_probe_request_count);
+        } else if (s_probe_request_count % 100 == 0) {
+            ESP_LOGI(TAG, "PROBE_DEBUG: Management frames seen: %lu, subtype: 0x%02X", (unsigned long)s_probe_request_count, frame_subtype);
+        }
+    }
+    
     if (frame_type == 0 && (frame_subtype == 0x0C || frame_subtype == 0x0A)) {
         s_deauth_count++;
-        s_deauth_last_seen = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+        s_deauth_last_seen = get_current_timestamp();
         return;
     }
     
@@ -494,6 +664,108 @@ static void stations_sniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
     uint8_t station_mac[6];
     uint8_t ap_bssid[6];
     bool found = false;
+    
+    // Enhanced probe request fingerprinting for management frames
+    if (frame_type == 0 && frame_subtype == 0x04) { // Probe Request
+        // Extract source MAC from probe request frame
+        uint8_t probe_mac[6];
+        memcpy(probe_mac, addr2, 6); // Source address is addr2 in management frames
+        
+        ESP_LOGI(TAG, "PROBE_FINGERPRINT: Capturing probe request from %02X:%02X:%02X:%02X:%02X:%02X on channel %d, RSSI %d",
+                 probe_mac[0], probe_mac[1], probe_mac[2], probe_mac[3], probe_mac[4], probe_mac[5],
+                 rx_ctrl->channel, rx_ctrl->rssi);
+        
+        // Parse probe request for fingerprinting
+        uint8_t *frame_body = payload + 24;
+        int body_len = rx_ctrl->sig_len - 24;
+        if (body_len > 0) {
+            station_info_t temp_station = {0};
+            memcpy(temp_station.station_mac, probe_mac, 6);
+            temp_station.channel = rx_ctrl->channel;
+            temp_station.rssi = rx_ctrl->rssi;
+            temp_station.last_seen = get_current_timestamp();
+            
+            parse_probe_request_fingerprint(frame_body, body_len, &temp_station);
+            
+            ESP_LOGI(TAG, "PROBE_FINGERPRINT: Vendor: %s, Fingerprint: %s",
+                     temp_station.device_vendor, temp_station.device_fingerprint);
+                     
+            // Update existing station record or create new one
+            xSemaphoreTake(stations_mutex, portMAX_DELAY);
+            bool station_exists = false;
+            for(int i=0; i<stations_count; i++) {
+                if(memcmp(stations[i].station_mac, probe_mac, 6) == 0) {
+                    // Update fingerprinting data
+                    station_exists = true;
+                    stations[i].probe_count++;
+                    stations[i].last_seen = temp_station.last_seen;
+                    stations[i].rssi = temp_station.rssi;
+                    if (temp_station.has_fingerprint) {
+                        stations[i].has_fingerprint = true;
+                        if (strlen(temp_station.device_vendor) > 0) {
+                            strncpy(stations[i].device_vendor, temp_station.device_vendor, sizeof(stations[i].device_vendor) - 1);
+                            stations[i].device_vendor[sizeof(stations[i].device_vendor) - 1] = '\0';
+                        }
+                        if (strlen(temp_station.device_fingerprint) > 0) {
+                            strncpy(stations[i].device_fingerprint, temp_station.device_fingerprint, sizeof(stations[i].device_fingerprint) - 1);
+                            stations[i].device_fingerprint[sizeof(stations[i].device_fingerprint) - 1] = '\0';
+                        }
+                    }
+                    ESP_LOGI(TAG, "PROBE_FINGERPRINT: Updated existing station %s, probe count: %d", 
+                             mac_to_str(probe_mac), stations[i].probe_count);
+                    break;
+                }
+            }
+            
+            // Create new station record if not found and we have space
+            if (!station_exists && stations_count < MAX_STATIONS) {
+                // For probe requests, try to find a known AP on the same channel
+                bool ap_found = false;
+                for(int k=0; k<known_ap_count; k++) {
+                    if(known_ap_channels[k] == rx_ctrl->channel) {
+                        memcpy(temp_station.ap_bssid, known_ap_bssids[k], 6);
+                        ap_found = true;
+                        break;
+                    }
+                }
+                
+                // If no known AP on this channel, use broadcast
+                if (!ap_found) {
+                    uint8_t broadcast_bssid[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+                    memcpy(temp_station.ap_bssid, broadcast_bssid, 6);
+                }
+                
+                temp_station.probe_count = 1;
+                temp_station.last_seen = get_current_timestamp();
+                temp_station.is_grouped = false;
+                temp_station.grouped_mac_count = 0;
+                
+                // Create station if we have any useful fingerprint data
+                if (strlen(temp_station.device_fingerprint) > 4 || strlen(temp_station.device_vendor) > 0) {
+                    temp_station.has_fingerprint = true;
+                    
+                    // Try to group with existing station if we have fingerprint
+                    if (try_group_with_existing_station(&temp_station)) {
+                        ESP_LOGI(TAG, "PROBE_FINGERPRINT: Grouped station %s with existing device based on fingerprint match",
+                                 mac_to_str(probe_mac));
+                    } else {
+                        memcpy(&stations[stations_count], &temp_station, sizeof(station_info_t));
+                        stations[stations_count].is_grouped = false;
+                        stations[stations_count].grouped_mac_count = 0;
+                        ESP_LOGI(TAG, "PROBE_FINGERPRINT: Created new station from probe - %s, Vendor: %s, Channel: %d, RSSI: %d",
+                                 mac_to_str(temp_station.station_mac), temp_station.device_vendor, temp_station.channel, temp_station.rssi);
+                        stations_count++;
+                    }
+                } else {
+                    ESP_LOGI(TAG, "PROBE_FINGERPRINT: Skipping station creation - insufficient fingerprint data");
+                }
+            } else if (!station_exists) {
+                ESP_LOGW(TAG, "PROBE_FINGERPRINT: Station array full, cannot add new station %s", mac_to_str(probe_mac));
+            }
+            xSemaphoreGive(stations_mutex);
+        }
+    }
+    
     if(frame_type == 2){
         if(to_ds && !from_ds){ memcpy(station_mac, addr2, 6); memcpy(ap_bssid, addr1, 6); found = true; }
         else if(!to_ds && from_ds){ memcpy(station_mac, addr1, 6); memcpy(ap_bssid, addr2, 6); found = true; }
@@ -514,15 +786,39 @@ static void stations_sniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
     if(memcmp(station_mac, bcast, 6)==0) return;
     if((station_mac[0] & 0x01) != 0) return;
     if(memcmp(station_mac, ap_bssid, 6)==0) return;
-    station_info_t candidate = { .channel = rx_ctrl->channel, .rssi = rx_ctrl->rssi };
+    station_info_t candidate = { 
+        .channel = rx_ctrl->channel, 
+        .rssi = rx_ctrl->rssi,
+        .probe_count = 1,
+        .last_seen = get_current_timestamp(),
+        .has_fingerprint = false
+    };
     memcpy(candidate.station_mac, station_mac, 6);
     memcpy(candidate.ap_bssid, ap_bssid, 6);
+    
+    // Get vendor from OUI
+    const char* vendor = get_vendor_from_oui(station_mac);
+    if(vendor) {
+        strncpy(candidate.device_vendor, vendor, sizeof(candidate.device_vendor) - 1);
+        candidate.device_vendor[sizeof(candidate.device_vendor) - 1] = '\0';
+    }
+    
     xSemaphoreTake(stations_mutex, portMAX_DELAY);
     bool exists = false;
     for(int i=0; i<stations_count; i++) {
-        if(memcmp(stations[i].station_mac, candidate.station_mac, 6) == 0 && memcmp(stations[i].ap_bssid, candidate.ap_bssid, 6) == 0) { exists = true; break; }
+        if(memcmp(stations[i].station_mac, candidate.station_mac, 6) == 0 && memcmp(stations[i].ap_bssid, candidate.ap_bssid, 6) == 0) { 
+            exists = true;
+            stations[i].probe_count++;
+            stations[i].last_seen = candidate.last_seen;
+            stations[i].rssi = candidate.rssi;
+            break;
+        }
     }
-    if(!exists && stations_count < MAX_STATIONS) { stations[stations_count++] = candidate; }
+    if(!exists && stations_count < MAX_STATIONS) { 
+        stations[stations_count++] = candidate;
+        ESP_LOGI(TAG, "PROBE_FINGERPRINT: New station added - %s, Vendor: %s, Channel: %d, RSSI: %d",
+                 mac_to_str(candidate.station_mac), candidate.device_vendor, candidate.channel, candidate.rssi);
+    }
     xSemaphoreGive(stations_mutex);
 }
 
@@ -570,6 +866,10 @@ void wifi_scan_stations() {
     xSemaphoreTake(stations_mutex, portMAX_DELAY);
     stations_count = 0; // reset for new scan
     xSemaphoreGive(stations_mutex);
+    
+    // Reset probe request counter for debugging
+    s_probe_request_count = 0;
+    ESP_LOGI(TAG, "PROBE_DEBUG: Starting station scan, reset probe counter to 0");
 
     if(known_ap_count == 0) {
         wifi_scan_config_t scan_config = { .ssid = NULL, .bssid = NULL, .channel = 0, .show_hidden = true, .scan_type = WIFI_SCAN_TYPE_ACTIVE, .scan_time.active.min = 150, .scan_time.active.max = 300 };
@@ -612,6 +912,8 @@ void wifi_scan_stations() {
 
     esp_wifi_set_promiscuous(false);
     
+    ESP_LOGI(TAG, "PROBE_DEBUG: Station scan completed, total probe requests processed: %lu", (unsigned long)s_probe_request_count);
+    
     probe_hidden_aps_internal();
     
     // restore original mode and reconnect if needed
@@ -651,16 +953,40 @@ const char* wifi_scan_get_station_results() {
         }
 
         // Add station to AP's list
-        uint32_t now_sec = (uint32_t)(esp_timer_get_time() / 1000000ULL);
         cJSON *station = cJSON_CreateObject();
         cJSON_AddStringToObject(station, "mac", 
             (char*)mac_to_str(stations[i].station_mac));
         cJSON_AddNumberToObject(station, "rssi", stations[i].rssi);
-        cJSON_AddNumberToObject(station, "last_seen", now_sec);
+        cJSON_AddNumberToObject(station, "last_seen", stations[i].last_seen);
+        cJSON_AddNumberToObject(station, "probe_count", stations[i].probe_count);
         
-        char sta_vendor[48] = "Unknown";
-        ouis_lookup_vendor(stations[i].station_mac, sta_vendor, sizeof(sta_vendor));
-        cJSON_AddStringToObject(station, "vendor", sta_vendor);
+        // Add fingerprinting data
+        if (stations[i].has_fingerprint) {
+            cJSON_AddBoolToObject(station, "has_fingerprint", true);
+            if (strlen(stations[i].device_vendor) > 0) {
+                cJSON_AddStringToObject(station, "device_vendor", stations[i].device_vendor);
+            } else {
+                cJSON_AddStringToObject(station, "device_vendor", "Unknown");
+            }
+            if (strlen(stations[i].device_fingerprint) > 0) {
+                cJSON_AddStringToObject(station, "device_fingerprint", stations[i].device_fingerprint);
+            }
+        } else {
+            cJSON_AddBoolToObject(station, "has_fingerprint", false);
+            // Fallback to basic OUI lookup
+            char sta_vendor[48] = "Unknown";
+            ouis_lookup_vendor(stations[i].station_mac, sta_vendor, sizeof(sta_vendor));
+            cJSON_AddStringToObject(station, "device_vendor", sta_vendor);
+        }
+        
+        // Add grouped MAC addresses if this device has multiple MACs
+        if (stations[i].is_grouped && stations[i].grouped_mac_count > 0) {
+            cJSON *grouped_macs_array = cJSON_AddArrayToObject(station, "grouped_macs");
+            for (int g = 0; g < stations[i].grouped_mac_count && g < 5; g++) {
+                cJSON_AddItemToArray(grouped_macs_array, cJSON_CreateString(mac_to_str(stations[i].grouped_macs[g])));
+            }
+            cJSON_AddNumberToObject(station, "grouped_count", stations[i].grouped_mac_count + 1);
+        }
         
         cJSON_AddItemToArray(cJSON_GetObjectItem(ap_entry, "stations"), station);
     }
@@ -705,6 +1031,11 @@ void wifi_scan_reset_deauth_count(void) {
     s_deauth_count = 0;
 }
 
+void wifi_scan_increment_deauth_count(void) {
+    s_deauth_count++;
+    s_deauth_last_seen = get_current_timestamp();
+}
+
 void wifi_scan_register_hidden_ap(const uint8_t *bssid, uint8_t channel) {
     if (!bssid || s_hidden_ap_idx >= MAX_HIDDEN_APS) return;
     
@@ -717,7 +1048,7 @@ void wifi_scan_register_hidden_ap(const uint8_t *bssid, uint8_t channel) {
     memcpy(s_hidden_aps[s_hidden_ap_idx].bssid, bssid, 6);
     s_hidden_aps[s_hidden_ap_idx].channel = channel;
     s_hidden_aps[s_hidden_ap_idx].ssid[0] = '\0';
-    s_hidden_aps[s_hidden_ap_idx].first_seen = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    s_hidden_aps[s_hidden_ap_idx].first_seen = get_current_timestamp();
     s_hidden_aps[s_hidden_ap_idx].probe_attempts = 0;
     s_hidden_aps[s_hidden_ap_idx].revealed = false;
     s_hidden_ap_idx++;
@@ -725,7 +1056,7 @@ void wifi_scan_register_hidden_ap(const uint8_t *bssid, uint8_t channel) {
 
 const char* wifi_scan_get_security_stats_json(void) {
     static char buf[512];
-    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    uint32_t now = get_current_timestamp();
     int pos = 0;
     pos += snprintf(buf + pos, sizeof(buf) - pos, 
         "{\"deauth_count\":%lu,\"deauth_last_seen\":%lu,\"hidden_aps\":[",
@@ -816,4 +1147,262 @@ int wifi_scan_probe_hidden_aps(void) {
     
     ESP_LOGI(TAG, "Hidden AP monitoring complete: %d/%d revealed", revealed_count, unrevealed_count);
     return revealed_count;
+}
+
+// Probe Request Fingerprinting Implementation
+
+static const char* get_vendor_from_oui(const uint8_t *mac) {
+    // Use existing OUI lookup functionality
+    static char vendor_buffer[48];
+    if (ouis_lookup_vendor(mac, vendor_buffer, sizeof(vendor_buffer))) {
+        return vendor_buffer;
+    }
+    return "Unknown";
+}
+
+static void extract_device_capabilities(const uint8_t *ie_data, uint8_t ie_len, char *fingerprint, size_t fp_len) {
+    int pos = 0;
+    fingerprint[0] = '\0';
+    
+    // Parse supported rates (IE 0x01)
+    if (ie_data[0] == 0x01 && ie_len >= 1) {
+        pos += snprintf(fingerprint + pos, fp_len - pos, "Rates:");
+        for (int i = 1; i <= ie_len && i < 9; i++) {
+            uint8_t rate = ie_data[i];
+            if (rate & 0x80) {
+                pos += snprintf(fingerprint + pos, fp_len - pos, "%.1fM ", (rate & 0x7F) / 2.0);
+            } else {
+                pos += snprintf(fingerprint + pos, fp_len - pos, "%.1fM ", rate / 2.0);
+            }
+        }
+    }
+    
+    // Parse extended capabilities (IE 0x7F)
+    if (ie_data[0] == 0x7F && ie_len >= 1) {
+        pos += snprintf(fingerprint + pos, fp_len - pos, "ExtCaps:");
+        for (int i = 1; i <= ie_len && i < 9; i++) {
+            pos += snprintf(fingerprint + pos, fp_len - pos, "%02X", ie_data[i]);
+        }
+    }
+    
+    // Parse VHT capabilities (IE 0xBF) for 802.11ac devices
+    if (ie_data[0] == 0xBF && ie_len >= 1) {
+        pos += snprintf(fingerprint + pos, fp_len - pos, "VHT:");
+        // Extract key VHT capability fields for fingerprinting
+        if (ie_len >= 4) {
+            uint32_t vht_cap_info = (ie_data[1] << 24) | (ie_data[2] << 16) | (ie_data[3] << 8) | ie_data[4];
+            pos += snprintf(fingerprint + pos, fp_len - pos, "%08lX", (unsigned long)vht_cap_info);
+        }
+        if (ie_len >= 6) {
+            pos += snprintf(fingerprint + pos, fp_len - pos, "MCS:%02X%02X", ie_data[5], ie_data[6]);
+        }
+    }
+    
+    // Parse HT capabilities (IE 0x45) for 802.11n devices
+    if (ie_data[0] == 0x45 && ie_len >= 1) {
+        pos += snprintf(fingerprint + pos, fp_len - pos, "HT:");
+        if (ie_len >= 2) {
+            pos += snprintf(fingerprint + pos, fp_len - pos, "%04X", (ie_data[1] << 8) | ie_data[2]);
+        }
+    }
+    
+    ESP_LOGI(TAG, "PROBE_FINGERPRINT: Extracted capabilities - %s", fingerprint);
+}
+
+static void parse_probe_request_fingerprint(const uint8_t *frame_body, int frame_len, station_info_t *station) {
+    ESP_LOGI(TAG, "PROBE_FINGERPRINT: Parsing probe request, frame length: %d", frame_len);
+    
+    // Initialize fingerprint
+    station->device_fingerprint[0] = '\0';
+    station->device_vendor[0] = '\0';
+    station->has_fingerprint = false;
+    
+    int fp_pos = 0;
+    fp_pos += snprintf(station->device_fingerprint + fp_pos, sizeof(station->device_fingerprint) - fp_pos, "FP:");
+    
+    // Parse Information Elements (IEs) in probe request
+    int ie_offset = 0;
+    
+    // Skip SSID IE (0x00) if present
+    if (frame_len > 0 && frame_body[0] == 0x00) {
+        uint8_t ssid_len = frame_body[1];
+        ie_offset += 2 + ssid_len;
+        ESP_LOGI(TAG, "PROBE_FINGERPRINT: SSID length: %d", ssid_len);
+    }
+    
+    // Parse remaining IEs for fingerprinting
+    while (ie_offset + 1 < frame_len) {
+        uint8_t ie_id = frame_body[ie_offset];
+        uint8_t ie_len = frame_body[ie_offset + 1];
+        
+        ESP_LOGI(TAG, "PROBE_FINGERPRINT: Found IE 0x%02X, length %d at offset %d", ie_id, ie_len, ie_offset);
+        
+        if (ie_offset + 2 + ie_len > frame_len) {
+            ESP_LOGW(TAG, "PROBE_FINGERPRINT: IE 0x%02X extends beyond frame boundary", ie_id);
+            break;
+        }
+        
+        char ie_fingerprint[64] = {0};
+        extract_device_capabilities(&frame_body[ie_offset], ie_len + 2, ie_fingerprint, sizeof(ie_fingerprint));
+        
+        if (strlen(ie_fingerprint) > 0) {
+            fp_pos += snprintf(station->device_fingerprint + fp_pos, sizeof(station->device_fingerprint) - fp_pos, "%s ", ie_fingerprint);
+        }
+        
+        // Vendor-specific IEs (0xDD) often contain device-specific information
+        if (ie_id == 0xDD && ie_len >= 3) {
+            uint8_t vendor_oui[3];
+            memcpy(vendor_oui, &frame_body[ie_offset + 2], 3);
+            const char* vendor = get_vendor_from_oui(vendor_oui);
+            if (vendor && strlen(vendor) > 0) {
+                strncpy(station->device_vendor, vendor, sizeof(station->device_vendor) - 1);
+                station->device_vendor[sizeof(station->device_vendor) - 1] = '\0';
+                fp_pos += snprintf(station->device_fingerprint + fp_pos, sizeof(station->device_fingerprint) - fp_pos, "VENDOR:%s ", vendor);
+            }
+        }
+        
+        ie_offset += 2 + ie_len;
+        
+        // Prevent buffer overflow
+        if (fp_pos >= sizeof(station->device_fingerprint) - 20) {
+            break;
+        }
+    }
+    
+    // Get vendor from MAC address OUI as fallback
+    if (strlen(station->device_vendor) == 0) {
+        const char* vendor = get_vendor_from_oui(station->station_mac);
+        if (vendor) {
+            strncpy(station->device_vendor, vendor, sizeof(station->device_vendor) - 1);
+            station->device_vendor[sizeof(station->device_vendor) - 1] = '\0';
+        }
+    }
+    
+    // Mark as having fingerprint if we collected any useful data
+    if (strlen(station->device_fingerprint) > 4 || strlen(station->device_vendor) > 0) {
+        station->has_fingerprint = true;
+        ESP_LOGI(TAG, "PROBE_FINGERPRINT: Complete fingerprint generated - Vendor: %s, Data: %s", 
+                 station->device_vendor, station->device_fingerprint);
+    } else {
+        ESP_LOGI(TAG, "PROBE_FINGERPRINT: Limited fingerprint data available");
+    }
+}
+
+// Compare two fingerprints to determine if they're from the same device
+static bool fingerprints_match(const char *fp1, const char *fp2, int channel1, int channel2) {
+    // Must be on same or nearby channel
+    if (abs(channel1 - channel2) > 2) {
+        return false;
+    }
+    
+    // Both must have fingerprints
+    if (!fp1 || !fp2 || strlen(fp1) < 10 || strlen(fp2) < 10) {
+        return false;
+    }
+    
+    // Extract key parts of fingerprint for comparison
+    // Look for VHT capabilities (most unique identifier)
+    const char *vht1 = strstr(fp1, "VHT:");
+    const char *vht2 = strstr(fp2, "VHT:");
+    
+    if (vht1 && vht2) {
+        // Compare VHT capability info (first 8 hex chars after "VHT:")
+        if (strncmp(vht1, vht2, 12) == 0) {
+            ESP_LOGI(TAG, "FINGERPRINT_MATCH: VHT capabilities match");
+            return true;
+        }
+    }
+    
+    // Look for ExtCaps (extended capabilities)
+    const char *ext1 = strstr(fp1, "ExtCaps:");
+    const char *ext2 = strstr(fp2, "ExtCaps:");
+    
+    if (ext1 && ext2) {
+        // Compare ExtCaps (first 16 hex chars)
+        if (strncmp(ext1, ext2, 24) == 0) {
+            ESP_LOGI(TAG, "FINGERPRINT_MATCH: Extended capabilities match");
+            return true;
+        }
+    }
+    
+    // Look for supported rates pattern
+    const char *rates1 = strstr(fp1, "Rates:");
+    const char *rates2 = strstr(fp2, "Rates:");
+    
+    if (rates1 && rates2) {
+        // Extract rate string (up to next space or 50 chars)
+        char rate_str1[60] = {0};
+        char rate_str2[60] = {0};
+        const char *end1 = strchr(rates1 + 6, ' ');
+        const char *end2 = strchr(rates2 + 6, ' ');
+        
+        int len1 = end1 ? (end1 - rates1) : strlen(rates1);
+        int len2 = end2 ? (end2 - rates2) : strlen(rates2);
+        
+        if (len1 > 0 && len1 < 60) strncpy(rate_str1, rates1, len1);
+        if (len2 > 0 && len2 < 60) strncpy(rate_str2, rates2, len2);
+        
+        // If rates match exactly
+        if (strlen(rate_str1) > 10 && strcmp(rate_str1, rate_str2) == 0) {
+            ESP_LOGI(TAG, "FINGERPRINT_MATCH: Supported rates match exactly");
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+// Try to group new station with existing station based on fingerprint
+static bool try_group_with_existing_station(station_info_t *new_station) {
+    // Only group if it's a randomized MAC
+    if ((new_station->station_mac[0] & 0x02) == 0) {
+        return false;
+    }
+    
+    // Must have fingerprint
+    if (!new_station->has_fingerprint) {
+        return false;
+    }
+    
+    // Search for matching fingerprint in existing stations
+    for (int i = 0; i < stations_count; i++) {
+        // Skip if same MAC
+        if (memcmp(stations[i].station_mac, new_station->station_mac, 6) == 0) {
+            continue;
+        }
+        
+        // Must have fingerprint
+        if (!stations[i].has_fingerprint) {
+            continue;
+        }
+        
+        // Check if fingerprints match
+        if (fingerprints_match(stations[i].device_fingerprint, new_station->device_fingerprint,
+                               stations[i].channel, new_station->channel)) {
+            
+            ESP_LOGI(TAG, "FINGERPRINT_GROUP: Grouping %s with %s based on matching fingerprint",
+                     mac_to_str(new_station->station_mac), mac_to_str(stations[i].station_mac));
+            
+            // Add to grouped MACs if we have space
+            if (stations[i].grouped_mac_count < 5) {
+                memcpy(stations[i].grouped_macs[stations[i].grouped_mac_count], new_station->station_mac, 6);
+                stations[i].grouped_mac_count++;
+                stations[i].is_grouped = true;
+                
+                // Update probe count and RSSI
+                stations[i].probe_count += new_station->probe_count;
+                if (new_station->rssi > stations[i].rssi) {
+                    stations[i].rssi = new_station->rssi;
+                }
+                stations[i].last_seen = new_station->last_seen;
+                
+                ESP_LOGI(TAG, "FINGERPRINT_GROUP: Device now has %d MAC addresses, total probes: %d",
+                         stations[i].grouped_mac_count + 1, stations[i].probe_count);
+                
+                return true;
+            }
+        }
+    }
+    
+    return false;
 }

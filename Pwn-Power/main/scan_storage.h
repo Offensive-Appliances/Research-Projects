@@ -6,6 +6,10 @@
 #include <stddef.h>
 #include "esp_err.h"
 
+// Forward declaration to avoid including web server headers
+struct httpd_req;
+typedef struct httpd_req httpd_req_t;
+
 #define SCAN_STORAGE_PARTITION "scandata"
 #define SCAN_MAGIC 0x50574E53  // "PWNS"
 #define SCAN_VERSION 2
@@ -222,6 +226,7 @@ esp_err_t scan_storage_detect_rogue_aps(void);
 esp_err_t scan_storage_update_security_events(uint32_t deauth_count);
 const char* scan_storage_get_intelligence_json(void);
 const char* scan_storage_get_unified_intelligence_json(void);
+esp_err_t scan_storage_send_unified_intelligence_chunked(httpd_req_t *req);
 
 // history sample ring buffer
 esp_err_t scan_storage_append_history_sample(const history_sample_t *sample);

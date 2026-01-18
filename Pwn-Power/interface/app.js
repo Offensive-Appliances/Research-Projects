@@ -84,9 +84,25 @@ function showWarningPopup(msg) {
 async function fetchJSON(url, opts = {}) {
     try {
         const res = await fetch(url, opts);
-        return await res.json();
+        if (!res.ok) {
+            console.error(`HTTP error for ${url}: ${res.status} ${res.statusText}`);
+            return null;
+        }
+        const text = await res.text();
+        if (!text || text.length === 0) {
+            console.error(`Empty response from ${url}`);
+            return null;
+        }
+        try {
+            return JSON.parse(text);
+        } catch (parseErr) {
+            console.error(`JSON parse error for ${url}:`, parseErr);
+            console.error(`Response length: ${text.length}, First 200 chars:`, text.substring(0, 200));
+            console.error(`Last 200 chars:`, text.substring(Math.max(0, text.length - 200)));
+            return null;
+        }
     } catch (e) {
-        console.error('Fetch error:', e);
+        console.error(`Fetch error for ${url}:`, e);
         return null;
     }
 }
@@ -127,25 +143,30 @@ async function loadScanData() {
     }
 }
 
-function computeLastSeenTimestamp(status, lastSeenUptimeSec) {
-    const uptime = status?.uptime;
+function computeLastSeenTimestamp(status, lastSeenEpoch) {
     const epochNow = status?.timestamp;
     const timeSynced = status?.time_synced;
 
-    if (!lastSeenUptimeSec || !uptime) return '--';
-    if (lastSeenUptimeSec > uptime) return '--';
-    if (!timeSynced || !epochNow) return '--';
+    if (!lastSeenEpoch || !timeSynced || !epochNow) return '--';
+    if (lastSeenEpoch > epochNow) return '--';
 
-    const epoch = epochNow - (uptime - lastSeenUptimeSec);
-    if (!epoch || epoch <= 0) return '--';
-    return new Date(epoch * 1000).toISOString();
+    return new Date(lastSeenEpoch * 1000).toISOString();
 }
 
-function computeLastSeenRelative(status, lastSeenUptimeSec) {
-    const uptime = status?.uptime;
-    if (!lastSeenUptimeSec || !uptime) return '--';
-    if (lastSeenUptimeSec > uptime) return '--';
-    return formatUptime(uptime - lastSeenUptimeSec);
+function computeLastSeenRelative(status, lastSeenEpoch) {
+    const epochNow = status?.timestamp;
+    const timeSynced = status?.time_synced;
+
+    // If no valid timestamp or time not synced, show "Unknown"
+    if (!lastSeenEpoch || !timeSynced || !epochNow) return 'Unknown';
+    if (lastSeenEpoch > epochNow) return 'Unknown';
+
+    const ageSec = Math.floor(epochNow - lastSeenEpoch);
+    
+    // If the age is very large (years), likely timestamp issue
+    if (ageSec > 31536000) return 'Unknown';
+    
+    return formatUptime(ageSec);
 }
 
 function renderNetworkTable(tableId, selectable, status) {
@@ -160,17 +181,39 @@ function renderNetworkTable(tableId, selectable, status) {
         const row = document.createElement('tr');
         row.dataset.mac = ap.MAC;
         row.dataset.channel = ap.Channel;
-        const uptime = status?.uptime || 0;
-        const age = (ap.last_seen && uptime && ap.last_seen <= uptime) ? (uptime - ap.last_seen) : null;
+        const lastSeenText = computeLastSeenRelative(status, ap.last_seen);
+        const clientCount = (ap.stations && ap.stations.length > 0) ? ap.stations.length : 0;
+        const expandIcon = clientCount > 0 ? '<span class="expand-icon" style="vertical-align: middle; margin-right: 4px;"></span>' : '';
+        
         row.innerHTML = `
-            <td>${pii(ap.SSID || '(Hidden)', 'ssid')}</td>
+            <td>${expandIcon}<span style="vertical-align: middle; ${expandIcon ? 'margin-left: 4px;' : ''}">${pii(ap.SSID || '(Hidden)', 'ssid')}</span></td>
             <td><code>${pii(ap.MAC, 'mac')}</code></td>
             <td class="muted">${pii(ap.Vendor || 'Unknown', 'vendor')}</td>
             <td>${ap.Security}</td>
             <td>${ap.Channel}</td>
             <td>${ap.RSSI || '--'}</td>
-            <td class="muted">${age === null ? '--' : `<span class="js-ago" data-ago-base="${age}" data-ago-start="${nowMs}">${formatUptime(age)}</span>`}</td>
+            <td class="muted">${lastSeenText}</td>
         `;
+        
+        // Add expand/collapse for APs with clients
+        if (clientCount > 0) {
+            row.classList.add('has-clients');
+            const expandIcon = row.querySelector('.expand-icon');
+            const toggleClients = (e) => {
+                e.stopPropagation();
+                const isExpanded = row.classList.toggle('expanded');
+                // Toggle visibility of client rows
+                const clientRows = tbody.querySelectorAll(`tr.client-row[data-ap-mac="${ap.MAC}"]`);
+                clientRows.forEach(cr => {
+                    cr.style.display = isExpanded ? '' : 'none';
+                });
+            };
+            
+            if (expandIcon) {
+                expandIcon.style.cursor = 'pointer';
+                expandIcon.onclick = toggleClients;
+            }
+        }
         
         if (selectable) {
             row.onclick = () => selectAP(row, ap);
@@ -184,15 +227,24 @@ function renderNetworkTable(tableId, selectable, status) {
                 clientRow.className = 'client-row';
                 clientRow.dataset.apMac = ap.MAC;
                 clientRow.dataset.staMac = sta.mac;
-                const staAge = (sta.last_seen && uptime && sta.last_seen <= uptime) ? (uptime - sta.last_seen) : null;
+                clientRow.style.display = 'none'; // Hidden by default
+                const staLastSeenText = computeLastSeenRelative(status, sta.last_seen);
+                
+                // Build grouped MACs display if available
+                let macDisplay = pii(sta.mac, 'mac');
+                if (sta.grouped_macs && sta.grouped_macs.length > 0) {
+                    const groupedList = sta.grouped_macs.map(m => pii(m, 'mac')).join(', ');
+                    macDisplay += ` <span class="muted" style="font-size:0.85em">(+${sta.grouped_count - 1} more: ${groupedList})</span>`;
+                }
+                
                 clientRow.innerHTML = `
                     <td>↳ Client</td>
-                    <td><code>${pii(sta.mac, 'mac')}</code></td>
-                    <td class="muted">${pii(sta.vendor || 'Unknown', 'vendor')}</td>
+                    <td><code>${macDisplay}</code></td>
+                    <td class="muted">${pii(sta.device_vendor || sta.vendor || 'Unknown', 'vendor')}</td>
                     <td></td>
                     <td></td>
                     <td>${sta.rssi}</td>
-                    <td class="muted">${staAge === null ? '--' : `<span class="js-ago" data-ago-base="${staAge}" data-ago-start="${nowMs}">${formatUptime(staAge)}</span>`}</td>
+                    <td class="muted">${staLastSeenText}</td>
                 `;
                 if (selectable) {
                     clientRow.onclick = (e) => {
@@ -204,8 +256,6 @@ function renderNetworkTable(tableId, selectable, status) {
             });
         }
     });
-
-    updateAgoTick();
 }
 
 function selectAP(row, ap) {
@@ -405,183 +455,6 @@ async function saveScanSettings() {
     showToast('Settings saved');
 }
 
-async function downloadReport() {
-    const [data, secStats, scanSettings, apConfig, netStatus, intelUnified] = await Promise.all([
-        fetchJSON('/scan/report'),
-        fetchJSON('/security/stats'),
-        fetchJSON('/scan/settings'),
-        fetchJSON('/ap/config'),
-        fetchJSON('/wifi/status'),
-        fetchJSON('/intelligence/unified')
-    ]);
-    if (!data) return showToast('Failed to get report');
-
-    const now = new Date();
-    const hours = data.summary?.monitoring_hours || 0;
-    const days = Math.floor(hours / 24);
-    const remHours = (hours % 24).toFixed(1);
-    const duration = days > 0 ? `${days}d ${remHours}h` : `${hours.toFixed(1)}h`;
-
-    const lines = [];
-    const addSection = (title, headers = []) => {
-        if (lines.length) lines.push('');
-        lines.push(`[${title}]`);
-        if (headers.length) lines.push(headers.join(','));
-    };
-
-    addSection('Overview', ['Field', 'Value']);
-    lines.push(`Generated,${now.toISOString()}`);
-    lines.push(`Uptime,${duration}`);
-    lines.push(`Total Scans,${data.summary?.total_scans || 0}`);
-    lines.push(`APs Found,${data.summary?.unique_aps || 0}`);
-    lines.push(`Clients Found,${data.summary?.unique_stations || 0}`);
-    lines.push(`Scans/Hour,${hours > 0 ? ((data.summary?.total_scans || 0) / hours).toFixed(2) : 0}`);
-
-    if (intelUnified?.summary?.presence) {
-        const presence = intelUnified.summary.presence;
-        addSection('Device Presence Snapshot', ['Metric', 'Value']);
-        lines.push(`Devices Present,${presence.devices_present ?? 0}`);
-        lines.push(`Devices Away,${presence.devices_away ?? 0}`);
-        lines.push(`New Today,${presence.new_today ?? 0}`);
-        lines.push(`Total Known,${(presence.devices_present || 0) + (presence.devices_away || 0)}`);
-    }
-
-    if (intelUnified?.summary?.security) {
-        const secSummary = intelUnified.summary.security;
-        addSection('Device Security Snapshot', ['Metric', 'Value']);
-        lines.push(`Deauth Events,${secSummary.deauth_events ?? 0}`);
-        lines.push(`Rogue APs,${secSummary.rogue_aps ?? 0}`);
-        lines.push(`Open Networks,${secSummary.open_networks ?? 0}`);
-        lines.push(`Hidden Networks,${secSummary.hidden_networks ?? 0}`);
-    }
-
-    if (intelUnified?.summary?.network) {
-        const netSummary = intelUnified.summary.network;
-        addSection('Network Activity Snapshot', ['Metric', 'Value']);
-        lines.push(`Unique APs,${netSummary.unique_aps ?? 0}`);
-        lines.push(`Unique Clients,${netSummary.unique_stations ?? 0}`);
-        lines.push(`Active Channels,${netSummary.active_channels ?? 0}`);
-        lines.push(`Monitoring Hours,${(intelUnified.summary.uptime_hours ?? 0).toFixed ? intelUnified.summary.uptime_hours.toFixed(1) + 'h' : intelUnified.summary.uptime_hours || 0}`);
-    }
-
-    if (scanSettings) {
-        addSection('Scan Settings', ['Setting', 'Value']);
-        lines.push(`Background Scanning,${scanSettings.bg_enabled ? 'Enabled' : 'Disabled'}`);
-        lines.push(`Scan Interval (min),${(scanSettings.bg_interval || 0) / 60}`);
-        lines.push(`Auto Handshake,${scanSettings.auto_handshake ? 'Enabled' : 'Disabled'}`);
-        lines.push(`Idle Threshold (s),${scanSettings.idle_threshold ?? 'n/a'}`);
-        lines.push(`Handshake Duration (s),${scanSettings.handshake_duration ?? 'n/a'}`);
-    }
-
-    if (apConfig) {
-        addSection('AP Configuration', ['Field', 'Value']);
-        lines.push(`SSID,${apConfig.ssid || '--'}`);
-        lines.push(`Security,${apConfig.has_password ? 'WPA2/WPA3' : 'Open'}`);
-        lines.push(`Channel,${apConfig.channel ?? 'n/a'}`);
-        lines.push(`Clients Allowed,${apConfig.max_clients ?? 'n/a'}`);
-    }
-
-    if (netStatus) {
-        addSection('Live Network Status', ['Field', 'Value']);
-        lines.push(`Status,${netStatus.status || 'unknown'}`);
-        lines.push(`SSID,${netStatus.saved_ssid || netStatus.current_ssid || '--'}`);
-        lines.push(`Auto-Connect,${netStatus.auto_connect ? 'Enabled' : 'Disabled'}`);
-        lines.push(`AP While Connected,${netStatus.ap_while_connected ? 'Enabled' : 'Disabled'}`);
-        lines.push(`Uptime (s),${netStatus.uptime ?? 'n/a'}`);
-    }
-
-    addSection('Security Events', ['Event', 'Value']);
-    lines.push(`Deauth Frames Detected,${secStats?.deauth_count || 0}`);
-    lines.push(`Last Deauth,${secStats?.deauth_last_seen > 0 ? formatUptime(secStats.deauth_last_seen) : 'None'}`);
-    lines.push(`Hidden APs Found,${secStats?.hidden_count || 0}`);
-
-    if (secStats?.hidden_aps?.length > 0) {
-        addSection('Hidden Networks', ['BSSID', 'Status', 'SSID']);
-        secStats.hidden_aps.forEach(h => {
-            const status = h.revealed ? 'Revealed' : 'Unknown';
-            const ssid = h.revealed && h.ssid ? h.ssid : '(not revealed)';
-            lines.push(`${h.bssid},${status},"${ssid}"`);
-        });
-    }
-
-    const sec = data.security_analysis || {};
-    const total = (data.summary?.unique_aps || 1);
-    addSection('Security Breakdown', ['Type', 'Count', 'Percentage']);
-    lines.push(`Open,${sec.open || 0},${((sec.open || 0) / total * 100).toFixed(1)}%`);
-    lines.push(`WEP,${sec.wep || 0},${((sec.wep || 0) / total * 100).toFixed(1)}%`);
-    lines.push(`WPA2,${sec.wpa2 || 0},${((sec.wpa2 || 0) / total * 100).toFixed(1)}%`);
-    lines.push(`WPA3,${sec.wpa3 || 0},${((sec.wpa3 || 0) / total * 100).toFixed(1)}%`);
-    lines.push(`WPA2/WPA3,${sec.wpa2_wpa3 || 0},${((sec.wpa2_wpa3 || 0) / total * 100).toFixed(1)}%`);
-
-    addSection('Channel Usage', ['Channel', 'AP Count']);
-    if (data.channel_analysis?.channels) {
-        data.channel_analysis.channels.forEach(ch => {
-            lines.push(`${ch.channel},${ch.ap_count}`);
-        });
-    }
-
-    const status = await fetchJSON('/wifi/status');
-
-    addSection('Access Points', ['SSID', 'BSSID', 'Vendor', 'Channel', 'RSSI (dBm)', 'Security', 'Clients', 'Hidden', 'Last Seen']);
-    if (data.networks) {
-        data.networks.forEach(net => {
-            const hidden = !net.ssid || net.ssid === '' ? 'Yes' : 'No';
-            const ssid = net.ssid || "(Hidden)";
-            const vendor = net.vendor || "Unknown";
-            const lastSeen = computeLastSeenTimestamp(status, net.last_seen);
-            lines.push(`"${ssid}",${net.bssid},"${vendor}",${net.channel},${net.rssi},${net.security},${net.stations},${hidden},${lastSeen}`);
-        });
-    }
-
-    addSection('Clients', ['MAC', 'Vendor', 'AP BSSID', 'AP SSID', 'RSSI (dBm)', 'Random MAC', 'Last Seen']);
-    if (data.networks) {
-        data.networks.forEach(net => {
-            if (net.clients) {
-                net.clients.forEach(client => {
-                    const randomMac = client.vendor === 'Random MAC' ? 'Yes' : 'No';
-                    const cVendor = client.vendor || "Unknown";
-                    const cSsid = net.ssid || "(Hidden)";
-                    const lastSeen = computeLastSeenTimestamp(status, client.last_seen);
-                    lines.push(`${client.mac},"${cVendor}",${net.bssid},"${cSsid}",${client.rssi},${randomMac},${lastSeen}`);
-                });
-            }
-        });
-    }
-
-    addSection('Vulnerable Networks (WPA2 with clients)', ['SSID', 'BSSID', 'Vendor', 'Channel', 'RSSI', 'Clients', 'Score']);
-    if (data.networks) {
-        const vulnerable = data.networks
-            .filter(net => net.security && net.security.includes('WPA2') && !net.security.includes('WPA3') && net.stations > 0)
-            .map(net => {
-                const rssiBonus = net.rssi > -50 ? 3 : net.rssi > -65 ? 2 : net.rssi > -75 ? 1 : 0;
-                return { ...net, score: (net.stations * 3) + rssiBonus };
-            })
-            .sort((a, b) => b.score - a.score);
-
-        vulnerable.forEach(net => {
-            const ssid = net.ssid || "(Hidden)";
-            const vendor = net.vendor || "Unknown";
-            lines.push(`"${ssid}",${net.bssid},"${vendor}",${net.channel},${net.rssi},${net.stations},${net.score}`);
-        });
-        if (vulnerable.length === 0) lines.push('None found');
-    }
-    addSection('Summary Totals', ['Field', 'Value']);
-    const openCount = sec.open || 0;
-    const wepCount = sec.wep || 0;
-    lines.push(`Open/WEP Networks,${openCount + wepCount}`);
-    lines.push(`Total Clients,${data.summary?.unique_stations || 0}`);
-    lines.push(`Total APs,${data.summary?.unique_aps || 0}`);
-
-    const csv = lines.join('\n');
-    const blob = new Blob([csv], { type: 'text/csv' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `pwnpower_report_${now.toISOString().slice(0,10)}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
-    showToast('Report downloaded');
-}
 
 async function loadApConfig() {
     const data = await fetchJSON('/ap/config');
@@ -788,7 +661,7 @@ let deviceIntelligenceData = {
     intelligence: null,
     report: null,
     currentFilter: 'all',
-    currentSort: 'trust',
+    currentSort: 'last_seen',
     currentAPFilter: 'all',
     devicesPerPage: 10,
     displayedDevices: 10
@@ -1931,7 +1804,7 @@ async function drawSSIDClientsChart(canvasId, samples) {
     const networks = Array.from(ssidAggregates.values())
         .map(agg => ({
             ssid: hashToSsid.get(agg.hash) || `Unknown (${agg.hash})`,
-            stations: Math.round(agg.total / agg.count)
+            stations: agg.max
         }))
         .sort((a, b) => b.stations - a.stations)
         .slice(0, 10);
@@ -2197,6 +2070,12 @@ document.addEventListener('DOMContentLoaded', () => {
     loadHistoryCharts(7);
     loadHomeSSIDs();
     loadWebhookConfig();
+
+    // Sync device sort dropdown with currentSort state
+    const deviceSort = $('#device-sort');
+    if (deviceSort) {
+        deviceSort.value = deviceIntelligenceData.currentSort;
+    }
 
     addTrackedInterval(loadNetworkStatus, 10000);
     addTrackedInterval(updateBgScanStatus, 5000);

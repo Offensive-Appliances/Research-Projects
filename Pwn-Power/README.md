@@ -9,8 +9,9 @@ All controlled via a modern web interface.
 - WiFi network scanning with vendor identification
 - Station/client detection via promiscuous mode
 - Hidden SSID detection and revelation
-- Deauth frame detection and channel analysis
+- Deauth frame detection during manual and background scanning
 - Device tracking with timestamps
+- **Probe request fingerprinting** for advanced device identification
 
 ### Attacks & Capture
 - Targeted deauthentication attacks
@@ -22,7 +23,7 @@ All controlled via a modern web interface.
 - Configurable AP with WPA2/WPA3 support
 - Station mode with auto-reconnect
 - mDNS support (`pwnpower.local`)
-- NTP time sync
+- **Automatic NTP time sync** when connected to internet
 
 ### Analytics & Monitoring
 - Background scanning with flash storage
