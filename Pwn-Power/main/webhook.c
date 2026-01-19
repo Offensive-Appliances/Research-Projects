@@ -179,9 +179,18 @@ esp_err_t webhook_set_config(const webhook_config_t *config) {
     nvs_close(handle);
     
     if (err == ESP_OK) {
+        bool was_enabled = current_config.enabled;
         memcpy(&current_config, config, sizeof(webhook_config_t));
         ESP_LOGI(TAG, "Webhook config saved (enabled=%d, url=%s)", 
                  current_config.enabled, current_config.url);
+        
+        // If webhooks were disabled, clear pending events to prevent accumulation
+        if (was_enabled && !current_config.enabled) {
+            send_cursor = scan_storage_get_event_count();
+            last_write_idx = scan_storage_get_event_write_idx();
+            persist_cursor_state();
+            ESP_LOGI(TAG, "Webhook disabled - advanced cursor to end of backlog");
+        }
     }
     
     return err;

@@ -1,6 +1,7 @@
 #include "device_lifecycle.h"
 #include "device_db.h"
 #include "scan_storage.h"
+#include "webhook.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -88,6 +89,12 @@ static uint8_t calculate_trust_score(const device_state_t *state, uint32_t days_
 }
 
 static void generate_event(const uint8_t *mac, device_event_type_t event_type, int8_t rssi, const char *vendor) {
+    // Check if webhook alerts are enabled - if not, don't generate or store events
+    webhook_config_t webhook_config;
+    if (webhook_get_config(&webhook_config) != ESP_OK || !webhook_config.enabled) {
+        return;
+    }
+    
     device_event_t event;
     memset(&event, 0, sizeof(event));
     

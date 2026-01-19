@@ -434,6 +434,9 @@ async function loadScanSettings() {
     if (autoHs) autoHs.checked = data.auto_handshake;
     if (idleThresh) idleThresh.value = data.idle_threshold;
     if (hsDur) hsDur.value = data.handshake_duration;
+    
+    // Store scan interval globally for gap detection
+    window.currentScanInterval = Math.round(data.bg_interval / 60);
 }
 
 async function saveScanSettings() {
@@ -455,6 +458,9 @@ async function saveScanSettings() {
         })
     });
     showToast('Settings saved');
+    
+    // Update global scan interval for gap detection
+    window.currentScanInterval = Math.round(bgInterval / 60);
 }
 
 
@@ -851,16 +857,29 @@ function renderPresenceHeatmap(presenceHours) {
     let html = '<div class="heatmap-label"><span>24-Hour Activity</span><span>Hover for time</span></div>';
     html += '<div class="presence-heatmap">';
 
+    // Get current local time to calculate proper hour labels
+    const now = new Date();
+    const currentHour = now.getHours();
+
     for (let hour = 0; hour < 24; hour++) {
         const byteIndex = Math.floor(hour / 8);
         const bitIndex = hour % 8;
         const isPresent = (presenceHours[byteIndex] >> bitIndex) & 1;
-        const timeLabel = `${hour.toString().padStart(2, '0')}:00`;
+        
+        // Calculate actual hour in local time (24-hour format)
+        const localHour = (currentHour - 23 + hour + 24) % 24;
+        const timeLabel = `${localHour.toString().padStart(2, '0')}:00`;
+        
         html += `<div class="hour ${isPresent ? 'active' : ''}" title="${timeLabel}"></div>`;
     }
 
     html += '</div>';
-    html += '<div class="heatmap-hours"><span>00</span><span>06</span><span>12</span><span>18</span><span>23</span></div>';
+    
+    // Update hour labels to show actual local time range
+    const startHour = (currentHour - 23 + 24) % 24;
+    const hourLabels = [startHour, (startHour + 6) % 24, (startHour + 12) % 24, (startHour + 18) % 24, (startHour + 23) % 24];
+    html += `<div class="heatmap-hours">${hourLabels.map(h => `<span>${h.toString().padStart(2, '0')}</span>`).join('')}</div>`;
+    
     return html;
 }
 
@@ -1236,7 +1255,16 @@ function setupChartResize(canvas, redrawFn) {
     
     const debouncedRedraw = debounce(() => {
         const cached = chartCache.get(canvas);
-        if (cached) redrawFn(cached.canvasId, cached.samples, cached.config);
+        if (cached) {
+            // Handle different callback signatures
+            if (cached.config) {
+                // Multi-line and interactive charts: (canvasId, samples, config)
+                redrawFn(cached.canvasId, cached.samples, cached.config);
+            } else {
+                // SSID chart: (canvasId, samples)
+                redrawFn(cached.canvasId, cached.samples);
+            }
+        }
     }, 100);
     
     const observer = new ResizeObserver(debouncedRedraw);
@@ -1333,23 +1361,75 @@ function drawMultiLineChart(canvasId, samples, config) {
     }
 
     // Draw each series
+    const timeRange = config.timeRange;
+    const timeRangeMs = timeRange.endTime - timeRange.startTime;
+    
     seriesData.forEach(series => {
         if (series.data.length === 0) return;
 
-        const points = series.data.map((d, i) => ({
-            x: series.data.length === 1 ? padding.left + chartWidth / 2 : padding.left + (i / (series.data.length - 1)) * chartWidth,
-            y: padding.top + chartHeight - ((d.value - minValue) / (maxValue - minValue)) * chartHeight
-        }));
+        const points = series.data.map((d) => {
+            let x;
+            if (series.data.length === 1) {
+                // For single data point, position based on its timestamp within the time range
+                const timeRatio = timeRangeMs > 0 ? ((d.timestamp || 0) - timeRange.startTime) / timeRangeMs : 0.5;
+                x = padding.left + Math.max(0, Math.min(1, timeRatio)) * chartWidth;
+            } else {
+                // Position based on actual timestamp within the time range
+                const timeRatio = timeRangeMs > 0 ? ((d.timestamp || 0) - timeRange.startTime) / timeRangeMs : 0;
+                x = padding.left + Math.max(0, Math.min(1, timeRatio)) * chartWidth;
+            }
+            
+            return {
+                x: x,
+                y: padding.top + chartHeight - ((d.value - minValue) / (maxValue - minValue)) * chartHeight,
+                timestamp: d.timestamp || 0,
+                value: d.value
+            };
+        });
 
-        // Draw line with smooth joins
+        // Detect gaps (downtime periods) - gap threshold: 2x expected sample interval
+        const gaps = [];
+        // Get current scan interval from settings, default to 2 minutes if not available
+        const scanIntervalMinutes = window.currentScanInterval || 2;
+        const expectedInterval = 2 * scanIntervalMinutes * 60 * 1000; // 2x scan interval in milliseconds
+        for (let i = 0; i < points.length - 1; i++) {
+            if (points[i].timestamp && points[i + 1].timestamp) {
+                const timeDiff = points[i + 1].timestamp - points[i].timestamp;
+                if (timeDiff > expectedInterval) {
+                    gaps.push({ start: i, end: i + 1, duration: timeDiff });
+                }
+            }
+        }
+
+        // Draw line segments with dashed lines for gaps
         if (points.length > 1) {
             ctx.strokeStyle = series.color;
             ctx.lineWidth = isMobile ? 1.5 : 2;
             ctx.lineJoin = 'round';
             ctx.lineCap = 'round';
-            ctx.beginPath();
-            points.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
-            ctx.stroke();
+            
+            for (let i = 0; i < points.length - 1; i++) {
+                const isGap = gaps.some(gap => gap.start === i);
+                
+                if (isGap) {
+                    // Draw dashed line for gap
+                    ctx.setLineDash([5, 5]);
+                    ctx.globalAlpha = 0.5;
+                } else {
+                    // Draw solid line for normal data
+                    ctx.setLineDash([]);
+                    ctx.globalAlpha = 1;
+                }
+                
+                ctx.beginPath();
+                ctx.moveTo(points[i].x, points[i].y);
+                ctx.lineTo(points[i + 1].x, points[i + 1].y);
+                ctx.stroke();
+            }
+            
+            // Reset line dash and alpha
+            ctx.setLineDash([]);
+            ctx.globalAlpha = 1;
         }
 
         // Draw points (smaller for multi-line)
@@ -1360,23 +1440,55 @@ function drawMultiLineChart(canvasId, samples, config) {
             ctx.arc(p.x, p.y, pointSize, 0, Math.PI * 2);
             ctx.fill();
         });
+
+        // Add gap indicators (subtle text above gaps)
+        if (gaps.length > 0 && !isMobile) {
+            ctx.fillStyle = '#666';
+            ctx.font = '10px system-ui, sans-serif';
+            ctx.textAlign = 'center';
+            
+            gaps.forEach(gap => {
+                const midX = (points[gap.start].x + points[gap.end].x) / 2;
+                const gapY = padding.top + chartHeight + 15;
+                const durationHours = Math.round(gap.duration / (1000 * 60 * 60) * 10) / 10;
+                ctx.fillText(`${durationHours}h gap`, midX, gapY);
+            });
+        }
     });
 
-    // X-axis labels (use first series for timestamps)
-    const firstSeries = seriesData.find(s => s.data.length > 0);
-    if (firstSeries) {
+    // X-axis labels (show time range based on selected time frame)
+    if (timeRange && timeRangeMs > 0) {
         ctx.fillStyle = '#666';
         ctx.font = (isMobile ? '10px' : '12px') + ' system-ui, sans-serif';
         ctx.textAlign = 'center';
-        const labelCount = Math.min(isMobile ? 3 : 5, firstSeries.data.length);
+        const labelCount = isMobile ? 3 : 5;
 
-        if (labelCount === 1) {
-            ctx.fillText(firstSeries.data[0].label, padding.left + chartWidth / 2, rect.height - (isMobile ? 12 : 20));
-        } else {
-            for (let i = 0; i < labelCount; i++) {
-                const idx = Math.floor((i / (labelCount - 1)) * (firstSeries.data.length - 1));
-                const x = padding.left + (idx / (firstSeries.data.length - 1)) * chartWidth;
-                ctx.fillText(firstSeries.data[idx].label, x, rect.height - (isMobile ? 12 : 20));
+        for (let i = 0; i < labelCount; i++) {
+            const timeRatio = i / (labelCount - 1);
+            const timestamp = timeRange.startTime + (timeRatio * timeRangeMs);
+            const x = padding.left + timeRatio * chartWidth;
+            
+            const date = new Date(timestamp);
+            const label = date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+            ctx.fillText(label, x, rect.height - (isMobile ? 12 : 20));
+        }
+    } else {
+        // Fallback to original behavior if no time range
+        const firstSeries = seriesData.find(s => s.data.length > 0);
+        if (firstSeries) {
+            ctx.fillStyle = '#666';
+            ctx.font = (isMobile ? '10px' : '12px') + ' system-ui, sans-serif';
+            ctx.textAlign = 'center';
+            const labelCount = Math.min(isMobile ? 3 : 5, firstSeries.data.length);
+
+            if (labelCount === 1) {
+                ctx.fillText(firstSeries.data[0].label, padding.left + chartWidth / 2, rect.height - (isMobile ? 12 : 20));
+            } else {
+                for (let i = 0; i < labelCount; i++) {
+                    const idx = Math.floor((i / (labelCount - 1)) * (firstSeries.data.length - 1));
+                    const x = padding.left + (idx / (firstSeries.data.length - 1)) * chartWidth;
+                    ctx.fillText(firstSeries.data[idx].label, x, rect.height - (isMobile ? 12 : 20));
+                }
             }
         }
     }
@@ -1489,38 +1601,95 @@ function drawInteractiveChart(canvasId, samples, config, highlightIdx = -1) {
         ctx.fillText(Math.round(val), padding.left - 6, y + 4);
     }
     
-    // Build path points
+    // Build path points with timestamps for gap detection
     const points = dataPoints.map((d, i) => ({
         x: dataPoints.length === 1 ? padding.left + chartWidth / 2 : padding.left + (i / (dataPoints.length - 1)) * chartWidth,
         y: padding.top + chartHeight - ((d.value - minValue) / (maxValue - minValue)) * chartHeight,
         value: d.value,
-        label: d.label
+        label: d.label,
+        timestamp: d.timestamp || 0
     }));
 
-    // Draw area fill under line
+    // Detect gaps (downtime periods) - gap threshold: 2x expected sample interval
+    const gaps = [];
+    // Get current scan interval from settings, default to 2 minutes if not available
+    const scanIntervalMinutes = window.currentScanInterval || 2;
+    const expectedInterval = 2 * scanIntervalMinutes * 60 * 1000; // 2x scan interval in milliseconds
+    for (let i = 0; i < points.length - 1; i++) {
+        if (points[i].timestamp && points[i + 1].timestamp) {
+            const timeDiff = points[i + 1].timestamp - points[i].timestamp;
+            if (timeDiff > expectedInterval) {
+                gaps.push({ start: i, end: i + 1, duration: timeDiff });
+            }
+        }
+    }
+
+    // Draw area fill under line (skip gaps)
     if (points.length > 1) {
         const areaGrad = ctx.createLinearGradient(0, padding.top, 0, padding.top + chartHeight);
         areaGrad.addColorStop(0, config.color + '40');
         areaGrad.addColorStop(1, config.color + '05');
         
         ctx.fillStyle = areaGrad;
-        ctx.beginPath();
-        ctx.moveTo(points[0].x, padding.top + chartHeight);
-        points.forEach(p => ctx.lineTo(p.x, p.y));
-        ctx.lineTo(points[points.length - 1].x, padding.top + chartHeight);
-        ctx.closePath();
-        ctx.fill();
+        
+        // Draw area segments, skipping gaps
+        for (let i = 0; i < points.length - 1; i++) {
+            const isGap = gaps.some(gap => gap.start === i);
+            if (isGap) continue;
+            
+            ctx.beginPath();
+            ctx.moveTo(points[i].x, padding.top + chartHeight);
+            ctx.lineTo(points[i].x, points[i].y);
+            ctx.lineTo(points[i + 1].x, points[i + 1].y);
+            ctx.lineTo(points[i + 1].x, padding.top + chartHeight);
+            ctx.closePath();
+            ctx.fill();
+        }
     }
 
-    // Draw line
+    // Draw line with dashed segments for gaps
     if (points.length > 1) {
         ctx.strokeStyle = config.color;
         ctx.lineWidth = 2.5;
         ctx.lineJoin = 'round';
         ctx.lineCap = 'round';
-        ctx.beginPath();
-        points.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
-        ctx.stroke();
+        
+        for (let i = 0; i < points.length - 1; i++) {
+            const isGap = gaps.some(gap => gap.start === i);
+            
+            if (isGap) {
+                // Draw dashed line for gap
+                ctx.setLineDash([5, 5]);
+                ctx.globalAlpha = 0.5;
+            } else {
+                // Draw solid line for normal data
+                ctx.setLineDash([]);
+                ctx.globalAlpha = 1;
+            }
+            
+            ctx.beginPath();
+            ctx.moveTo(points[i].x, points[i].y);
+            ctx.lineTo(points[i + 1].x, points[i + 1].y);
+            ctx.stroke();
+        }
+        
+        // Reset line dash and alpha
+        ctx.setLineDash([]);
+        ctx.globalAlpha = 1;
+    }
+
+    // Add gap indicators (subtle text above gaps)
+    if (gaps.length > 0 && !isMobile) {
+        ctx.fillStyle = '#666';
+        ctx.font = '10px system-ui, sans-serif';
+        ctx.textAlign = 'center';
+        
+        gaps.forEach(gap => {
+            const midX = (points[gap.start].x + points[gap.end].x) / 2;
+            const gapY = padding.top + chartHeight + 15;
+            const durationHours = Math.round(gap.duration / (1000 * 60 * 60) * 10) / 10;
+            ctx.fillText(`${durationHours}h gap`, midX, gapY);
+        });
     }
 
     // Draw points
@@ -1653,8 +1822,9 @@ function formatHistoryLabel(sample) {
         const mins = Math.floor((sample.uptime_sec % 3600) / 60);
         return hours > 0 ? `${hours}h${mins}m` : `${mins}m`;
     }
+    // Device epoch_ts is UTC, convert to local time for display
     const date = new Date(sample.epoch_ts * 1000);
-    return date.toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit' });
+    return date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
 }
 
 function updateGraphOverlayState(graphKey, active) {
@@ -1664,7 +1834,7 @@ function updateGraphOverlayState(graphKey, active) {
     overlay.classList.toggle('active', active);
 }
 
-function renderCharts(samples) {
+function renderCharts(samples, timeRange = null) {
     const needsMoreData = !samples || samples.length < HISTORY_READY_THRESHOLD;
 
     // Show/hide overlays based on data availability
@@ -1674,8 +1844,18 @@ function renderCharts(samples) {
 
     if (!samples || samples.length === 0) return;
 
+    // If no time range provided, calculate from samples
+    if (!timeRange) {
+        const endTime = Date.now();
+        const startTime = samples.length > 0 ? 
+            Math.min(...samples.map(s => s.epoch_ts * 1000)) : 
+            endTime - (24 * 60 * 60 * 1000);
+        timeRange = { startTime, endTime, days: (endTime - startTime) / (24 * 60 * 60 * 1000) };
+    }
+
     // activity chart - show APs and clients as separate lines with smoothing
     drawMultiLineChart('#activity-chart', samples, {
+        timeRange: timeRange,
         extractSeries: (samples) => {
             const apData = [];
             const clientData = [];
@@ -1706,8 +1886,8 @@ function renderCharts(samples) {
                 const apAvg = Math.round(apSum / currentWindowSize);
                 const clientAvg = Math.round(clientSum / currentWindowSize);
 
-                apData.push({ label, value: apAvg });
-                clientData.push({ label, value: clientAvg });
+                apData.push({ label, value: apAvg, timestamp: s.epoch_ts * 1000 });
+                clientData.push({ label, value: clientAvg, timestamp: s.epoch_ts * 1000 });
             });
 
             return [
@@ -1723,6 +1903,7 @@ function renderCharts(samples) {
         : `Showing ${samples.length} samples`;
 
     drawMultiLineChart('#channel-chart-time', samples, {
+        timeRange: timeRange,
         extractSeries: (samples) => {
             // Optimize: Find active channels first, then build only needed series
             const activeChannels = new Set();
@@ -1759,7 +1940,8 @@ function renderCharts(samples) {
 
                     data.push({
                         label: formatHistoryLabel(s),
-                        value: avg
+                        value: avg,
+                        timestamp: s.epoch_ts * 1000
                     });
                 });
 
@@ -1816,10 +1998,10 @@ async function drawSSIDClientsChart(canvasId, samples) {
     const canvas = $(canvasId);
     if (!canvas) return;
 
-    addToChartCache(canvas, { canvasId, networks });
+    addToChartCache(canvas, { canvasId, samples });
     setupChartResize(canvas, (id, cachedData) => {
-        if (cachedData && cachedData.networks) {
-            drawSSIDClientsChartImpl(id, cachedData.networks);
+        if (cachedData && cachedData.samples) {
+            drawSSIDClientsChart(id, cachedData.samples);
         }
     });
 
@@ -1876,7 +2058,8 @@ function drawSSIDClientsChartImpl(canvasId, networks) {
 
         // Draw client count on top of bar
         ctx.fillStyle = '#fff';
-        ctx.font = '12px system-ui, sans-serif';
+        const clientCountFontSize = Math.max(10, Math.min(12, barWidth / 3));
+        ctx.font = `${clientCountFontSize}px system-ui, sans-serif`;
         ctx.textAlign = 'center';
         ctx.fillText(net.stations, x + barWidth / 2, y - 5);
 
@@ -1885,17 +2068,20 @@ function drawSSIDClientsChartImpl(canvasId, networks) {
         ctx.translate(x + barWidth / 2, padding.top + chartHeight + 10);
         ctx.rotate(-Math.PI / 4);
         ctx.fillStyle = '#aaa';
-        ctx.font = '11px system-ui, sans-serif';
+        const ssidFontSize = Math.max(9, Math.min(11, barWidth / 4));
+        ctx.font = `${ssidFontSize}px system-ui, sans-serif`;
         ctx.textAlign = 'right';
         const ssid = net.ssid || `Hidden`;
-        const displaySsid = privacyMode ? '••••••••' : (ssid.length > 15 ? ssid.slice(0, 15) + '...' : ssid);
+        const maxSsidLength = Math.max(8, Math.floor(barWidth / 6));
+        const displaySsid = privacyMode ? '••••••••' : (ssid.length > maxSsidLength ? ssid.slice(0, maxSsidLength) + '...' : ssid);
         ctx.fillText(displaySsid, 0, 0);
         ctx.restore();
     });
 
     // Draw Y-axis labels
     ctx.fillStyle = '#666';
-    ctx.font = '12px system-ui, sans-serif';
+    const yAxisFontSize = Math.max(10, Math.min(12, chartWidth / 40));
+    ctx.font = `${yAxisFontSize}px system-ui, sans-serif`;
     ctx.textAlign = 'right';
     for (let i = 0; i <= 5; i++) {
         const val = Math.round((maxClients / 5) * i);
@@ -1905,13 +2091,16 @@ function drawSSIDClientsChartImpl(canvasId, networks) {
 
     // Title
     ctx.fillStyle = '#fff';
-    ctx.font = 'bold 14px system-ui, sans-serif';
+    const titleFontSize = Math.max(12, Math.min(16, chartWidth / 25));
+    ctx.font = `bold ${titleFontSize}px system-ui, sans-serif`;
     ctx.textAlign = 'center';
     ctx.fillText('Top Networks by Client Count', rect.width / 2, isMobile ? 15 : 20);
 }
 
 async function loadHistoryCharts(days) {
-    const data = await fetchJSON(`/history/samples?days=${days}`);
+    // For 'from-start', fetch all available data (use large days value)
+    const fetchDays = days === 'from-start' ? 365 : days;
+    const data = await fetchJSON(`/history/samples?days=${fetchDays}`);
     if (!data || !data.samples || data.samples.length === 0) {
         showToast('No history data available yet');
         return;
@@ -1919,17 +2108,42 @@ async function loadHistoryCharts(days) {
 
     const desc = document.querySelector('.history-description');
     if (desc) {
-        desc.textContent = days === 1
-            ? 'Network activity charts (last 24 hours)'
-            : days < 1
-            ? `Network activity charts (last ${Math.round(days * 24)} hours)`
-            : `Network activity charts (last ${days} days)`;
+        if (days === 'from-start') {
+            const oldestSample = data.samples[0];
+            const oldestTime = oldestSample && oldestSample.epoch_ts ? 
+                new Date(oldestSample.epoch_ts * 1000).toLocaleDateString() : 'unknown';
+            desc.textContent = `Network activity charts (from ${oldestTime})`;
+        } else {
+            desc.textContent = days === 1
+                ? 'Network activity charts (last 24 hours)'
+                : days < 1
+                ? `Network activity charts (last ${Math.round(days * 24)} hours)`
+                : `Network activity charts (last ${days} days)`;
+        }
     }
 
     // Use samples directly without unnecessary padding
     chartData = data.samples;
-    renderCharts(data.samples);
-    showToast(`Loaded ${data.samples.length} samples (${Math.round(days * 24)} hour range)`);
+    
+    let timeRange;
+    if (days === 'from-start') {
+        // For 'from-start', calculate time range from oldest sample to now
+        const endTime = Date.now();
+        const oldestTimestamp = data.samples.length > 0 ? 
+            Math.min(...data.samples.map(s => s.epoch_ts * 1000)) : endTime - (24 * 60 * 60 * 1000);
+        const startTime = oldestTimestamp;
+        const actualDays = (endTime - startTime) / (24 * 60 * 60 * 1000);
+        timeRange = { startTime, endTime, days: actualDays };
+        showToast(`Loaded ${data.samples.length} samples (${Math.round(actualDays * 24)} hour range)`);
+    } else {
+        // Calculate the time range for proper chart positioning
+        const endTime = Date.now();
+        const startTime = endTime - (days * 24 * 60 * 60 * 1000);
+        timeRange = { startTime, endTime, days };
+        showToast(`Loaded ${data.samples.length} samples (${Math.round(days * 24)} hour range)`);
+    }
+    
+    renderCharts(data.samples, timeRange);
 }
 
 
@@ -2017,7 +2231,8 @@ async function loadWebhookConfig() {
     if (allEventsCheckbox) allEventsCheckbox.checked = data.all_events;
     
     if (status) {
-        const pending = data.total_events - data.send_cursor;
+        const pendingRaw = data.total_events - data.send_cursor;
+        const pending = data.enabled ? Math.max(0, pendingRaw) : 0;
         status.textContent = `Status: ${data.enabled ? 'Enabled' : 'Disabled'} • Sent: ${data.send_cursor} • Pending: ${pending}`;
     }
 }

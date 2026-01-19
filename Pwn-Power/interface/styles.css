@@ -412,7 +412,7 @@ tr.expanded .expand-icon {
     position: relative;
     border-radius: 12px;
     background: var(--bg-card);
-    padding: 16px;
+    padding: 16px 16px 16px 8px;
     min-height: 280px;
 }
 
@@ -485,7 +485,7 @@ tr.expanded .expand-icon {
     }
 
     .graph-wrapper {
-        padding: 12px;
+        padding: 12px 12px 12px 4px;
         min-height: 220px;
     }
 
