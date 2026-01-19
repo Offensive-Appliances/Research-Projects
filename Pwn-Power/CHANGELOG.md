@@ -25,7 +25,6 @@
 - Revised web interface styling
 - Automatically populate WiFi Recon and Attack table in the background
 - Increased AP storage limit from 16 to 32 networks per scan
-- Added automatic UI accumulation for unlimited unique networks/clients across scans, resetting on page reload
 
 
 ## v1.0
