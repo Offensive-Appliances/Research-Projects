@@ -190,6 +190,7 @@ function renderNetworkTable(tableId, selectable, status) {
             <td><code>${pii(ap.MAC, 'mac')}</code></td>
             <td class="muted">${pii(ap.Vendor || 'Unknown', 'vendor')}</td>
             <td>${ap.Security}</td>
+            <td>${ap.wps ? 'Yes' : 'No'}</td>
             <td>${ap.Channel}</td>
             <td>${ap.RSSI || '--'}</td>
             <td class="muted">${lastSeenText}</td>
@@ -241,6 +242,7 @@ function renderNetworkTable(tableId, selectable, status) {
                     <td>↳ Client</td>
                     <td><code>${macDisplay}</code></td>
                     <td class="muted">${pii(sta.device_vendor || sta.vendor || 'Unknown', 'vendor')}</td>
+                    <td></td>
                     <td></td>
                     <td></td>
                     <td>${sta.rssi}</td>

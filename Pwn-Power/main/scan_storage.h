@@ -47,6 +47,7 @@ typedef struct __attribute__((packed)) {
     uint32_t last_seen;
     uint16_t beacon_count;
     uint8_t hidden;
+    uint8_t wps_enabled;
     stored_station_t stations[MAX_STATIONS_PER_AP];
 } stored_ap_t;
 

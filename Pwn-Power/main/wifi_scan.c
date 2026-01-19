@@ -17,6 +17,7 @@
 // Forward declarations
 extern bool pwnpower_time_is_synced(void);
 static uint32_t get_current_timestamp(void);
+static void stations_sniffer(void* buf, wifi_promiscuous_pkt_type_t type);
 
 #define TAG "WiFi_Scan"
 #define MAX_JSON_SIZE 8192  // Increased size to accommodate the new JSON structure
@@ -62,6 +63,15 @@ typedef struct {
 } hidden_ap_t;
 static hidden_ap_t s_hidden_aps[MAX_HIDDEN_APS];
 static int s_hidden_ap_idx = 0;
+
+// WPS tracking
+#define MAX_WPS_APS 100
+typedef struct {
+    uint8_t bssid[6];
+    bool wps_enabled;
+} wps_ap_t;
+static wps_ap_t s_wps_aps[MAX_WPS_APS];
+static int s_wps_ap_count = 0;
 
 // Define 2.4 GHz and 5 GHz channels
 const uint8_t dual_band_channels[] = {
@@ -109,6 +119,67 @@ const char* get_band(uint8_t channel) {
         return "5ghz";
     }
     return "Unknown Band";
+}
+
+// WPS detection helper - checks lookup table populated by beacon parsing
+static bool detect_wps(const uint8_t *bssid) {
+    for (int i = 0; i < s_wps_ap_count; i++) {
+        if (memcmp(s_wps_aps[i].bssid, bssid, 6) == 0) {
+            return s_wps_aps[i].wps_enabled;
+        }
+    }
+    return false;
+}
+
+// Update WPS status for an AP
+static void update_wps_status(const uint8_t *bssid, bool wps_enabled) {
+    // Check if already exists
+    for (int i = 0; i < s_wps_ap_count; i++) {
+        if (memcmp(s_wps_aps[i].bssid, bssid, 6) == 0) {
+            if (wps_enabled && !s_wps_aps[i].wps_enabled) {
+                ESP_LOGI(TAG, "WPS detected on %02X:%02X:%02X:%02X:%02X:%02X",
+                         bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+            }
+            s_wps_aps[i].wps_enabled = wps_enabled;
+            return;
+        }
+    }
+    // Add new entry if space available
+    if (s_wps_ap_count < MAX_WPS_APS) {
+        memcpy(s_wps_aps[s_wps_ap_count].bssid, bssid, 6);
+        s_wps_aps[s_wps_ap_count].wps_enabled = wps_enabled;
+        if (wps_enabled) {
+            ESP_LOGI(TAG, "WPS detected on %02X:%02X:%02X:%02X:%02X:%02X",
+                     bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+        }
+        s_wps_ap_count++;
+    }
+}
+
+// Parse beacon/probe response for WPS Information Element
+static bool parse_wps_ie(const uint8_t *frame_body, int body_len) {
+    const uint8_t *ptr = frame_body;
+    const uint8_t *end = frame_body + body_len;
+
+    // WPS uses vendor-specific IE (0xDD) with OUI 0x0050F204 and type 0x04
+    while (ptr + 2 <= end) {
+        uint8_t ie_id = ptr[0];
+        uint8_t ie_len = ptr[1];
+
+        if (ptr + 2 + ie_len > end) break;
+
+        // Check for vendor-specific IE
+        if (ie_id == 0xDD && ie_len >= 4) {
+            // Check WPS OUI: 0x0050F204
+            if (ptr[2] == 0x00 && ptr[3] == 0x50 && ptr[4] == 0xF2 && ptr[5] == 0x04) {
+                return true;  // WPS detected
+            }
+        }
+
+        ptr += 2 + ie_len;
+    }
+
+    return false;
 }
 
 // Smart channel weighting functions
@@ -188,6 +259,9 @@ static void maintain_channel_learning(void) {
 void wifi_scan() {
     if(!scan_mutex) {
         scan_mutex = xSemaphoreCreateMutex();
+    }
+    if(!stations_mutex) {
+        stations_mutex = xSemaphoreCreateMutex();
     }
 
     scan_in_progress = true;
@@ -271,10 +345,11 @@ void wifi_scan() {
         
         // Update channel activity with RSSI filtering
         update_channel_activity(channel, ap_count, rssi_values, ap_count);
-        
+
         if (rssi_values) {
             free(rssi_values);
         }
+
         uint32_t now_sec = get_current_timestamp();
         for (int j = 0; j < ap_count; j++) {
             bool is_hidden = (ap_records[j].ssid[0] == '\0');
@@ -311,7 +386,11 @@ void wifi_scan() {
             char vendor[48] = "Unknown";
             ouis_lookup_vendor(ap_records[j].bssid, vendor, sizeof(vendor));
             cJSON_AddStringToObject(ap_entry, "Vendor", vendor);
-            
+
+            // Add WPS status
+            bool wps = detect_wps(ap_records[j].bssid);
+            cJSON_AddBoolToObject(ap_entry, "wps", wps);
+
             cJSON_AddItemToArray(rows, ap_entry);
             bool exists = false;
             for(int k=0;k<known_ap_count;k++){ if(memcmp(known_ap_bssids[k], ap_records[j].bssid, 6)==0){ exists=true; break; } }
@@ -414,6 +493,26 @@ void wifi_scan() {
         }
     }
     ESP_LOGI(TAG, "Merged stations for %d APs", merge_count);
+
+    // Update WPS status for all APs now that station scan has detected WPS
+    ESP_LOGI(TAG, "Updating WPS status for APs...");
+    cJSON_ArrayForEach(ap_entry, rows) {
+        cJSON *mac_item = cJSON_GetObjectItem(ap_entry, "MAC");
+        if (mac_item && mac_item->valuestring) {
+            // Parse MAC address
+            uint8_t bssid[6];
+            if (sscanf(mac_item->valuestring, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+                      &bssid[0], &bssid[1], &bssid[2], &bssid[3], &bssid[4], &bssid[5]) == 6) {
+                bool wps = detect_wps(bssid);
+                cJSON *wps_item = cJSON_GetObjectItem(ap_entry, "wps");
+                if (wps_item) {
+                    cJSON_SetBoolValue(wps_item, wps);
+                } else {
+                    cJSON_AddBoolToObject(ap_entry, "wps", wps);
+                }
+            }
+        }
+    }
 
     // Store results in buffer with mutex protection
     xSemaphoreTake(scan_mutex, portMAX_DELAY);
@@ -593,7 +692,21 @@ static void stations_sniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
         s_deauth_last_seen = get_current_timestamp();
         return;
     }
-    
+
+    // Parse beacons (0x08) and probe responses (0x0B) for WPS
+    if (frame_type == 0 && (frame_subtype == 0x08 || frame_subtype == 0x0B)) {
+        uint8_t *bssid = (frame_subtype == 0x08) ? (payload + 16) : (payload + 16);
+        uint8_t *frame_body = payload + 24;
+
+        // Skip fixed parameters (timestamp: 8, beacon interval: 2, capabilities: 2)
+        int fixed_params_len = 12;
+        if (rx_ctrl->sig_len > 24 + fixed_params_len) {
+            bool wps_found = parse_wps_ie(frame_body + fixed_params_len,
+                                          rx_ctrl->sig_len - 24 - fixed_params_len);
+            update_wps_status(bssid, wps_found);
+        }
+    }
+
     // Monitor for probe responses (0x0B) that might reveal hidden SSIDs
     if (frame_type == 0 && frame_subtype == 0x0B) {
         uint8_t *bssid = payload + 16;
