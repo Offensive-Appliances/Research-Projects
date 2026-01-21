@@ -18,6 +18,7 @@ idf_component_register(
         "webhook.c"
         "ouis.c"
         "monitor_uptime.c"
+        "json_utils.c"
     INCLUDE_DIRS
         "."
     EMBED_FILES

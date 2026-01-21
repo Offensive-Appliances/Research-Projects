@@ -11,7 +11,9 @@ typedef enum {
     DEVICE_EVENT_FIRST_SEEN = 0,
     DEVICE_EVENT_ARRIVED = 1,
     DEVICE_EVENT_LEFT = 2,
-    DEVICE_EVENT_RETURNED = 3
+    DEVICE_EVENT_RETURNED = 3,
+    DEVICE_EVENT_DEAUTH_DETECTED = 4,
+    DEVICE_EVENT_HANDSHAKE_CAPTURED = 5
 } device_event_type_t;
 
 // trust score ranges (auto-calculated)
@@ -35,5 +37,10 @@ bool device_lifecycle_is_present(const uint8_t *mac);
 
 // restore device history from persisted storage (prevents first_seen events on reboot)
 esp_err_t device_lifecycle_restore_device(const uint8_t *mac);
+
+// generate security event alerts
+void device_lifecycle_generate_deauth_event(const uint8_t *mac, uint32_t deauth_count);
+void device_lifecycle_generate_batched_deauth_alert(uint32_t total_deauth_count, uint32_t scan_duration_sec);
+void device_lifecycle_generate_handshake_event(const uint8_t *bssid, const uint8_t *client_mac, int eapol_count);
 
 #endif

@@ -9,28 +9,38 @@
 #include <ctype.h>
 #include "esp_wifi_types.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "cJSON.h"
 #include "sdkconfig.h"
 #include "ouis.h"
 #include "scan_storage.h"
+#include "json_utils.h"
+#include "device_lifecycle.h"
 
 // Forward declarations
 extern bool pwnpower_time_is_synced(void);
 static uint32_t get_current_timestamp(void);
 static void stations_sniffer(void* buf, wifi_promiscuous_pkt_type_t type);
+static esp_err_t update_scan_results_json(cJSON *root);
 
 #define TAG "WiFi_Scan"
 #define MAX_JSON_SIZE 8192  // Increased size to accommodate the new JSON structure
 #define MAX_STATIONS 50
 
-static char scan_results_json[MAX_JSON_SIZE]; // Buffer for JSON results
+static char *scan_results_json = NULL; // Dynamic buffer for JSON results
+static size_t scan_results_size = MAX_JSON_SIZE;
+static char *station_json_buffer = NULL; // Dynamic buffer for station results
 static station_info_t stations[MAX_STATIONS];
 static SemaphoreHandle_t stations_mutex = NULL;
 static volatile size_t stations_count = 0;
 static bool scan_in_progress = false;
 static bool new_results_available = false;
+static uint32_t scan_results_timestamp = 0;  // Timestamp when results were generated
+static bool scan_was_truncated = false;      // Flag if results were truncated due to size
 static volatile bool station_scan_active = false;
 static SemaphoreHandle_t scan_mutex = NULL;
+static TaskHandle_t s_wifi_scan_task_handle = NULL;
+static void wifi_scan_task(void *arg);
 static uint8_t known_ap_bssids[100][6];
 static uint8_t known_ap_channels[64];
 static int known_ap_count = 0;
@@ -89,6 +99,46 @@ const uint8_t dual_band_channels[] = {
 };
 
 const size_t dual_band_channels_size = sizeof(dual_band_channels)/sizeof(dual_band_channels[0]);
+
+// Helper function to update scan results JSON with proper memory management
+static esp_err_t update_scan_results_json(cJSON *root) {
+    if (!root) return ESP_ERR_INVALID_ARG;
+    
+    // Free existing buffer
+    if (scan_results_json) {
+        free(scan_results_json);
+        scan_results_json = NULL;
+    }
+    
+    // Create new JSON string
+    size_t json_len;
+    char *new_json = json_print_sized(root, scan_results_size, &json_len);
+    if (!new_json) {
+        ESP_LOGE(TAG, "Failed to create scan results JSON");
+        return ESP_ERR_NO_MEM;
+    }
+    
+    scan_results_json = new_json;
+    return ESP_OK;
+}
+
+// Cleanup function for memory management
+void wifi_scan_cleanup(void) {
+    if (scan_results_json) {
+        free(scan_results_json);
+        scan_results_json = NULL;
+    }
+    
+    // Clean up station JSON buffer
+    wifi_scan_cleanup_station_json();
+}
+
+// Initialize memory for wifi scan
+void wifi_scan_init_memory(void) {
+    scan_results_json = NULL;
+    scan_results_size = MAX_JSON_SIZE;
+    ESP_LOGI(TAG, "WiFi scan memory initialized");
+}
 
 // Helper function to get the security type from the encryption mode
 const char* get_security_type(uint8_t encryption) {
@@ -186,7 +236,7 @@ static bool parse_wps_ie(const uint8_t *frame_body, int body_len) {
 uint32_t get_channel_dwell_time(uint8_t channel, bool is_background_scan) {
     // Default dwell times
     uint32_t base_ap_dwell = is_background_scan ? 80 : 120;
-    uint32_t base_station_dwell = is_background_scan ? 300 : 500;
+    uint32_t base_station_dwell = is_background_scan ? 200 : 500;
     
     // Only apply weighting after we have enough data
     if (channel_scan_counts[channel] >= MIN_SCANS_FOR_LEARNING) {
@@ -206,7 +256,7 @@ uint32_t get_channel_dwell_time(uint8_t channel, bool is_background_scan) {
         // Ensure reasonable bounds
         if (base_ap_dwell < 60) base_ap_dwell = 60;
         if (base_ap_dwell > 240) base_ap_dwell = 240;
-        if (base_station_dwell < 250) base_station_dwell = 250;
+        if (base_station_dwell < 150) base_station_dwell = 150;
         if (base_station_dwell > 1000) base_station_dwell = 1000;
         
         ESP_LOGD(TAG, "Channel %d: discovery_rate=%.2f, multiplier=%.2f, dwell=%d ms", 
@@ -256,6 +306,8 @@ static void maintain_channel_learning(void) {
     }
 }
 
+static uint32_t last_scan_complete_time = 0;
+
 void wifi_scan() {
     if(!scan_mutex) {
         scan_mutex = xSemaphoreCreateMutex();
@@ -264,6 +316,19 @@ void wifi_scan() {
         stations_mutex = xSemaphoreCreateMutex();
     }
 
+    uint32_t scan_start_time = (uint32_t)(esp_timer_get_time() / 1000); // milliseconds
+
+    // Prevent rapid-fire scans (debounce within 30 seconds)
+    if (last_scan_complete_time > 0) {
+        uint32_t time_since_last = scan_start_time - last_scan_complete_time;
+        if (time_since_last < 30000) {
+            ESP_LOGW(TAG, "=== SCAN BLOCKED === Too soon after last scan (only %lu ms ago), ignoring request",
+                     (unsigned long)time_since_last);
+            return;
+        }
+    }
+
+    ESP_LOGI(TAG, "=== SCAN START === at %lu ms, setting scan_in_progress=true", (unsigned long)scan_start_time);
     scan_in_progress = true;
     
     // Run maintenance to adapt to changing conditions
@@ -383,7 +448,7 @@ void wifi_scan() {
             cJSON_AddNumberToObject(ap_entry, "last_seen", now_sec);
             cJSON_AddBoolToObject(ap_entry, "hidden", is_hidden);
             
-            char vendor[48] = "Unknown";
+            char vendor[64] = "Unknown";
             ouis_lookup_vendor(ap_records[j].bssid, vendor, sizeof(vendor));
             cJSON_AddStringToObject(ap_entry, "Vendor", vendor);
 
@@ -516,34 +581,105 @@ void wifi_scan() {
 
     // Store results in buffer with mutex protection
     xSemaphoreTake(scan_mutex, portMAX_DELAY);
-    char *json_str = cJSON_PrintUnformatted(root);
-    if (json_str) {
-        size_t json_len = strlen(json_str);
-        if (json_len >= MAX_JSON_SIZE) {
-            ESP_LOGW(TAG, "Scan JSON too large (%u bytes), returning empty result", (unsigned)json_len);
-            strncpy(scan_results_json, "{\"rows\":[]}", MAX_JSON_SIZE - 1);
-            scan_results_json[MAX_JSON_SIZE - 1] = '\0';
-        } else {
-            memcpy(scan_results_json, json_str, json_len + 1);
+    scan_was_truncated = false;
+
+    // Use dynamic allocation for JSON
+    esp_err_t err = update_scan_results_json(root);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to update scan results JSON");
+        scan_was_truncated = true;
+        // Set fallback JSON
+        if (scan_results_json) {
+            free(scan_results_json);
         }
-        free(json_str);
-    } else {
-        strncpy(scan_results_json, "{\"rows\":[]}", MAX_JSON_SIZE - 1);
-        scan_results_json[MAX_JSON_SIZE - 1] = '\0';
+        scan_results_json = strdup("{\"rows\":[]}");
     }
-    
+
+    scan_results_timestamp = get_current_timestamp();
+    uint32_t scan_end_time = (uint32_t)(esp_timer_get_time() / 1000); // milliseconds
+    uint32_t scan_duration = scan_end_time - scan_start_time;
+
     scan_in_progress = false;
     new_results_available = true;
+    last_scan_complete_time = scan_end_time; // Track when scan completed for debouncing
+    ESP_LOGI(TAG, "=== SCAN COMPLETE === at %lu ms, duration=%lu ms, setting scan_in_progress=false",
+             (unsigned long)scan_end_time, (unsigned long)scan_duration);
     xSemaphoreGive(scan_mutex);
-    
+
+    // Check if there's a pending background scan update to apply
+    extern scan_record_t pending_background_record;
+    if (pending_background_record.header.magic == SCAN_MAGIC) {
+        ESP_LOGI(TAG, "Applying pending background scan update");
+        wifi_scan_update_ui_cache_from_record(&pending_background_record);
+        memset(&pending_background_record, 0, sizeof(scan_record_t));
+    }
+
     // cleanup
     cJSON_Delete(root);
     cJSON_Delete(station_root);
-    
+
     // Sync deauth detection results to intelligence system
     scan_storage_update_security_events(wifi_scan_get_deauth_count());
-    
+
+    // Send batched deauth webhook alert if frames were detected
+    if (wifi_scan_get_deauth_count() > 0) {
+        device_lifecycle_generate_batched_deauth_alert(wifi_scan_get_deauth_count(), 30); // Station scans typically ~30 seconds
+        // Reset count after sending alert to prevent duplicate notifications
+        wifi_scan_reset_deauth_count();
+    }
+
     ESP_LOGI(TAG, "Wi-Fi Scan Completed. Results cached.");
+    
+    // Clean up temporary memory to prevent fragmentation
+    wifi_scan_cleanup_station_json();
+    
+    // Log heap status after cleanup
+    uint32_t free_heap = esp_get_free_heap_size();
+    ESP_LOGI(TAG, "Heap after scan cleanup: %lu bytes", (unsigned long)free_heap);
+}
+
+bool wifi_scan_start_async(void) {
+    if(!scan_mutex) {
+        scan_mutex = xSemaphoreCreateMutex();
+    }
+
+    if(!stations_mutex) {
+        stations_mutex = xSemaphoreCreateMutex();
+    }
+
+    if(!scan_mutex || !stations_mutex) {
+        ESP_LOGE(TAG, "Failed to create scan mutexes");
+        return false;
+    }
+
+    xSemaphoreTake(scan_mutex, portMAX_DELAY);
+    if(scan_in_progress || s_wifi_scan_task_handle != NULL) {
+        xSemaphoreGive(scan_mutex);
+        ESP_LOGW(TAG, "Scan already running; ignoring async start");
+        return false;
+    }
+    scan_in_progress = true;
+    xSemaphoreGive(scan_mutex);
+
+    BaseType_t rc = xTaskCreate(wifi_scan_task, "wifi_scan_task", 8192, NULL, 5, &s_wifi_scan_task_handle);
+    if(rc != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create wifi_scan_task: %d", rc);
+        xSemaphoreTake(scan_mutex, portMAX_DELAY);
+        scan_in_progress = false;
+        xSemaphoreGive(scan_mutex);
+        s_wifi_scan_task_handle = NULL;
+        return false;
+    }
+
+    return true;
+}
+
+static void wifi_scan_task(void *arg) {
+    ESP_LOGI(TAG, "Wi-Fi scan task started");
+    wifi_scan();
+    s_wifi_scan_task_handle = NULL;
+    ESP_LOGI(TAG, "Wi-Fi scan task finished");
+    vTaskDelete(NULL);
 }
 
 // update ui cache from background scan record
@@ -569,7 +705,7 @@ void wifi_scan_update_ui_cache_from_record(const scan_record_t *record) {
         cJSON_AddNumberToObject(ap_entry, "last_seen", now_sec);
         cJSON_AddBoolToObject(ap_entry, "hidden", ap->hidden);
         
-        char vendor[48] = "Unknown";
+        char vendor[64] = "Unknown";
         ouis_lookup_vendor(ap->bssid, vendor, sizeof(vendor));
         cJSON_AddStringToObject(ap_entry, "Vendor", vendor);
         
@@ -583,7 +719,7 @@ void wifi_scan_update_ui_cache_from_record(const scan_record_t *record) {
                 cJSON_AddNumberToObject(sta_obj, "rssi", sta->rssi);
                 cJSON_AddNumberToObject(sta_obj, "last_seen", now_sec);
                 
-                char sta_vendor[48] = "Unknown";
+                char sta_vendor[64] = "Unknown";
                 ouis_lookup_vendor(sta->mac, sta_vendor, sizeof(sta_vendor));
                 cJSON_AddStringToObject(sta_obj, "vendor", sta_vendor);
                 
@@ -596,24 +732,38 @@ void wifi_scan_update_ui_cache_from_record(const scan_record_t *record) {
     
     // update cache with mutex protection
     xSemaphoreTake(scan_mutex, portMAX_DELAY);
-    char *json_str = cJSON_PrintUnformatted(root);
-    if (json_str) {
-        size_t json_len = strlen(json_str);
-        if (json_len >= MAX_JSON_SIZE) {
-            ESP_LOGW(TAG, "Background scan JSON too large (%u bytes)", (unsigned)json_len);
-            strncpy(scan_results_json, "{\"rows\":[]}", MAX_JSON_SIZE - 1);
-        } else {
-            memcpy(scan_results_json, json_str, json_len + 1);
-        }
-        free(json_str);
-    } else {
-        strncpy(scan_results_json, "{\"rows\":[]}", MAX_JSON_SIZE - 1);
+
+    // Don't overwrite if manual scan is in progress, but queue update for after scan completes
+    if (scan_in_progress) {
+        ESP_LOGW(TAG, "Manual scan in progress, queuing background scan cache update");
+        xSemaphoreGive(scan_mutex);
+        if (root) cJSON_Delete(root);
+        
+        // Store record for later update when scan completes
+        extern scan_record_t pending_background_record;
+        memcpy(&pending_background_record, record, sizeof(scan_record_t));
+        return;
     }
-    scan_results_json[MAX_JSON_SIZE - 1] = '\0';
+
+    scan_was_truncated = false;
+    
+    // Use dynamic allocation for JSON (same as main scan)
+    esp_err_t err = update_scan_results_json(root);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to update scan results JSON from background scan");
+        scan_was_truncated = true;
+        // Set fallback JSON
+        if (scan_results_json) {
+            free(scan_results_json);
+        }
+        scan_results_json = strdup("{\"rows\":[]}");
+    }
+    
+    scan_results_timestamp = now_sec;
     new_results_available = true;
     xSemaphoreGive(scan_mutex);
     
-    cJSON_Delete(root);
+    if (root) cJSON_Delete(root);
     ESP_LOGI(TAG, "UI cache updated from background scan (%u APs, %u stations)", 
              record->header.ap_count, record->header.total_stations);
 }
@@ -639,6 +789,33 @@ bool wifi_scan_is_complete() {
     bool complete = !scan_in_progress;
     xSemaphoreGive(scan_mutex);
     return complete;
+}
+
+bool wifi_scan_is_in_progress() {
+    if(!scan_mutex) return false;
+
+    xSemaphoreTake(scan_mutex, portMAX_DELAY);
+    bool in_progress = scan_in_progress;
+    xSemaphoreGive(scan_mutex);
+    return in_progress;
+}
+
+uint32_t wifi_scan_get_results_timestamp() {
+    if(!scan_mutex) return 0;
+
+    xSemaphoreTake(scan_mutex, portMAX_DELAY);
+    uint32_t ts = scan_results_timestamp;
+    xSemaphoreGive(scan_mutex);
+    return ts;
+}
+
+bool wifi_scan_was_truncated() {
+    if(!scan_mutex) return false;
+
+    xSemaphoreTake(scan_mutex, portMAX_DELAY);
+    bool truncated = scan_was_truncated;
+    xSemaphoreGive(scan_mutex);
+    return truncated;
 }
 
 bool wifi_scan_has_new_results() {
@@ -677,12 +854,12 @@ static void stations_sniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
     uint8_t frame_type = (fc0 >> 2) & 0x03;
     uint8_t frame_subtype = (fc0 >> 4) & 0x0F;
     
-    // Debug: Log all management frame types we see
+    // Debug: Log management frame types (reduced frequency)
     if (frame_type == 0) {
         s_probe_request_count++;
-        if (frame_subtype == 0x04) {
+        if (frame_subtype == 0x04 && s_probe_request_count % 50 == 0) {
             ESP_LOGI(TAG, "PROBE_DEBUG: Probe request detected! Total probe requests seen: %lu", (unsigned long)s_probe_request_count);
-        } else if (s_probe_request_count % 100 == 0) {
+        } else if (s_probe_request_count % 200 == 0) {
             ESP_LOGI(TAG, "PROBE_DEBUG: Management frames seen: %lu, subtype: 0x%02X", (unsigned long)s_probe_request_count, frame_subtype);
         }
     }
@@ -690,6 +867,9 @@ static void stations_sniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
     if (frame_type == 0 && (frame_subtype == 0x0C || frame_subtype == 0x0A)) {
         s_deauth_count++;
         s_deauth_last_seen = get_current_timestamp();
+        
+        ESP_LOGI(TAG, "Deauth frame detected, total: %lu", (unsigned long)s_deauth_count);
+        
         return;
     }
 
@@ -784,7 +964,7 @@ static void stations_sniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
         uint8_t probe_mac[6];
         memcpy(probe_mac, addr2, 6); // Source address is addr2 in management frames
         
-        ESP_LOGI(TAG, "PROBE_FINGERPRINT: Capturing probe request from %02X:%02X:%02X:%02X:%02X:%02X on channel %d, RSSI %d",
+        ESP_LOGD(TAG, "PROBE_FINGERPRINT: Capturing probe request from %02X:%02X:%02X:%02X:%02X:%02X on channel %d, RSSI %d",
                  probe_mac[0], probe_mac[1], probe_mac[2], probe_mac[3], probe_mac[4], probe_mac[5],
                  rx_ctrl->channel, rx_ctrl->rssi);
         
@@ -800,7 +980,7 @@ static void stations_sniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
             
             parse_probe_request_fingerprint(frame_body, body_len, &temp_station);
             
-            ESP_LOGI(TAG, "PROBE_FINGERPRINT: Vendor: %s, Fingerprint: %s",
+            ESP_LOGD(TAG, "PROBE_FINGERPRINT: Vendor: %s, Fingerprint: %s",
                      temp_station.device_vendor, temp_station.device_fingerprint);
                      
             // Update existing station record or create new one
@@ -824,7 +1004,7 @@ static void stations_sniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
                             stations[i].device_fingerprint[sizeof(stations[i].device_fingerprint) - 1] = '\0';
                         }
                     }
-                    ESP_LOGI(TAG, "PROBE_FINGERPRINT: Updated existing station %s, probe count: %d", 
+                    ESP_LOGD(TAG, "PROBE_FINGERPRINT: Updated existing station %s, probe count: %d", 
                              mac_to_str(probe_mac), stations[i].probe_count);
                     break;
                 }
@@ -865,12 +1045,12 @@ static void stations_sniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
                         memcpy(&stations[stations_count], &temp_station, sizeof(station_info_t));
                         stations[stations_count].is_grouped = false;
                         stations[stations_count].grouped_mac_count = 0;
-                        ESP_LOGI(TAG, "PROBE_FINGERPRINT: Created new station from probe - %s, Vendor: %s, Channel: %d, RSSI: %d",
+                        ESP_LOGD(TAG, "PROBE_FINGERPRINT: Created new station from probe - %s, Vendor: %s, Channel: %d, RSSI: %d",
                                  mac_to_str(temp_station.station_mac), temp_station.device_vendor, temp_station.channel, temp_station.rssi);
                         stations_count++;
                     }
                 } else {
-                    ESP_LOGI(TAG, "PROBE_FINGERPRINT: Skipping station creation - insufficient fingerprint data");
+                    ESP_LOGD(TAG, "PROBE_FINGERPRINT: Skipping station creation - insufficient fingerprint data");
                 }
             } else if (!station_exists) {
                 ESP_LOGW(TAG, "PROBE_FINGERPRINT: Station array full, cannot add new station %s", mac_to_str(probe_mac));
@@ -909,12 +1089,9 @@ static void stations_sniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
     memcpy(candidate.station_mac, station_mac, 6);
     memcpy(candidate.ap_bssid, ap_bssid, 6);
     
-    // Get vendor from OUI
-    const char* vendor = get_vendor_from_oui(station_mac);
-    if(vendor) {
-        strncpy(candidate.device_vendor, vendor, sizeof(candidate.device_vendor) - 1);
-        candidate.device_vendor[sizeof(candidate.device_vendor) - 1] = '\0';
-    }
+    // Skip vendor lookup during sniffer processing for performance
+    // Vendor will be filled later during fingerprint processing
+    candidate.device_vendor[0] = '\0';
     
     xSemaphoreTake(stations_mutex, portMAX_DELAY);
     bool exists = false;
@@ -929,7 +1106,7 @@ static void stations_sniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
     }
     if(!exists && stations_count < MAX_STATIONS) { 
         stations[stations_count++] = candidate;
-        ESP_LOGI(TAG, "PROBE_FINGERPRINT: New station added - %s, Vendor: %s, Channel: %d, RSSI: %d",
+        ESP_LOGD(TAG, "PROBE_FINGERPRINT: New station added - %s, Vendor: %s, Channel: %d, RSSI: %d",
                  mac_to_str(candidate.station_mac), candidate.device_vendor, candidate.channel, candidate.rssi);
     }
     xSemaphoreGive(stations_mutex);
@@ -1010,7 +1187,7 @@ void wifi_scan_stations() {
     esp_wifi_set_promiscuous_rx_cb(stations_sniffer);
 
     uint32_t scan_time_ms = 8000;
-    uint32_t dwell_time_ms = 300;
+    uint32_t dwell_time_ms = 200;
     int ch_count = known_channel_count > 0 ? known_channel_count : (int)dual_band_channels_size;
     uint32_t iterations = scan_time_ms / (dwell_time_ms * (uint32_t)ch_count);
     if (iterations == 0) iterations = 1;
@@ -1045,7 +1222,6 @@ void wifi_scan_stations() {
 }
 
 const char* wifi_scan_get_station_results() {
-    static char json_output[4096];
     cJSON *root = cJSON_CreateObject();
     
     xSemaphoreTake(stations_mutex, portMAX_DELAY);
@@ -1087,7 +1263,7 @@ const char* wifi_scan_get_station_results() {
         } else {
             cJSON_AddBoolToObject(station, "has_fingerprint", false);
             // Fallback to basic OUI lookup
-            char sta_vendor[48] = "Unknown";
+            char sta_vendor[64] = "Unknown";
             ouis_lookup_vendor(stations[i].station_mac, sta_vendor, sizeof(sta_vendor));
             cJSON_AddStringToObject(station, "device_vendor", sta_vendor);
         }
@@ -1105,24 +1281,30 @@ const char* wifi_scan_get_station_results() {
     }
     xSemaphoreGive(stations_mutex);
     
-    char *json = cJSON_PrintUnformatted(root);
-    if (json) {
-        size_t json_len = strlen(json);
-        if (json_len >= sizeof(json_output)) {
-            ESP_LOGW(TAG, "Station JSON too large (%u bytes), returning empty result", (unsigned)json_len);
-            strncpy(json_output, "{}", sizeof(json_output) - 1);
-            json_output[sizeof(json_output) - 1] = '\0';
-        } else {
-            memcpy(json_output, json, json_len + 1);
-        }
-        free(json);
-    } else {
-        strncpy(json_output, "{}", sizeof(json_output) - 1);
-        json_output[sizeof(json_output) - 1] = '\0';
-    }
+    // Use dynamic allocation for JSON
+    char *json = json_create_string(root);
     cJSON_Delete(root);
     
-    return json_output;
+    if (!json) {
+        ESP_LOGE(TAG, "Failed to create station results JSON");
+        return "{}";
+    }
+    
+    // Store in global buffer for compatibility (caller expects const char*)
+    if (station_json_buffer) {
+        free(station_json_buffer);
+    }
+    station_json_buffer = json;
+    
+    return station_json_buffer;
+}
+
+// Cleanup function for station JSON buffer
+void wifi_scan_cleanup_station_json(void) {
+    if (station_json_buffer) {
+        free(station_json_buffer);
+        station_json_buffer = NULL;
+    }
 }
 
 const char* mac_to_str(const uint8_t *mac) {
@@ -1266,7 +1448,7 @@ int wifi_scan_probe_hidden_aps(void) {
 
 static const char* get_vendor_from_oui(const uint8_t *mac) {
     // Use existing OUI lookup functionality
-    static char vendor_buffer[48];
+    static char vendor_buffer[64];
     if (ouis_lookup_vendor(mac, vendor_buffer, sizeof(vendor_buffer))) {
         return vendor_buffer;
     }
@@ -1319,11 +1501,11 @@ static void extract_device_capabilities(const uint8_t *ie_data, uint8_t ie_len, 
         }
     }
     
-    ESP_LOGI(TAG, "PROBE_FINGERPRINT: Extracted capabilities - %s", fingerprint);
+    ESP_LOGD(TAG, "PROBE_FINGERPRINT: Extracted capabilities - %s", fingerprint);
 }
 
 static void parse_probe_request_fingerprint(const uint8_t *frame_body, int frame_len, station_info_t *station) {
-    ESP_LOGI(TAG, "PROBE_FINGERPRINT: Parsing probe request, frame length: %d", frame_len);
+    ESP_LOGD(TAG, "PROBE_FINGERPRINT: Parsing probe request, frame length: %d", frame_len);
     
     // Initialize fingerprint
     station->device_fingerprint[0] = '\0';
@@ -1340,7 +1522,7 @@ static void parse_probe_request_fingerprint(const uint8_t *frame_body, int frame
     if (frame_len > 0 && frame_body[0] == 0x00) {
         uint8_t ssid_len = frame_body[1];
         ie_offset += 2 + ssid_len;
-        ESP_LOGI(TAG, "PROBE_FINGERPRINT: SSID length: %d", ssid_len);
+        ESP_LOGD(TAG, "PROBE_FINGERPRINT: SSID length: %d", ssid_len);
     }
     
     // Parse remaining IEs for fingerprinting
@@ -1348,7 +1530,7 @@ static void parse_probe_request_fingerprint(const uint8_t *frame_body, int frame
         uint8_t ie_id = frame_body[ie_offset];
         uint8_t ie_len = frame_body[ie_offset + 1];
         
-        ESP_LOGI(TAG, "PROBE_FINGERPRINT: Found IE 0x%02X, length %d at offset %d", ie_id, ie_len, ie_offset);
+        ESP_LOGD(TAG, "PROBE_FINGERPRINT: Found IE 0x%02X, length %d at offset %d", ie_id, ie_len, ie_offset);
         
         if (ie_offset + 2 + ie_len > frame_len) {
             ESP_LOGW(TAG, "PROBE_FINGERPRINT: IE 0x%02X extends beyond frame boundary", ie_id);
@@ -1394,10 +1576,10 @@ static void parse_probe_request_fingerprint(const uint8_t *frame_body, int frame
     // Mark as having fingerprint if we collected any useful data
     if (strlen(station->device_fingerprint) > 4 || strlen(station->device_vendor) > 0) {
         station->has_fingerprint = true;
-        ESP_LOGI(TAG, "PROBE_FINGERPRINT: Complete fingerprint generated - Vendor: %s, Data: %s", 
+        ESP_LOGD(TAG, "PROBE_FINGERPRINT: Complete fingerprint generated - Vendor: %s, Data: %s", 
                  station->device_vendor, station->device_fingerprint);
     } else {
-        ESP_LOGI(TAG, "PROBE_FINGERPRINT: Limited fingerprint data available");
+        ESP_LOGD(TAG, "PROBE_FINGERPRINT: Limited fingerprint data available");
     }
 }
 

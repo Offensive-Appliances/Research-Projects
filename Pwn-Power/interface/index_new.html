@@ -190,6 +190,83 @@
                         </div>
                     </div>
                 </div>
+
+                <div class="card" style="margin-bottom:16px;" id="bottleneck-panel">
+                    <h4>Network Bottlenecks</h4>
+                    <div class="muted" style="margin-bottom:12px;">Real-time performance bottleneck detection</div>
+                    
+                    <!-- Overall Score Display -->
+                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+                        <div style="display:flex;align-items:center;gap:12px;">
+                            <div class="bottleneck-score-circle" id="bottleneck-overall-score" data-score="0">
+                                <div class="score-value">--</div>
+                                <div class="score-label">Risk</div>
+                            </div>
+                            <div>
+                                <div class="bottleneck-severity" id="bottleneck-severity">Analyzing...</div>
+                                <div class="muted" style="font-size:11px;" id="bottleneck-summary">Loading analysis</div>
+                            </div>
+                        </div>
+                        <button class="btn btn-sm" onclick="toggleBottleneckDetails()">Details</button>
+                    </div>
+                    
+                    <!-- Bottleneck Breakdown -->
+                    <div class="bottleneck-breakdown" id="bottleneck-breakdown" style="display:none;">
+                        <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-bottom:16px;">
+                            <div class="bottleneck-metric" data-type="channel">
+                                <div class="metric-header">
+                                    <span class="metric-name">Channel</span>
+                                    <span class="metric-score" id="channel-score">--</span>
+                                </div>
+                                <div class="metric-bar">
+                                    <div class="metric-fill" id="channel-fill"></div>
+                                </div>
+                                <div class="metric-detail" id="channel-detail">--</div>
+                            </div>
+                            
+                            <div class="bottleneck-metric" data-type="capacity">
+                                <div class="metric-header">
+                                    <span class="metric-name">Capacity</span>
+                                    <span class="metric-score" id="capacity-score">--</span>
+                                </div>
+                                <div class="metric-bar">
+                                    <div class="metric-fill" id="capacity-fill"></div>
+                                </div>
+                                <div class="metric-detail" id="capacity-detail">--</div>
+                            </div>
+                            
+                            <div class="bottleneck-metric" data-type="signal">
+                                <div class="metric-header">
+                                    <span class="metric-name">Signal</span>
+                                    <span class="metric-score" id="signal-score">--</span>
+                                </div>
+                                <div class="metric-bar">
+                                    <div class="metric-fill" id="signal-fill"></div>
+                                </div>
+                                <div class="metric-detail" id="signal-detail">--</div>
+                            </div>
+                            
+                            <div class="bottleneck-metric" data-type="timing">
+                                <div class="metric-header">
+                                    <span class="metric-name">Timing</span>
+                                    <span class="metric-score" id="timing-score">--</span>
+                                </div>
+                                <div class="metric-bar">
+                                    <div class="metric-fill" id="timing-fill"></div>
+                                </div>
+                                <div class="metric-detail" id="timing-detail">--</div>
+                            </div>
+                        </div>
+                        
+                        <!-- Recommendations -->
+                        <div class="bottleneck-recommendations" id="bottleneck-recommendations">
+                            <h5 style="margin:0 0 8px 0;font-size:13px;">Recommendations</h5>
+                            <div id="recommendations-list" style="display:flex;flex-direction:column;gap:6px;">
+                                <div class="muted" style="font-size:11px;">No recommendations available</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
                 
                 <div class="card" style="margin-bottom:16px;">
                     <h4>Security Overview</h4>
@@ -276,6 +353,14 @@
                                 <label style="display:flex;align-items:center;gap:10px;cursor:pointer;padding:6px;border-radius:4px;transition:background 0.2s;">
                                     <input type="checkbox" id="webhook-new-device" style="width:16px;height:16px;">
                                     <span style="font-size:13px;">New unknown device</span>
+                                </label>
+                                <label style="display:flex;align-items:center;gap:10px;cursor:pointer;padding:6px;border-radius:4px;transition:background 0.2s;">
+                                    <input type="checkbox" id="webhook-deauth" style="width:16px;height:16px;">
+                                    <span style="font-size:13px;">Deauth frames detected</span>
+                                </label>
+                                <label style="display:flex;align-items:center;gap:10px;cursor:pointer;padding:6px;border-radius:4px;transition:background 0.2s;">
+                                    <input type="checkbox" id="webhook-handshake" style="width:16px;height:16px;">
+                                    <span style="font-size:13px;">Handshake captured</span>
                                 </label>
                                 <label style="display:flex;align-items:center;gap:10px;cursor:pointer;padding:6px;border-radius:4px;transition:background 0.2s;">
                                     <input type="checkbox" id="webhook-tracked-only" style="width:16px;height:16px;">
@@ -451,7 +536,6 @@
     
     <div class="privacy-indicator">Privacy Mode Active</div>
     <script src="app.js"></script>
-    <script src="csv_generator.js"></script>
 </body>
 </html>
 

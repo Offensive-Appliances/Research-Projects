@@ -14,6 +14,8 @@ typedef struct {
     bool home_departure_alert;  // alert when home device leaves
     bool home_arrival_alert;    // alert when home device arrives
     bool new_device_alert;      // alert on unknown devices (trust < 30)
+    bool deauth_alert;          // alert on deauth frame detection
+    bool handshake_alert;       // alert on successful handshake capture
     bool all_events;            // send all events (overrides filters)
 } webhook_config_t;
 

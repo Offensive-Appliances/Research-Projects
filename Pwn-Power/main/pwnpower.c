@@ -225,49 +225,132 @@ static void sta_reconnect_task(void *arg) {
     }
 }
 
+// Periodic heap monitor task
+static void heap_monitor_task(void *arg) {
+    ESP_LOGI(TAG, "Heap monitor task started");
+
+    while (1) {
+        // Log heap stats every 30 seconds
+        vTaskDelay(pdMS_TO_TICKS(30000));
+
+        uint32_t free_heap = esp_get_free_heap_size();
+        uint32_t min_free_heap = esp_get_minimum_free_heap_size();
+        uint32_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+
+        ESP_LOGI(TAG, "=== HEAP STATS ===");
+        ESP_LOGI(TAG, "Free heap: %lu bytes (%.1f KB)",
+                 (unsigned long)free_heap, free_heap / 1024.0f);
+        ESP_LOGI(TAG, "Min free ever: %lu bytes (%.1f KB)",
+                 (unsigned long)min_free_heap, min_free_heap / 1024.0f);
+        ESP_LOGI(TAG, "Largest free block: %lu bytes (%.1f KB)",
+                 (unsigned long)largest_block, largest_block / 1024.0f);
+
+        // Warn if heap is getting low
+        if (free_heap < 20000) {
+            ESP_LOGW(TAG, "WARNING: Low heap detected! Free: %lu bytes", (unsigned long)free_heap);
+        }
+        
+        // Periodic cleanup every 5 minutes (10 cycles)
+        static int cleanup_counter = 0;
+        if (++cleanup_counter >= 10) {
+            cleanup_counter = 0;
+            ESP_LOGI(TAG, "Performing periodic memory cleanup...");
+            
+            // Clean up WiFi scan memory
+            extern void wifi_scan_cleanup_station_json(void);
+            wifi_scan_cleanup_station_json();
+            
+            // Force garbage collection
+            void *temp = malloc(1024);
+            if (temp) {
+                free(temp);
+                ESP_LOGI(TAG, "Memory cleanup completed. Heap: %lu bytes", (unsigned long)esp_get_free_heap_size());
+            }
+        }
+    }
+}
+
 void app_main() {
+    ESP_LOGI(TAG, "=== BOOT: app_main START ===");
+    ESP_LOGI(TAG, "Heap at app_main entry: %lu bytes", (unsigned long)esp_get_free_heap_size());
+
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+    ESP_LOGI(TAG, "Heap after NVS init: %lu bytes", (unsigned long)esp_get_free_heap_size());
 
     // initialize monitor uptime tracking (early to capture boot time)
     monitor_uptime_init();
+    ESP_LOGI(TAG, "Heap after monitor_uptime_init: %lu bytes", (unsigned long)esp_get_free_heap_size());
 
     // mark app valid so rollback doesn't screw us after ota
     esp_ota_mark_app_valid_cancel_rollback();
     attack_mutex = xSemaphoreCreateMutex();
+    ESP_LOGI(TAG, "Heap before WiFi init: %lu bytes", (unsigned long)esp_get_free_heap_size());
+
     wifi_init_softap();
-    
+    ESP_LOGI(TAG, "Heap after WiFi init (MAJOR): %lu bytes (-%lu)",
+             (unsigned long)esp_get_free_heap_size(),
+             (unsigned long)(esp_get_minimum_free_heap_size()));
+
     // wait for any ongoing deauth to complete
     while(deauth_active) {
         ESP_LOGI(TAG, "waiting for deauth operations to complete...");
         vTaskDelay(pdMS_TO_TICKS(1000)); // check every second
     }
-    
+
     start_webserver();
-    
+    ESP_LOGI(TAG, "Heap after web server: %lu bytes", (unsigned long)esp_get_free_heap_size());
+
     mdns_service_init("pwnpower");
-    
+    ESP_LOGI(TAG, "Heap after mDNS: %lu bytes", (unsigned long)esp_get_free_heap_size());
+
     // initialize device tracking
     device_db_init();
+    ESP_LOGI(TAG, "Heap after DeviceDB: %lu bytes", (unsigned long)esp_get_free_heap_size());
+
     device_lifecycle_init();
-    
+    ESP_LOGI(TAG, "Heap after DeviceLifecycle: %lu bytes", (unsigned long)esp_get_free_heap_size());
+
     // initialize and start webhook dispatcher
     webhook_init();
+    ESP_LOGI(TAG, "Heap after webhook_init: %lu bytes", (unsigned long)esp_get_free_heap_size());
+
+    // initialize wifi scan memory
+    extern void wifi_scan_init_memory(void);
+    wifi_scan_init_memory();
+    ESP_LOGI(TAG, "Heap after wifi_scan_init_memory: %lu bytes", (unsigned long)esp_get_free_heap_size());
+
     webhook_start();
-    
+    ESP_LOGI(TAG, "Heap after webhook_start (task): %lu bytes", (unsigned long)esp_get_free_heap_size());
+
     if (background_scan_init() == ESP_OK) {
+        ESP_LOGI(TAG, "Heap after background_scan_init: %lu bytes", (unsigned long)esp_get_free_heap_size());
         background_scan_start();
+        ESP_LOGI(TAG, "Heap after background_scan_start (task): %lu bytes", (unsigned long)esp_get_free_heap_size());
     }
-    
+
     if (idle_scanner_init() == ESP_OK) {
+        ESP_LOGI(TAG, "Heap after idle_scanner_init: %lu bytes", (unsigned long)esp_get_free_heap_size());
         idle_scanner_start();
+        ESP_LOGI(TAG, "Heap after idle_scanner_start (task): %lu bytes", (unsigned long)esp_get_free_heap_size());
     }
-    
+
     // start periodic sta reconnect task
+    ESP_LOGI(TAG, "Heap before sta_reconnect task: %lu bytes", (unsigned long)esp_get_free_heap_size());
     xTaskCreate(sta_reconnect_task, "sta_reconnect", 2048, NULL, 5, NULL);
     ESP_LOGI(TAG, "Started STA reconnect task");
+    ESP_LOGI(TAG, "Heap after sta_reconnect task: %lu bytes", (unsigned long)esp_get_free_heap_size());
+
+    // start periodic heap monitor task
+    xTaskCreate(heap_monitor_task, "heap_monitor", 2048, NULL, 1, NULL);
+    ESP_LOGI(TAG, "Started heap monitor task");
+
+    ESP_LOGI(TAG, "=== APP INITIALIZATION COMPLETE ===");
+    ESP_LOGI(TAG, "Initial free heap: %lu bytes (%.1f KB)",
+             (unsigned long)esp_get_free_heap_size(),
+             esp_get_free_heap_size() / 1024.0f);
 }

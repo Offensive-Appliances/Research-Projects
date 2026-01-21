@@ -118,7 +118,7 @@ typedef struct __attribute__((packed)) {
     uint8_t trust_score;    // 0-100
     uint8_t tracked;        // 1 if tracked
     uint8_t device_flags;   // DEVICE_FLAG_* from device_presence_t
-    char vendor[24];
+    char vendor[64];
     uint8_t _reserved[2];
 } device_event_t;
 
@@ -144,7 +144,7 @@ typedef struct {
     uint32_t total_sightings;
     int8_t rssi_avg;
     uint8_t device_type;
-    char vendor[24];
+    char vendor[64];
     bool is_known;
     uint32_t presence_hours[24];  // Hourly presence pattern
     uint8_t associated_ap_count;
@@ -159,7 +159,7 @@ typedef struct __attribute__((packed)) {
     uint16_t total_sightings;
     int8_t rssi_avg;
     uint8_t flags;
-    char vendor[16];
+    char vendor[64];
     uint8_t presence_hours[3];
     uint8_t associated_ap_count;
     uint8_t associated_aps[8][6];
@@ -207,6 +207,12 @@ typedef struct {
     uint32_t rogue_aps_detected;
     uint32_t known_devices_present;
 } network_stats_t;
+
+// Shared scan record buffer (defined in scan_storage.c, used across multiple files)
+extern scan_record_t shared_scan_buffer;
+
+// Pending background scan record for queuing updates during manual scans
+extern scan_record_t pending_background_record;
 
 esp_err_t scan_storage_init(void);
 esp_err_t scan_storage_save(scan_record_t *record);

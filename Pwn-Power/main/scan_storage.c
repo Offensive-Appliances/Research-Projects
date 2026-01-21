@@ -50,6 +50,16 @@ static char extra_home_ssids[3][33] = {{0}};  // up to 3 additional home SSIDs
 static uint32_t device_updates_since_save = 0;
 #define DEVICE_SAVE_INTERVAL 20
 
+// Pre-allocated write buffer for device saves (avoids fragmentation)
+static uint8_t device_write_buffer[sizeof(uint32_t) + (sizeof(device_presence_t) * MAX_TRACKED_DEVICES)];
+
+// Shared scan record buffer for temporary operations (avoids ~9KB repeated allocations)
+// Non-static so it can be accessed from other files via extern declaration
+scan_record_t shared_scan_buffer;
+
+// Pending background scan record for queuing updates during manual scans
+scan_record_t pending_background_record;
+
 // Counter caps to prevent overflow
 #define MAX_BEACON_COUNT 65000
 #define MAX_FRAME_COUNT 100000
@@ -114,19 +124,15 @@ static esp_err_t save_tracked_devices(void) {
 
     size_t data_size = sizeof(device_presence_t) * tracked_device_count;
     size_t total_size = sizeof(uint32_t) + data_size;
-    
-    uint8_t *write_buf = malloc(total_size);
-    if (!write_buf) {
-        ESP_LOGE(TAG, "failed to allocate write buffer");
-        return ESP_ERR_NO_MEM;
-    }
-    
+
+    // Use pre-allocated static buffer instead of malloc (prevents fragmentation)
+    uint8_t *write_buf = device_write_buffer;
+
     uint32_t count_header = tracked_device_count;
     memcpy(write_buf, &count_header, sizeof(uint32_t));
     memcpy(write_buf + sizeof(uint32_t), tracked_devices, data_size);
-    
+
     esp_err_t err = flash_manager_write(&flash_mgr, DEVICES_OFFSET, write_buf, total_size);
-    free(write_buf);
     
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "failed to write devices: %s", esp_err_to_name(err));
@@ -391,19 +397,28 @@ static void prune_stale_data(scan_record_t *record, time_t current_time) {
     }
 }
 
+// Separate buffer for merging operations to avoid aliasing with input record
+static scan_record_t existing_scan_buffer;
+
 esp_err_t scan_storage_save(scan_record_t *record) {
     if (!flash_mgr.partition || !record) return ESP_ERR_INVALID_ARG;
 
-    scan_record_t *existing = malloc(sizeof(scan_record_t));
+    ESP_LOGI(TAG, "scan_storage_save: INPUT record has %u APs, %u stations",
+             record->header.ap_count, record->header.total_stations);
+
+    // Use separate static buffer to avoid aliasing bug when record == &shared_scan_buffer
+    scan_record_t *existing = &existing_scan_buffer;
     bool has_existing = false;
-    
-    if (existing && storage_index.record_count > 0) {
+
+    if (storage_index.record_count > 0) {
         uint32_t read_offset = DATA_OFFSET;
         if (flash_manager_read(&flash_mgr, read_offset, existing, sizeof(scan_record_t)) == ESP_OK) {
             if (existing->header.magic == SCAN_MAGIC) {
                 uint32_t expected_crc = calc_record_crc(existing);
                 if (existing->header.crc32 == expected_crc) {
                     has_existing = true;
+                    ESP_LOGI(TAG, "scan_storage_save: EXISTING record has %u APs, %u stations",
+                             existing->header.ap_count, existing->header.total_stations);
                 }
             }
         }
@@ -472,15 +487,21 @@ esp_err_t scan_storage_save(scan_record_t *record) {
         for (uint8_t i = 0; i < existing->header.ap_count; i++) {
             existing->header.total_stations += existing->aps[i].station_count;
         }
-        
+
+        ESP_LOGI(TAG, "scan_storage_save: MERGED record has %u APs, %u stations",
+                 existing->header.ap_count, existing->header.total_stations);
+
         existing->header.timestamp = record->header.timestamp;
         existing->header.uptime_sec = record->header.uptime_sec;
         existing->header.epoch_ts = record->header.epoch_ts;
         existing->header.time_valid = record->header.time_valid;
         memcpy(record, existing, sizeof(scan_record_t));
+
+        ESP_LOGI(TAG, "scan_storage_save: FINAL record (after memcpy) has %u APs, %u stations",
+                 record->header.ap_count, record->header.total_stations);
+    } else {
+        ESP_LOGI(TAG, "scan_storage_save: No existing record, using INPUT as-is");
     }
-    
-    if (existing) free(existing);
 
     record->header.magic = SCAN_MAGIC;
     record->header.version = SCAN_VERSION;
@@ -557,8 +578,8 @@ esp_err_t scan_storage_get_stats(network_stats_t *stats) {
 
     if (storage_index.record_count == 0) return ESP_OK;
 
-    scan_record_t *rec = malloc(sizeof(scan_record_t));
-    if (!rec) return ESP_ERR_NO_MEM;
+    // Use shared buffer instead of malloc
+    scan_record_t *rec = &shared_scan_buffer;
 
     if (scan_storage_get_latest(rec) == ESP_OK) {
         stats->total_aps_seen = rec->header.ap_count;
@@ -566,8 +587,6 @@ esp_err_t scan_storage_get_stats(network_stats_t *stats) {
         stats->total_stations_seen = rec->header.total_stations;
         stats->current_stations = rec->header.total_stations;
     }
-
-    free(rec);
 
     if (storage_index.first_boot > 0 && storage_index.last_scan > storage_index.first_boot) {
         stats->monitoring_duration_sec = storage_index.last_scan - storage_index.first_boot;
@@ -640,8 +659,9 @@ const char* scan_storage_get_report_json(void) {
 
     cJSON *networks = cJSON_AddArrayToObject(root, "networks");
     
-    scan_record_t *latest = malloc(sizeof(scan_record_t));
-    if (latest && scan_storage_get_latest(latest) == ESP_OK) {
+    // Use shared buffer instead of malloc
+    scan_record_t *latest = &shared_scan_buffer;
+    if (scan_storage_get_latest(latest) == ESP_OK) {
         for (uint8_t i = 0; i < latest->header.ap_count; i++) {
             stored_ap_t *ap = &latest->aps[i];
             cJSON *net = cJSON_CreateObject();
@@ -692,7 +712,6 @@ const char* scan_storage_get_report_json(void) {
             cJSON_AddItemToArray(networks, net);
         }
     }
-    if (latest) free(latest);
 
     char *json = cJSON_PrintUnformatted(root);
     strncpy(report_json, json, sizeof(report_json) - 1);
@@ -707,8 +726,9 @@ const char* scan_storage_get_timeline_json(uint8_t hours) {
     cJSON *root = cJSON_CreateObject();
     cJSON *timeline = cJSON_AddArrayToObject(root, "timeline");
     
-    scan_record_t *rec = malloc(sizeof(scan_record_t));
-    if (rec) {
+    // Use shared buffer instead of malloc
+    scan_record_t *rec = &shared_scan_buffer;
+    {
         for (uint8_t i = 0; i < storage_index.record_count; i++) {
             if (scan_storage_get_record(i, rec) != ESP_OK) continue;
             
@@ -720,7 +740,6 @@ const char* scan_storage_get_timeline_json(uint8_t hours) {
             cJSON_AddNumberToObject(entry, "duration", rec->header.scan_duration_sec);
             cJSON_AddItemToArray(timeline, entry);
         }
-        free(rec);
     }
 
     char *json = cJSON_PrintUnformatted(root);
@@ -737,8 +756,8 @@ esp_err_t scan_storage_get_ap_history(const uint8_t *bssid, ap_summary_t *summar
     memset(summary, 0, sizeof(ap_summary_t));
     memcpy(summary->bssid, bssid, 6);
     
-    scan_record_t *rec = malloc(sizeof(scan_record_t));
-    if (!rec) return ESP_ERR_NO_MEM;
+    // Use shared buffer instead of malloc
+    scan_record_t *rec = &shared_scan_buffer;
     
     int rssi_sum = 0;
     int rssi_count = 0;
@@ -765,9 +784,7 @@ esp_err_t scan_storage_get_ap_history(const uint8_t *bssid, ap_summary_t *summar
             }
         }
     }
-    
-    free(rec);
-    
+
     if (rssi_count > 0) {
         summary->rssi_avg = rssi_sum / rssi_count;
         summary->rssi_trend = last_rssi - first_rssi;
@@ -910,7 +927,7 @@ esp_err_t scan_storage_update_device_presence(const uint8_t *mac, int8_t rssi, c
     }
 
     // get vendor for lifecycle
-    char vendor[48] = "Unknown";
+    char vendor[64] = "Unknown";
     ouis_lookup_vendor(mac, vendor, sizeof(vendor));
 
     // update lifecycle tracking (generates events as needed)
@@ -1273,9 +1290,15 @@ esp_err_t scan_storage_set_device_home(const uint8_t *mac, bool is_home) {
 }
 
 esp_err_t scan_storage_detect_rogue_aps(void) {
+    // CRITICAL: Cannot use shared_scan_buffer here because this function is called
+    // from populate_scan_record() which is actively using shared_scan_buffer
     scan_record_t *rec = malloc(sizeof(scan_record_t));
-    if (!rec) return ESP_ERR_NO_MEM;
+    if (!rec) {
+        ESP_LOGE(TAG, "Failed to allocate buffer for rogue AP detection");
+        return ESP_ERR_NO_MEM;
+    }
 
+    esp_err_t result = ESP_FAIL;
     if (scan_storage_get_latest(rec) != ESP_OK) {
         free(rec);
         return ESP_FAIL;
@@ -1318,13 +1341,14 @@ esp_err_t scan_storage_detect_rogue_aps(void) {
             }
         }
     }
-    
+
     free(rec);
     return ESP_OK;
 }
 
 esp_err_t scan_storage_update_security_events(uint32_t deauth_count) {
     deauth_events_hour = deauth_count;
+    ESP_LOGI("STORAGE", "Security events updated: deauth_count=%lu", (unsigned long)deauth_count);
     return ESP_OK;
 }
 
@@ -1385,7 +1409,10 @@ const char* scan_storage_get_intelligence_json(void) {
             }
         }
     }
-    if (rec) free(rec);
+    
+    if (rec) {
+        free(rec);
+    }
     
     snprintf(intelligence_json, sizeof(intelligence_json),
         "{"
@@ -1452,7 +1479,10 @@ esp_err_t scan_storage_send_unified_intelligence_chunked(httpd_req_t *req) {
         }
         for (int i = 1; i < 14; i++) if (channels[i]) active_channels++;
     }
-    if (rec) free(rec);
+    
+    if (rec) {
+        free(rec);
+    }
     
     // Send summary
     int len = snprintf(chunk, sizeof(chunk),
@@ -1467,7 +1497,8 @@ esp_err_t scan_storage_send_unified_intelligence_chunked(httpd_req_t *req) {
     if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) return ESP_FAIL;
     
     // Stream devices one at a time
-    scan_record_t *ap_rec = malloc(sizeof(scan_record_t));
+    // Use shared buffer instead of malloc
+    scan_record_t *ap_rec = &shared_scan_buffer;
     bool has_aps = (ap_rec && scan_storage_get_latest(ap_rec) == ESP_OK);
     
     for (int i = 0; i < tracked_device_count; i++) {
@@ -1516,7 +1547,7 @@ esp_err_t scan_storage_send_unified_intelligence_chunked(httpd_req_t *req) {
             DEVICE_IS_KNOWN(dev->flags) ? "true" : "false", DEVICE_IS_HOME(dev->flags) ? "true" : "false",
             (unsigned long)days_tracked, dev->presence_hours[0], dev->presence_hours[1], dev->presence_hours[2],
             dev->associated_ap_count);
-        if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) { if (ap_rec) free(ap_rec); return ESP_FAIL; }
+        if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) { return ESP_FAIL; }
         
         // Send associated APs
         for (uint8_t ap_idx = 0; ap_idx < dev->associated_ap_count && ap_idx < 8; ap_idx++) {
@@ -1534,13 +1565,12 @@ esp_err_t scan_storage_send_unified_intelligence_chunked(httpd_req_t *req) {
                 ap_idx > 0 ? "," : "", ssid,
                 dev->associated_aps[ap_idx][0], dev->associated_aps[ap_idx][1], dev->associated_aps[ap_idx][2],
                 dev->associated_aps[ap_idx][3], dev->associated_aps[ap_idx][4], dev->associated_aps[ap_idx][5]);
-            if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) { if (ap_rec) free(ap_rec); return ESP_FAIL; }
+            if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) { return ESP_FAIL; }
         }
         
-        if (httpd_resp_send_chunk(req, "]}", 2) != ESP_OK) { if (ap_rec) free(ap_rec); return ESP_FAIL; }
+        if (httpd_resp_send_chunk(req, "]}", 2) != ESP_OK) { return ESP_FAIL; }
     }
-    if (ap_rec) free(ap_rec);
-    
+        
     // Close JSON
     if (httpd_resp_send_chunk(req, "]}", 2) != ESP_OK) return ESP_FAIL;
     if (httpd_resp_send_chunk(req, NULL, 0) != ESP_OK) return ESP_FAIL;
@@ -1653,16 +1683,28 @@ static uint32_t sanitize_history_samples(history_sample_t *samples, uint32_t cou
             time_valid = false;
         }
 
+        // Only dedup if timestamps match AND data is identical
+        // This prevents false positives when samples legitimately have same timestamp
         bool is_dup = false;
         if (have_prev) {
+            bool timestamps_match = false;
             if (time_valid && last_time_valid && epoch_ts == last_epoch) {
-                is_dup = true;
+                timestamps_match = true;
             } else if (!time_valid && !last_time_valid && src->timestamp_delta_sec == last_uptime) {
-                is_dup = true;
+                timestamps_match = true;
+            }
+
+            // Only treat as duplicate if timestamps match AND ap/client counts match
+            if (timestamps_match && valid_count > 0) {
+                history_sample_t *prev = &samples[valid_count - 1];
+                if (prev->ap_count == src->ap_count && prev->client_count == src->client_count) {
+                    is_dup = true;
+                }
             }
         }
         if (is_dup) {
-            ESP_LOGD(TAG, "dedup sample %u", i);
+            ESP_LOGD(TAG, "dedup sample %u (epoch=%lu, aps=%u, clients=%u)",
+                     i, (unsigned long)epoch_ts, src->ap_count, src->client_count);
             continue;
         }
 

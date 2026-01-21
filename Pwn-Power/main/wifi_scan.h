@@ -9,8 +9,12 @@
 #include "scan_storage.h"
 
 void wifi_scan();
+bool wifi_scan_start_async(void);
 const char* wifi_scan_get_results();
 bool wifi_scan_is_complete();
+bool wifi_scan_is_in_progress();
+uint32_t wifi_scan_get_results_timestamp();
+bool wifi_scan_was_truncated();
 bool wifi_scan_has_new_results();
 void wifi_scan_update_ui_cache_from_record(const scan_record_t *record);
 extern const uint8_t dual_band_channels[];
@@ -21,7 +25,7 @@ typedef struct {
     uint8_t ap_bssid[6];
     int channel;
     int rssi;
-    char device_vendor[32];
+    char device_vendor[64];
     char device_fingerprint[128];
     uint32_t probe_count;
     uint32_t last_seen;
@@ -58,5 +62,10 @@ void update_channel_activity(uint8_t channel, uint32_t devices_found, int8_t *rs
 extern uint32_t channel_scan_counts[14];
 extern uint32_t channel_discovery_counts[14];
 extern uint32_t last_channel_update;
+
+// Memory management
+void wifi_scan_cleanup(void);
+void wifi_scan_init_memory(void);
+void wifi_scan_cleanup_station_json(void);
 
 #endif

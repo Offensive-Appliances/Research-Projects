@@ -27,7 +27,7 @@ extern uint32_t wifi_scan_get_deauth_count(void);
 extern void wifi_scan_increment_deauth_count(void);
 
 #define TAG "BgScan"
-#define BG_SCAN_TASK_STACK 8192
+#define BG_SCAN_TASK_STACK 6144  // Reduced from 8192 to save memory
 #define BG_SCAN_TASK_PRIO 5
 
 static bg_scan_state_t scan_state = BG_SCAN_IDLE;
@@ -255,12 +255,15 @@ static void populate_scan_record(scan_record_t *record) {
     
     if (original_mode == WIFI_MODE_APSTA || original_mode == WIFI_MODE_AP) {
         ESP_LOGI(TAG, "Temporarily switching to STA mode for channel hopping");
+        ESP_LOGI(TAG, "Deauthenticating all AP clients...");
         esp_wifi_deauth_sta(0);
         vTaskDelay(pdMS_TO_TICKS(200));
     }
-    
+
+    ESP_LOGI(TAG, "Setting WiFi mode to STA (AP will be destroyed temporarily)");
     esp_wifi_set_mode(WIFI_MODE_STA);
     vTaskDelay(pdMS_TO_TICKS(300));
+    ESP_LOGI(TAG, "Now in STA-only mode for promiscuous scanning");
     
     wifi_promiscuous_filter_t filt = {
         .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA
@@ -271,18 +274,19 @@ static void populate_scan_record(scan_record_t *record) {
     
     for (uint8_t ch = 1; ch <= 13; ch++) {
         esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
-        vTaskDelay(pdMS_TO_TICKS(350));
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
     
     esp_wifi_set_promiscuous(false);
     esp_wifi_set_promiscuous_rx_cb(NULL);
     
     if (original_mode != WIFI_MODE_STA) {
-        ESP_LOGI(TAG, "Restoring original WiFi mode");
+        ESP_LOGI(TAG, "Restoring original WiFi mode (AP will restart)");
         esp_wifi_set_mode(original_mode);
         vTaskDelay(pdMS_TO_TICKS(500));
+        ESP_LOGI(TAG, "WiFi mode restored, AP should be available again");
     }
-    
+
     if (was_sta_connected) {
         ESP_LOGI(TAG, "Reconnecting STA");
         esp_wifi_connect();
@@ -333,9 +337,15 @@ static void populate_scan_record(scan_record_t *record) {
 
 static void background_scan_task(void *arg) {
     ESP_LOGI(TAG, "Background scan task started");
-    
+    ESP_LOGI(TAG, "Initial free heap: %lu bytes", (unsigned long)esp_get_free_heap_size());
+
     while (task_running) {
         scan_state = BG_SCAN_WAITING;
+
+        // Periodic heap monitoring while waiting
+        ESP_LOGI(TAG, "Free heap (waiting): %lu bytes, Min ever: %lu bytes",
+                 (unsigned long)esp_get_free_heap_size(),
+                 (unsigned long)esp_get_minimum_free_heap_size());
         
         uint32_t remaining_ms = config.interval_sec * 1000;
         const uint32_t check_interval_ms = 1000;
@@ -354,25 +364,39 @@ static void background_scan_task(void *arg) {
         if (!config.auto_scan && !was_triggered) continue;
         
         scan_state = BG_SCAN_RUNNING;
-        ESP_LOGI(TAG, "Starting background scan");
-        
-        scan_record_t *record = malloc(sizeof(scan_record_t));
-        if (!record) {
-            ESP_LOGE(TAG, "Failed to allocate scan record");
-            continue;
-        }
-        
+        ESP_LOGI(TAG, "=== BACKGROUND SCAN START ===");
+        ESP_LOGI(TAG, "Free heap before scan: %lu bytes", (unsigned long)esp_get_free_heap_size());
+
+        // Use shared buffer instead of malloc
+        scan_record_t *record = &shared_scan_buffer;
+
         populate_scan_record(record);
         
         history_sample_t sample;
         memset(&sample, 0, sizeof(sample));
         
         uint32_t base_epoch = scan_storage_get_history_base_epoch();
-        if (base_epoch == 0 && record->header.time_valid && record->header.epoch_ts > 0) {
-            base_epoch = record->header.epoch_ts;
-            scan_storage_set_history_base_epoch(base_epoch);
+
+        // Reset base epoch if time just synced or if delta would overflow
+        if (record->header.time_valid && record->header.epoch_ts > 0) {
+            if (base_epoch == 0) {
+                // First time sync - set initial base
+                base_epoch = record->header.epoch_ts;
+                scan_storage_set_history_base_epoch(base_epoch);
+                ESP_LOGI(TAG, "history base epoch initialized: %lu", (unsigned long)base_epoch);
+            } else {
+                uint32_t delta = record->header.epoch_ts - base_epoch;
+                // Reset base epoch if delta exceeds 16-bit limit (65535 sec = ~18 hours)
+                // Use threshold of 60000 seconds (~16.6 hours) to prevent overflow
+                if (delta > 60000) {
+                    base_epoch = record->header.epoch_ts;
+                    scan_storage_set_history_base_epoch(base_epoch);
+                    ESP_LOGW(TAG, "history base epoch reset due to overflow: %lu (delta was %lu)",
+                             (unsigned long)base_epoch, (unsigned long)delta);
+                }
+            }
         }
-        
+
         if (record->header.time_valid && base_epoch > 0 && record->header.epoch_ts >= base_epoch) {
             uint32_t delta = record->header.epoch_ts - base_epoch;
             sample.timestamp_delta_sec = (delta > 65535) ? 65535 : delta;
@@ -383,6 +407,10 @@ static void background_scan_task(void *arg) {
         }
         sample.ap_count = record->header.ap_count;
         sample.client_count = record->header.total_stations > 255 ? 255 : record->header.total_stations;
+        if (sample.client_count >= 250) {
+            ESP_LOGW(TAG, "history sample client_count=%u looks corrupt; treating as 0", sample.client_count);
+            sample.client_count = 0;
+        }
         
         for (uint8_t i = 0; i < record->header.ap_count; i++) {
             uint8_t ch = record->aps[i].channel;
@@ -443,15 +471,20 @@ static void background_scan_task(void *arg) {
             sample.ssid_clients[i].client_count = ssid_temps[i].count;
         }
         
+        ESP_LOGI(TAG, "Free heap before storage save: %lu bytes", (unsigned long)esp_get_free_heap_size());
+
         esp_err_t err = scan_storage_save(record);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Failed to save scan: %s", esp_err_to_name(err));
         } else {
-            ESP_LOGI(TAG, "Scan complete: %u APs, %u stations", 
+            ESP_LOGI(TAG, "Background scan saved successfully (%u APs, %u stations)", 
                      record->header.ap_count, record->header.total_stations);
+            
+            // Only update UI cache if save was successful
+            wifi_scan_update_ui_cache_from_record(record);
         }
-        
-        wifi_scan_update_ui_cache_from_record(record);
+
+        ESP_LOGI(TAG, "Free heap after storage save: %lu bytes", (unsigned long)esp_get_free_heap_size());
         
         err = scan_storage_append_history_sample(&sample);
         if (err != ESP_OK) {
@@ -461,9 +494,22 @@ static void background_scan_task(void *arg) {
         // flush tracked devices to nvs after each scan
         scan_storage_flush_devices();
         
-        free(record);
+        // Sync deauth detection results to intelligence system
+        scan_storage_update_security_events(wifi_scan_get_deauth_count());
         
+        // Send batched deauth webhook alert if frames were detected
+        if (wifi_scan_get_deauth_count() > 0) {
+            device_lifecycle_generate_batched_deauth_alert(wifi_scan_get_deauth_count(), record->header.scan_duration_sec);
+            // Reset count after sending alert to prevent duplicate notifications
+            wifi_scan_reset_deauth_count();
+        }
+
         last_scan_time = get_uptime_sec();
+
+        ESP_LOGI(TAG, "Free heap at scan end: %lu bytes, Min ever: %lu bytes",
+                 (unsigned long)esp_get_free_heap_size(),
+                 (unsigned long)esp_get_minimum_free_heap_size());
+        ESP_LOGI(TAG, "=== BACKGROUND SCAN END ===");
     }
     
     scan_state = BG_SCAN_IDLE;

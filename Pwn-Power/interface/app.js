@@ -107,9 +107,27 @@ async function fetchJSON(url, opts = {}) {
     }
 }
 
-async function loadScanData() {
-    const data = await fetchJSON('/cached-scan');
+async function loadScanData(preventNewScan = false) {
+    // Always try cached data first
+    let data = await fetchJSON('/cached-scan');
     const status = await fetchJSON('/wifi/status');
+
+    // Check if scan is in progress
+    if (data && data.scan_in_progress) {
+        showToast('Scan in progress, showing cached data...');
+    }
+
+    // Show warning if data was truncated
+    if (data && data.truncated) {
+        showToast('Warning: Scan results were truncated due to large data size', 'warning');
+    }
+
+    // If no cached data and we're allowed to trigger new scan, try /scan
+    if ((!data || !data.rows || data.rows.length === 0) && !preventNewScan) {
+        // Don't auto-trigger scan on refresh - user should click "Scan Networks"
+        showToast('No cached scan data. Click "Scan Networks" to start a scan.');
+        return;
+    }
     if (data && data.rows) {
         scanData = data.rows;
         
@@ -139,7 +157,7 @@ async function loadScanData() {
         
         renderNetworkTable('wifi-table', true, status);
         renderChannelChart();
-        updateStats();
+        updateStats(data.timestamp, status);
     }
 }
 
@@ -301,7 +319,8 @@ function renderChannelChart() {
     if (!container) return;
     
     const channels = {};
-    scanData.forEach(ap => {
+    const dataSource = Array.from(accumulatedNetworks.values());
+    dataSource.forEach(ap => {
         const ch = ap.Channel;
         channels[ch] = (channels[ch] || 0) + 1;
     });
@@ -321,35 +340,131 @@ function renderChannelChart() {
     }
 }
 
-function updateStats() {
+function updateStats(scanTimestamp, wifiStatus) {
     const apCount = accumulatedNetworks.size;
     let clientCount = 0;
     const dataSource = Array.from(accumulatedNetworks.values());
     dataSource.forEach(ap => {
         if (ap.stations) clientCount += ap.stations.length;
     });
-    
+
     const statEl = $('#scan-stats');
     if (statEl) {
-        statEl.textContent = `${apCount} APs, ${clientCount} clients`;
+        let statsText = `${apCount} APs, ${clientCount} clients`;
+
+        // Add age of data if we have timestamp and wifi status
+        if (scanTimestamp && wifiStatus && wifiStatus.timestamp) {
+            const age = wifiStatus.timestamp - scanTimestamp;
+            if (age > 0 && age < 86400) { // Less than 24 hours
+                const minutes = Math.floor(age / 60);
+                const seconds = Math.floor(age % 60);
+                if (minutes > 0) {
+                    statsText += ` (${minutes}m ago)`;
+                } else if (seconds > 5) {
+                    statsText += ` (${seconds}s ago)`;
+                } else {
+                    statsText += ` (just now)`;
+                }
+            }
+        }
+
+        statEl.textContent = statsText;
     }
 }
 
 let scanInProgress = false;
 
+// Check if scan was in progress when page loaded (e.g., after reconnection)
+try {
+    const lastScanTime = parseInt(sessionStorage.getItem('lastScanTime') || '0');
+    const now = Date.now();
+    // If scan started less than 30 seconds ago, assume still in progress
+    if (now - lastScanTime < 30000) {
+        scanInProgress = true;
+        console.log('Detected recent scan, setting lock');
+    }
+} catch (e) {
+    // sessionStorage not available
+}
+
+async function checkScanStatus() {
+    const status = await fetchJSON('/wifi/scan-status');
+    return status?.scan_in_progress || false;
+}
+
+// Track the active scan abort controller to prevent retries
+let activeScanController = null;
+
 async function triggerScan() {
-    if (scanInProgress) {
+    console.log('=== triggerScan() called at', new Date().toISOString(), '===');
+    console.log('Current state: scanInProgress=', scanInProgress);
+    console.trace('Call stack:'); // Show where this was called from
+
+    // Check actual backend scan status
+    const backendScanning = await checkScanStatus();
+    console.log('Backend scanning status:', backendScanning);
+
+    if (scanInProgress || backendScanning) {
+        console.warn('Scan already in progress, aborting');
         showToast('Scan already in progress');
         return;
     }
 
+    // Abort any previous scan request that might be stuck
+    if (activeScanController) {
+        console.log('Aborting previous scan controller');
+        activeScanController.abort();
+        activeScanController = null;
+    }
+
+    console.log('Starting new scan, creating AbortController...');
     scanInProgress = true;
+    // Store scan start time in sessionStorage to survive page reloads
+    try {
+        sessionStorage.setItem('lastScanTime', Date.now().toString());
+    } catch (e) {
+        // sessionStorage not available
+    }
     showWarningPopup('Scanning will temporarily interrupt your connection. You will need to reconnect or refresh this page after the scan completes.');
-    await fetchJSON('/scan');
-    setTimeout(() => {
-        loadScanData();
+
+    // Create abort controller for this scan
+    activeScanController = new AbortController();
+
+    try {
+        // The /scan endpoint is blocking and completes the scan before returning
+        const result = await fetch('/scan', { signal: activeScanController.signal });
+
+        // Check if request was successful
+        if (result && result.ok) {
+            await loadScanData(true);
+            showToast('Scan complete');
+        } else {
+            // Connection dropped during scan (expected)
+            console.log('Scan connection interrupted (expected), waiting for reconnection...');
+            await new Promise(resolve => setTimeout(resolve, 3000)); // Wait 3 seconds
+            await loadScanData(true);
+            showToast('Scan complete');
+        }
+    } catch (error) {
+        if (error.name === 'AbortError') {
+            console.log('Scan request was aborted');
+        } else {
+            console.error('Scan error:', error);
+            // Connection dropped, wait and load cached results
+            await new Promise(resolve => setTimeout(resolve, 3000));
+            await loadScanData(true);
+            showToast('Scan completed but connection was interrupted');
+        }
+    } finally {
+        activeScanController = null;
         scanInProgress = false;
-    }, 2000);
+        // Clear the scan lock
+        try {
+            sessionStorage.removeItem('lastScanTime');
+        } catch (e) {
+            // sessionStorage not available
+        }
+    }
 }
 
 async function startDeauth() {
@@ -1367,9 +1482,16 @@ function drawMultiLineChart(canvasId, samples, config) {
     seriesData.forEach(series => {
         if (series.data.length === 0) return;
 
-        const points = series.data.map((d) => {
+        // Sort data points by timestamp to ensure proper line connections
+        const sortedData = [...series.data]
+            .filter(d => Number.isFinite(d.timestamp))
+            .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+
+        if (sortedData.length === 0) return;
+
+        const points = sortedData.map((d, idx) => {
             let x;
-            if (series.data.length === 1) {
+            if (sortedData.length === 1) {
                 // For single data point, position based on its timestamp within the time range
                 const timeRatio = timeRangeMs > 0 ? ((d.timestamp || 0) - timeRange.startTime) / timeRangeMs : 0.5;
                 x = padding.left + Math.max(0, Math.min(1, timeRatio)) * chartWidth;
@@ -1383,7 +1505,8 @@ function drawMultiLineChart(canvasId, samples, config) {
                 x: x,
                 y: padding.top + chartHeight - ((d.value - minValue) / (maxValue - minValue)) * chartHeight,
                 timestamp: d.timestamp || 0,
-                value: d.value
+                value: d.value,
+                originalIndex: idx
             };
         });
 
@@ -1840,7 +1963,7 @@ function renderCharts(samples, timeRange = null) {
     // Show/hide overlays based on data availability
     updateGraphOverlayState('activity', needsMoreData);
     updateGraphOverlayState('channel', needsMoreData);
-    updateGraphOverlayState('ssid-clients', false); // Always show (uses current data, not history)
+    updateGraphOverlayState('ssid-clients', needsMoreData);
 
     if (!samples || samples.length === 0) return;
 
@@ -1854,7 +1977,10 @@ function renderCharts(samples, timeRange = null) {
     }
 
     // activity chart - show APs and clients as separate lines with smoothing
-    drawMultiLineChart('#activity-chart', samples, {
+    // Ensure samples are sorted chronologically to avoid line jumps
+    const sortedSamples = [...samples].sort((a, b) => (a.epoch_ts || 0) - (b.epoch_ts || 0));
+
+    drawMultiLineChart('#activity-chart', sortedSamples, {
         timeRange: timeRange,
         extractSeries: (samples) => {
             const apData = [];
@@ -1902,7 +2028,7 @@ function renderCharts(samples, timeRange = null) {
         ? `Collecting data... (${samples.length} samples)`
         : `Showing ${samples.length} samples`;
 
-    drawMultiLineChart('#channel-chart-time', samples, {
+    drawMultiLineChart('#channel-chart-time', sortedSamples, {
         timeRange: timeRange,
         extractSeries: (samples) => {
             // Optimize: Find active channels first, then build only needed series
@@ -2219,6 +2345,8 @@ async function loadWebhookConfig() {
     const homeDepartureCheckbox = $('#webhook-home-departure');
     const homeArrivalCheckbox = $('#webhook-home-arrival');
     const newDeviceCheckbox = $('#webhook-new-device');
+    const deauthCheckbox = $('#webhook-deauth');
+    const handshakeCheckbox = $('#webhook-handshake');
     const allEventsCheckbox = $('#webhook-all-events');
     const status = $('#webhook-status');
     
@@ -2228,6 +2356,8 @@ async function loadWebhookConfig() {
     if (homeDepartureCheckbox) homeDepartureCheckbox.checked = data.home_departure_alert;
     if (homeArrivalCheckbox) homeArrivalCheckbox.checked = data.home_arrival_alert;
     if (newDeviceCheckbox) newDeviceCheckbox.checked = data.new_device_alert;
+    if (deauthCheckbox) deauthCheckbox.checked = data.deauth_alert;
+    if (handshakeCheckbox) handshakeCheckbox.checked = data.handshake_alert;
     if (allEventsCheckbox) allEventsCheckbox.checked = data.all_events;
     
     if (status) {
@@ -2246,12 +2376,14 @@ async function saveWebhookConfig(e) {
     const home_departure_alert = $('#webhook-home-departure')?.checked ?? false;
     const home_arrival_alert = $('#webhook-home-arrival')?.checked ?? false;
     const new_device_alert = $('#webhook-new-device')?.checked ?? false;
+    const deauth_alert = $('#webhook-deauth')?.checked ?? false;
+    const handshake_alert = $('#webhook-handshake')?.checked ?? false;
     const all_events = $('#webhook-all-events')?.checked ?? false;
     
     const res = await fetchJSON('/webhook/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ enabled, url, tracked_only, home_departure_alert, home_arrival_alert, new_device_alert, all_events })
+        body: JSON.stringify({ enabled, url, tracked_only, home_departure_alert, home_arrival_alert, new_device_alert, deauth_alert, handshake_alert, all_events })
     });
     
     if (res && res.status === 'ok') {
@@ -2276,7 +2408,7 @@ async function testWebhook(e) {
 
 document.addEventListener('DOMContentLoaded', () => {
     initPrivacyMode();
-    loadScanData();
+    loadScanData(true); // Only load cached data on page load
     loadApConfig();
     loadNetworkStatus();
     loadHandshakes();
@@ -2287,6 +2419,7 @@ document.addEventListener('DOMContentLoaded', () => {
     loadHistoryCharts(7);
     loadHomeSSIDs();
     loadWebhookConfig();
+    loadBottleneckAnalysis(); // Initialize bottleneck detector
 
     // Sync device sort dropdown with currentSort state
     const deviceSort = $('#device-sort');
@@ -2296,7 +2429,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     addTrackedInterval(loadNetworkStatus, 10000);
     addTrackedInterval(updateBgScanStatus, 5000);
-    addTrackedInterval(loadDeviceIntelligence, 60000); // Reduced from 30s to 60s
+    addTrackedInterval(loadDeviceIntelligence, 15000); // Reduced from 60s to 15s for better responsiveness
+    addTrackedInterval(loadBottleneckAnalysis, 30000); // Update bottleneck analysis every 30 seconds
     if (!agoTicker) agoTicker = addTrackedInterval(updateAgoTick, 1000);
 
     const apForm = $('#ap-config-form');
@@ -2310,3 +2444,440 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 window.addEventListener('beforeunload', cleanupAllResources);
+
+// Network Bottleneck Detector Functions
+class NetworkBottleneckDetector {
+    calculateChannelBottleneck(channelCounts) {
+        const maxCapacity = 25;
+        const totalAPs = channelCounts.reduce((a, b) => a + b, 0);
+        const maxChannelCount = Math.max(...channelCounts);
+        
+        // Calculate bottleneck score based on worst channel utilization
+        const bottleneckScore = Math.min(100, (maxChannelCount / maxCapacity) * 100);
+        
+        // Find which channels are congested
+        const congestedChannels = channelCounts
+            .map((count, idx) => ({ channel: idx + 1, count, congested: count > 15 }))
+            .filter(ch => ch.congested);
+        
+        return {
+            score: Math.round(bottleneckScore),
+            severity: this.getSeverity(bottleneckScore),
+            detail: maxChannelCount > 0 ? 
+                `${maxChannelCount} APs on most congested channel (Ch ${channelCounts.indexOf(maxChannelCount) + 1})` : 
+                'No channels detected',
+            overloadedAPs: channelCounts.filter(c => c > 20).length,
+            congestedChannels: congestedChannels.length
+        };
+    }
+    
+    calculateCapacityBottleneck(clientCounts, apCount) {
+        const totalClients = clientCounts.reduce((a, b) => a + b, 0);
+        const avgClientsPerAP = apCount > 0 ? totalClients / apCount : 0;
+        const optimalRatio = 30;
+        const bottleneckScore = apCount > 0 ? Math.min(100, (avgClientsPerAP / optimalRatio) * 100) : 0;
+        
+        return {
+            score: Math.round(bottleneckScore),
+            devicesPerAP: Math.round(avgClientsPerAP),
+            severity: this.getSeverity(bottleneckScore),
+            detail: apCount > 0 ? `${Math.round(avgClientsPerAP)} devices per AP average` : 'No APs detected'
+        };
+    }
+    
+    calculateSignalBottleneck(rssiValues) {
+        if (!rssiValues || rssiValues.length === 0) {
+            return { score: 0, weakSignalPercentage: 0, severity: 'low', detail: 'No signal data' };
+        }
+        
+        const weakSignals = rssiValues.filter(rssi => rssi < -70).length;
+        const totalSignals = rssiValues.length;
+        const weakSignalPercentage = (weakSignals / totalSignals) * 100;
+        
+        return {
+            score: Math.round(weakSignalPercentage),
+            weakSignalPercentage: Math.round(weakSignalPercentage),
+            severity: this.getSeverity(weakSignalPercentage),
+            detail: `${weakSignals} devices with weak signal (< -70dBm)`
+        };
+    }
+    
+    calculateTimingBottleneck(activityTimeline) {
+        if (!activityTimeline || activityTimeline.length < 2) {
+            return { score: 0, congestionPeriods: 0, severity: 'low', detail: 'Insufficient data' };
+        }
+        
+        const totalDevices = activityTimeline.map(s => (s.ap_count || 0) + (s.client_count || 0));
+        
+        // Calculate average and standard deviation to detect significant spikes
+        const avgActivity = totalDevices.reduce((a, b) => a + b, 0) / totalDevices.length;
+        const variance = totalDevices.reduce((sum, val) => sum + Math.pow(val - avgActivity, 2), 0) / totalDevices.length;
+        const stdDev = Math.sqrt(variance);
+        
+        // Use statistical threshold (2 standard deviations above mean) for congestion
+        const peakThreshold = avgActivity + (2 * stdDev);
+        
+        // If there's very little variation, no timing bottleneck
+        if (stdDev < 1) {
+            return { score: 0, congestionPeriods: 0, severity: 'low', detail: 'Stable network activity' };
+        }
+        
+        const congestionPeriods = totalDevices.filter(count => count > peakThreshold).length;
+        const bottleneckScore = (congestionPeriods / totalDevices.length) * 100;
+        
+        return {
+            score: Math.round(bottleneckScore),
+            congestionPeriods: congestionPeriods,
+            severity: this.getSeverity(bottleneckScore),
+            detail: congestionPeriods > 0 ? 
+                `${congestionPeriods} periods of high activity detected` : 
+                'Consistent network activity'
+        };
+    }
+    
+    getSeverity(score) {
+        if (score < 25) return 'low';
+        if (score < 50) return 'medium';
+        if (score < 75) return 'high';
+        return 'critical';
+    }
+    
+    getOverallBottleneckScore(bottlenecks) {
+        const weights = { channel: 0.3, capacity: 0.25, signal: 0.25, timing: 0.2 };
+        
+        const weightedScore = 
+            bottlenecks.channel.score * weights.channel +
+            bottlenecks.capacity.score * weights.capacity +
+            bottlenecks.signal.score * weights.signal +
+            bottlenecks.timing.score * weights.timing;
+            
+        const overallScore = Math.round(weightedScore);
+        const primaryBottleneck = Object.entries(bottlenecks).reduce((a, [key, value]) => 
+            value.score > a.value.score ? { key, value } : a, { key: 'none', value: { score: 0 } });
+        
+        return {
+            overallScore,
+            severity: this.getSeverity(overallScore),
+            bottlenecks,
+            primaryBottleneck: primaryBottleneck.key,
+            recommendations: this.generateRecommendations(bottlenecks, primaryBottleneck)
+        };
+    }
+    
+    generateRecommendations(bottlenecks, primaryBottleneck) {
+        const recommendations = [];
+        
+        // Channel recommendations with specific channel info
+        if (bottlenecks.channel.score > 70) {
+            const worstChannel = bottlenecks.channel.congestedChannels > 0 ? 
+                `prioritize moving APs from congested channels` : 
+                `redistribute APs across channels`;
+            
+            recommendations.push({
+                priority: 'high',
+                title: 'Optimize Channel Usage',
+                description: `${bottlenecks.channel.overloadedAPs} APs on overloaded channels - ${worstChannel}`,
+                impact: 'Could improve performance by 40-60%'
+            });
+        }
+        
+        // Capacity recommendations with SSID-specific insights
+        if (bottlenecks.capacity.score > 80) {
+            let description = `Current load: ${bottlenecks.capacity.devicesPerAP} devices per AP`;
+            
+            // Add SSID-specific details if available
+            if (bottlenecks.capacity.ssidAnalysis) {
+                const worstSSID = bottlenecks.capacity.ssidAnalysis
+                    .sort((a, b) => b.avgClientsPerAP - a.avgClientsPerAP)[0];
+                
+                if (worstSSID && worstSSID.avgClientsPerAP > bottlenecks.capacity.devicesPerAP * 1.5) {
+                    description += `. "${worstSSID.ssid}" has ${Math.round(worstSSID.avgClientsPerAP)} devices per AP`;
+                }
+            }
+            
+            recommendations.push({
+                priority: 'critical',
+                title: 'Add Network Capacity',
+                description: description,
+                impact: 'Network may become unstable'
+            });
+        }
+        
+        // Signal recommendations with specific insights
+        if (bottlenecks.signal.score > 60) {
+            recommendations.push({
+                priority: 'medium',
+                title: 'Improve Signal Coverage',
+                description: `${bottlenecks.signal.weakSignalPercentage}% devices have poor signal (< -70dBm)`,
+                impact: 'Could improve reliability by 25%'
+            });
+        }
+        
+        // Timing recommendations
+        if (bottlenecks.timing.score > 75) {
+            recommendations.push({
+                priority: 'medium',
+                title: 'Optimize Peak Usage',
+                description: `Severe congestion during peak periods`,
+                impact: 'Could reduce peak congestion by 30%'
+            });
+        }
+        
+        // Add general recommendation if no specific issues but overall score is elevated
+        if (recommendations.length === 0 && bottlenecks.channel.score > 40) {
+            recommendations.push({
+                priority: 'low',
+                title: 'Monitor Network Performance',
+                description: 'Network performance is acceptable but should be monitored',
+                impact: 'Preventative maintenance recommended'
+            });
+        }
+        
+        return recommendations.sort((a, b) => this.getPriorityWeight(b.priority) - this.getPriorityWeight(a.priority));
+    }
+    
+    getPriorityWeight(priority) {
+        const weights = { critical: 4, high: 3, medium: 2, low: 1 };
+        return weights[priority] || 0;
+    }
+}
+
+const bottleneckDetector = new NetworkBottleneckDetector();
+
+async function loadBottleneckAnalysis() {
+    console.log('[BOTTLENECK] Starting bottleneck analysis...');
+    try {
+        // Use scan/report endpoint which has the networks array (not /intelligence/unified)
+        const [reportData, historyData] = await Promise.all([
+            fetchJSON('/scan/report'),
+            fetchJSON('/history/samples?days=3')  // Get 3 days of history for timing analysis
+        ]);
+
+        console.log('[BOTTLENECK] Raw reportData:', reportData);
+        console.log('[BOTTLENECK] Raw historyData:', historyData);
+
+        if (!reportData) {
+            console.error('[BOTTLENECK] No reportData received!');
+            updateBottleneckPanel(null);
+            return;
+        }
+
+        if (!reportData.networks) {
+            console.error('[BOTTLENECK] reportData.networks is missing! Available keys:', Object.keys(reportData));
+            updateBottleneckPanel(null);
+            return;
+        }
+
+        console.log('[BOTTLENECK] Network count:', reportData.networks.length);
+
+        // Extract data for bottleneck analysis from network scan report
+        const channelCounts = Array(13).fill(0);
+        const clientCounts = [];
+        const rssiValues = [];
+        const ssidData = new Map(); // Track SSIDs for better analysis
+
+        reportData.networks.forEach((network, idx) => {
+            // Handle both formats: clients can be an array of client objects, or stations can be a number
+            const clientCount = Array.isArray(network.clients)
+                ? network.clients.length
+                : (network.stations || 0);
+
+            console.log(`[BOTTLENECK] Network ${idx}:`, {
+                ssid: network.ssid,
+                channel: network.channel,
+                clientsRaw: network.clients,
+                stationsRaw: network.stations,
+                clientCount: clientCount,
+                rssi: network.rssi
+            });
+
+            if (network.channel >= 1 && network.channel <= 13) {
+                channelCounts[network.channel - 1]++;
+            }
+
+            clientCounts.push(clientCount);
+            rssiValues.push(network.rssi || 0);
+
+            // Track SSID data for capacity analysis
+            if (network.ssid) {
+                const existing = ssidData.get(network.ssid) || { count: 0, clients: 0, rssi: [] };
+                existing.count++;
+                existing.clients += clientCount;
+                existing.rssi.push(network.rssi || 0);
+                ssidData.set(network.ssid, existing);
+            }
+        });
+
+        console.log('[BOTTLENECK] Extracted data:', {
+            channelCounts,
+            clientCounts,
+            rssiValues,
+            ssidData: Array.from(ssidData.entries())
+        });
+
+        // Calculate bottlenecks with enhanced data
+        console.log('[BOTTLENECK] Calculating channel bottleneck...');
+        const channelBottleneck = bottleneckDetector.calculateChannelBottleneck(channelCounts);
+        console.log('[BOTTLENECK] Channel result:', channelBottleneck);
+
+        console.log('[BOTTLENECK] Calculating capacity bottleneck...');
+        const capacityBottleneck = bottleneckDetector.calculateCapacityBottleneck(clientCounts, reportData.networks.length);
+        console.log('[BOTTLENECK] Capacity result:', capacityBottleneck);
+
+        console.log('[BOTTLENECK] Calculating signal bottleneck...');
+        const signalBottleneck = bottleneckDetector.calculateSignalBottleneck(rssiValues);
+        console.log('[BOTTLENECK] Signal result:', signalBottleneck);
+
+        console.log('[BOTTLENECK] Calculating timing bottleneck...');
+        const timingBottleneck = bottleneckDetector.calculateTimingBottleneck(historyData?.samples || []);
+        console.log('[BOTTLENECK] Timing result:', timingBottleneck);
+
+        const bottlenecks = {
+            channel: channelBottleneck,
+            capacity: capacityBottleneck,
+            signal: signalBottleneck,
+            timing: timingBottleneck
+        };
+
+        // Add SSID-specific analysis to capacity bottleneck
+        if (ssidData.size > 0) {
+            bottlenecks.capacity.ssidAnalysis = Array.from(ssidData.entries()).map(([ssid, data]) => ({
+                ssid,
+                apCount: data.count,
+                totalClients: data.clients,
+                avgRssi: data.rssi.reduce((a, b) => a + b, 0) / data.rssi.length,
+                avgClientsPerAP: data.clients / data.count
+            }));
+            console.log('[BOTTLENECK] Added SSID analysis:', bottlenecks.capacity.ssidAnalysis);
+        }
+
+        console.log('[BOTTLENECK] Getting overall score...');
+        const analysis = bottleneckDetector.getOverallBottleneckScore(bottlenecks);
+        console.log('[BOTTLENECK] Final analysis:', analysis);
+
+        updateBottleneckPanel(analysis);
+
+    } catch (error) {
+        console.error('[BOTTLENECK] Failed to load bottleneck analysis:', error);
+        console.error('[BOTTLENECK] Error stack:', error.stack);
+        updateBottleneckPanel(null);
+    }
+}
+
+function updateBottleneckPanel(analysis) {
+    console.log('[BOTTLENECK-UI] Updating panel with analysis:', analysis);
+
+    if (!analysis) {
+        console.warn('[BOTTLENECK-UI] No analysis data - showing error state');
+        // Show error state
+        $('#bottleneck-overall-score').querySelector('.score-value').textContent = '--';
+        $('#bottleneck-severity').textContent = 'Analysis Failed';
+        $('#bottleneck-summary').textContent = 'Unable to analyze network';
+        return;
+    }
+
+    // Update overall score - handle NaN values properly
+    const scoreCircle = $('#bottleneck-overall-score');
+    const overallScore = isNaN(analysis.overallScore) ? 0 : analysis.overallScore;
+
+    // If score is NaN/invalid, adjust severity to match the low visual (green circle)
+    const displaySeverity = isNaN(analysis.overallScore) ? 'low' : analysis.severity;
+
+    console.log('[BOTTLENECK-UI] Setting overall score:', overallScore, 'original:', analysis.overallScore);
+    console.log('[BOTTLENECK-UI] Severity adjusted from', analysis.severity, 'to', displaySeverity);
+
+    scoreCircle.querySelector('.score-value').textContent = overallScore;
+    scoreCircle.dataset.score = overallScore;
+
+    // Add severity class to the circle for border color
+    scoreCircle.className = `bottleneck-score-circle ${displaySeverity}`;
+
+    // Update severity text to match the circle color
+    const severityEl = $('#bottleneck-severity');
+    severityEl.textContent = displaySeverity.charAt(0).toUpperCase() + displaySeverity.slice(1) + ' Risk';
+    severityEl.className = `bottleneck-severity ${displaySeverity}`;
+
+    // Update summary
+    const primaryBottleneck = analysis.bottlenecks[analysis.primaryBottleneck];
+    console.log('[BOTTLENECK-UI] Primary bottleneck:', analysis.primaryBottleneck, primaryBottleneck);
+    $('#bottleneck-summary').textContent = `Primary issue: ${analysis.primaryBottleneck} (${primaryBottleneck.detail})`;
+
+    // Update individual metrics
+    console.log('[BOTTLENECK-UI] Updating individual metrics...');
+    updateBottleneckMetric('channel', analysis.bottlenecks.channel);
+    updateBottleneckMetric('capacity', analysis.bottlenecks.capacity);
+    updateBottleneckMetric('signal', analysis.bottlenecks.signal);
+    updateBottleneckMetric('timing', analysis.bottlenecks.timing);
+
+    // Update recommendations
+    console.log('[BOTTLENECK-UI] Updating recommendations:', analysis.recommendations);
+    updateRecommendations(analysis.recommendations);
+}
+
+function updateBottleneckMetric(type, data) {
+    console.log(`[BOTTLENECK-METRIC] Updating ${type} metric:`, data);
+
+    const scoreEl = $(`#${type}-score`);
+    const fillEl = $(`#${type}-fill`);
+    const detailEl = $(`#${type}-detail`);
+
+    console.log(`[BOTTLENECK-METRIC] ${type} elements:`, {
+        scoreEl: !!scoreEl,
+        fillEl: !!fillEl,
+        detailEl: !!detailEl
+    });
+
+    if (scoreEl) {
+        const score = isNaN(data.score) ? 0 : data.score;
+        console.log(`[BOTTLENECK-METRIC] ${type} setting score:`, score);
+        scoreEl.textContent = score;
+    } else {
+        console.warn(`[BOTTLENECK-METRIC] ${type} scoreEl not found!`);
+    }
+
+    if (fillEl) {
+        const score = isNaN(data.score) ? 0 : data.score;
+        console.log(`[BOTTLENECK-METRIC] ${type} setting fill width: ${score}%, severity: ${data.severity}`);
+        fillEl.style.width = `${score}%`;
+        fillEl.className = `metric-fill ${data.severity}`;
+    } else {
+        console.warn(`[BOTTLENECK-METRIC] ${type} fillEl not found!`);
+    }
+
+    if (detailEl) {
+        console.log(`[BOTTLENECK-METRIC] ${type} setting detail:`, data.detail);
+        detailEl.textContent = data.detail;
+    } else {
+        console.warn(`[BOTTLENECK-METRIC] ${type} detailEl not found!`);
+    }
+}
+
+function updateRecommendations(recommendations) {
+    const container = $('#recommendations-list');
+    if (!container) return;
+    
+    if (!recommendations || recommendations.length === 0) {
+        container.innerHTML = '<div class="muted" style="font-size:11px;">No recommendations available</div>';
+        return;
+    }
+    
+    container.innerHTML = recommendations.map(rec => `
+        <div class="recommendation-item ${rec.priority}">
+            <div>
+                <div class="recommendation-priority ${rec.priority}">${rec.priority}</div>
+                <div class="recommendation-title">${rec.title}</div>
+                <div class="recommendation-desc">${rec.description}</div>
+                <div class="recommendation-impact">Impact: ${rec.impact}</div>
+            </div>
+        </div>
+    `).join('');
+}
+
+function toggleBottleneckDetails() {
+    const breakdown = $('#bottleneck-breakdown');
+    const isVisible = breakdown.style.display !== 'none';
+    breakdown.style.display = isVisible ? 'none' : 'block';
+    
+    // Update button text
+    event.target.textContent = isVisible ? 'Details' : 'Hide Details';
+}

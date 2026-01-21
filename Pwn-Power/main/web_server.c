@@ -25,6 +25,7 @@
 #include "esp_event.h"
 #include "driver/gpio.h"
 #include "monitor_uptime.h"
+#include "json_utils.h"
 #include <stddef.h>
 #include <time.h>
 
@@ -170,37 +171,120 @@ static void hs_task(void *arg) {
 
 static esp_err_t index_handler(httpd_req_t *req) {
     update_last_request_time();
+
+    ESP_LOGI(TAG, "=== ROOT REQUEST START ===");
+    ESP_LOGI(TAG, "Free heap: %lu bytes", (unsigned long)esp_get_free_heap_size());
+    ESP_LOGI(TAG, "Min free heap ever: %lu bytes", (unsigned long)esp_get_minimum_free_heap_size());
+
+    // Check for If-None-Match header (ETag-based caching)
+    char etag_buf[64];
+    size_t buf_len = sizeof(etag_buf);
+    if (httpd_req_get_hdr_value_str(req, "If-None-Match", etag_buf, buf_len) == ESP_OK) {
+        // Client has cached version, check if it matches
+        if (strcmp(etag_buf, "\"pwn-v1\"") == 0) {
+            ESP_LOGI(TAG, "Client has valid cached UI, sending 304 Not Modified");
+            httpd_resp_set_status(req, "304 Not Modified");
+            httpd_resp_send(req, NULL, 0);
+            return ESP_OK;
+        }
+    }
+
+    ESP_LOGI(TAG, "Sending fresh UI (%u bytes)", (unsigned int)WEB_UI_GZ_SIZE);
+
+    // Set caching headers to reduce repeated loads
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
-    httpd_resp_send(req, (const char *)WEB_UI_GZ, WEB_UI_GZ_SIZE);
-    return ESP_OK;
+    httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=3600");  // Cache for 1 hour
+    httpd_resp_set_hdr(req, "ETag", "\"pwn-v1\"");  // Version tag for cache validation
+
+    // Use regular send - it's more memory efficient than chunking!
+    // httpd_resp_send reads directly from flash and only buffers what fits in TCP window
+    esp_err_t ret = httpd_resp_send(req, WEB_UI_GZ, WEB_UI_GZ_SIZE);
+
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "UI sent successfully");
+    } else {
+        ESP_LOGE(TAG, "Failed to send UI: %s", esp_err_to_name(ret));
+    }
+
+    ESP_LOGI(TAG, "Free heap after send: %lu bytes", (unsigned long)esp_get_free_heap_size());
+    ESP_LOGI(TAG, "=== ROOT REQUEST END ===");
+
+    return ret;
 }
 // Handler for scanning Wi-Fi networks
+static uint32_t last_scan_request_time = 0;
+static uint32_t scan_request_count = 0;
+static char last_client_ip[INET6_ADDRSTRLEN] = {0};
+
 static esp_err_t wifi_scan_handler(httpd_req_t *req) {
     update_last_request_time();
-    ESP_LOGI(TAG, "Received Wi-Fi scan request");
+
+    ESP_LOGI(TAG, "=== /scan REQUEST ===");
+    ESP_LOGI(TAG, "Free heap: %lu bytes", (unsigned long)esp_get_free_heap_size());
+
+    // Get timing information
+    uint32_t current_time = (uint32_t)(esp_timer_get_time() / 1000); // milliseconds
+    uint32_t time_since_last = current_time - last_scan_request_time;
+    scan_request_count++;
+
+    // Get connection info
+    int sockfd = httpd_req_to_sockfd(req);
+    struct sockaddr_in6 addr;
+    socklen_t addr_size = sizeof(addr);
+    char addr_str[INET6_ADDRSTRLEN] = "unknown";
+    bool same_client = false;
+
+    if (getpeername(sockfd, (struct sockaddr *)&addr, &addr_size) == 0) {
+        inet_ntop(AF_INET6, &addr.sin6_addr, addr_str, sizeof(addr_str));
+        same_client = (last_client_ip[0] != '\0' && strcmp(addr_str, last_client_ip) == 0);
+        strncpy(last_client_ip, addr_str, sizeof(last_client_ip) - 1);
+        last_client_ip[sizeof(last_client_ip) - 1] = '\0';
+
+        ESP_LOGI(TAG, "=== SCAN REQUEST #%lu === from %s%s, fd=%d, time_since_last=%lums",
+                 (unsigned long)scan_request_count, addr_str,
+                 same_client ? " (SAME CLIENT)" : " (DIFFERENT CLIENT)",
+                 sockfd, (unsigned long)time_since_last);
+    } else {
+        ESP_LOGI(TAG, "=== SCAN REQUEST #%lu === fd=%d, time_since_last=%lums",
+                 (unsigned long)scan_request_count, sockfd, (unsigned long)time_since_last);
+    }
+
+    last_scan_request_time = current_time;
 
     // check if deauth is running
     if(deauth_task_handle != NULL) {
+        ESP_LOGW(TAG, "Cannot scan during active attack, returning 503");
         httpd_resp_send_err(req, HTTPD_503_SERVICE_UNAVAILABLE, "Cannot scan during active attack");
         return ESP_FAIL;
     }
 
     const char *cached_results = wifi_scan_get_results();
-    if(cached_results && strlen(cached_results) > 2) {
+    size_t cached_len = cached_results ? strlen(cached_results) : 0;
+
+    if(!wifi_scan_is_complete()) {
+        ESP_LOGW(TAG, "Scan already in progress, returning cached results (scan_in_progress=true)");
         httpd_resp_set_type(req, "application/json");
-        httpd_resp_send(req, cached_results, strlen(cached_results));
+        if(cached_len > 2) {
+            httpd_resp_send(req, cached_results, cached_len);
+        } else {
+            httpd_resp_sendstr(req, "{\"rows\":[]}");
+        }
         return ESP_OK;
     }
 
-    // no cached results, start initial scan
-    if(wifi_scan_is_complete()) {
-        wifi_scan();
-    }
+    ESP_LOGI(TAG, "No active scan detected (scan_in_progress=false), STARTING NEW SCAN NOW");
+    wifi_scan();
 
-    // return empty json while scan runs
+    const char *latest_results = wifi_scan_get_results();
+    size_t latest_len = latest_results ? strlen(latest_results) : 0;
+
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"rows\":[]}");
+    if(latest_len > 2) {
+        httpd_resp_send(req, latest_results, latest_len);
+    } else {
+        httpd_resp_sendstr(req, "{\"rows\":[]}");
+    }
     return ESP_OK;
 }
 
@@ -427,19 +511,55 @@ static esp_err_t station_scan_handler(httpd_req_t *req) {
 
 // New handler that ONLY returns cached results without triggering a scan
 static esp_err_t cached_scan_handler(httpd_req_t *req) {
-    ESP_LOGI(TAG, "Received cached-only scan request");
-    
-    // Return cached results if we have them
+    ESP_LOGI(TAG, "=== /cached-scan REQUEST ===");
+    ESP_LOGI(TAG, "Free heap: %lu bytes", (unsigned long)esp_get_free_heap_size());
+
+    // Get cached results with metadata
     const char *cached_results = wifi_scan_get_results();
-    if(cached_results && strlen(cached_results) > 2) { // Check if we have valid JSON (more than just {})
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_send(req, cached_results, strlen(cached_results));
+    uint32_t timestamp = wifi_scan_get_results_timestamp();
+    bool truncated = wifi_scan_was_truncated();
+    bool in_progress = wifi_scan_is_in_progress();
+
+    httpd_resp_set_type(req, "application/json");
+
+    // Build metadata string on stack (no malloc!)
+    char metadata[128];
+    snprintf(metadata, sizeof(metadata),
+            ",\"timestamp\":%lu,\"truncated\":%s,\"scan_in_progress\":%s}",
+            (unsigned long)timestamp,
+            truncated ? "true" : "false",
+            in_progress ? "true" : "false");
+
+    if(cached_results && strlen(cached_results) > 2) {
+        size_t cached_len = strlen(cached_results);
+
+        // Use chunked sending - zero heap allocation!
+        if (cached_results[cached_len - 1] == '}') {
+            // Send everything except closing brace
+            if (httpd_resp_send_chunk(req, cached_results, cached_len - 1) != ESP_OK) {
+                return ESP_FAIL;
+            }
+            // Send metadata with closing brace
+            if (httpd_resp_send_chunk(req, metadata, strlen(metadata)) != ESP_OK) {
+                return ESP_FAIL;
+            }
+            // End chunked response
+            httpd_resp_send_chunk(req, NULL, 0);
+            return ESP_OK;
+        }
+
+        // Fallback: just send cached results as-is
+        httpd_resp_send(req, cached_results, cached_len);
         return ESP_OK;
     }
-    
-    // Return empty JSON if we have no cached results
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"rows\":[]}");
+
+    // Return empty JSON with metadata if we have no cached results
+    char empty_response[128];
+    snprintf(empty_response, sizeof(empty_response),
+            "{\"rows\":[],\"timestamp\":%lu,\"truncated\":false,\"scan_in_progress\":%s}",
+            (unsigned long)timestamp,
+            in_progress ? "true" : "false");
+    httpd_resp_sendstr(req, empty_response);
     return ESP_OK;
 }
 
@@ -528,11 +648,7 @@ static esp_err_t handshake_handler(httpd_req_t *req) {
     ESP_LOGI(TAG, "Handshake capture start: bssid=%s, channel=%d, duration=%d, sta_count=%d", mac_json->valuestring, channel, duration, sta_count);
     cJSON *res = cJSON_CreateObject();
     cJSON_AddStringToObject(res, "status", "started");
-    char *out = cJSON_PrintUnformatted(res);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, out);
-    cJSON_free(out);
-    cJSON_Delete(res);
+    json_send_response(req, res);
     ESP_LOGI(TAG, "Handshake response sent, starting capture task");
     cJSON_Delete(root);
     xTaskCreate(hs_task, "hs_task", 4096, &hs_args, 5, &hs_task_handle);
@@ -571,17 +687,17 @@ static esp_err_t ota_upload_handler(httpd_req_t *req) {
 	esp_ota_handle_t handle = 0;
 	const esp_partition_t *part = NULL;
 	if (ota_begin(req->content_len, &handle, &part) != ESP_OK) {
-		// begin failed, probably no ota partition
 		ESP_LOGE(TAG, "ota begin failed");
 		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA begin failed (no OTA partition?)");
 		return ESP_FAIL;
 	}
 
+	esp_err_t status = ESP_FAIL;
 	char *buf = malloc(4096);
 	if (!buf) {
 		ESP_LOGE(TAG, "malloc failed");
 		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "malloc failed");
-		return ESP_FAIL;
+		goto ota_upload_cleanup;
 	}
 
 	size_t remaining = req->content_len;
@@ -590,35 +706,30 @@ static esp_err_t ota_upload_handler(httpd_req_t *req) {
 		int r = httpd_req_recv(req, buf, to_read);
 		if (r <= 0) {
 			ESP_LOGE(TAG, "recv failed r=%d", r);
-			free(buf);
 			httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Receive failed");
-			return ESP_FAIL;
+			goto ota_upload_cleanup;
 		}
 		if (ota_write(handle, buf, (size_t)r) != ESP_OK) {
 			ESP_LOGE(TAG, "ota write failed");
-			free(buf);
 			httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA write failed");
-			return ESP_FAIL;
+			goto ota_upload_cleanup;
 		}
 		remaining -= (size_t)r;
 	}
 
 	if (ota_finish_and_set_boot(handle, part) != ESP_OK) {
-		free(buf);
 		ESP_LOGE(TAG, "ota finish failed");
 		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA finish failed");
-		return ESP_FAIL;
+		goto ota_upload_cleanup;
 	}
 
 	ESP_LOGI(TAG, "OTA upload complete, erasing data and rebooting soon");
 	
-	// Erase scan data partition for clean update
 	esp_err_t scan_clear_err = scan_storage_clear();
 	if (scan_clear_err != ESP_OK) {
 		ESP_LOGE(TAG, "Failed to clear scan data: %s", esp_err_to_name(scan_clear_err));
 	}
 	
-	// Erase NVS partition for clean configuration
 	esp_err_t nvs_err = nvs_flash_erase();
 	if (nvs_err != ESP_OK) {
 		ESP_LOGE(TAG, "Failed to erase NVS: %s", esp_err_to_name(nvs_err));
@@ -626,7 +737,15 @@ static esp_err_t ota_upload_handler(httpd_req_t *req) {
 	
 	httpd_resp_set_type(req, "application/json");
 	httpd_resp_sendstr(req, "{\"status\":\"ok\",\"message\":\"Firmware uploaded. Data erased. Rebooting in 3 seconds...\"}");
-	free(buf);
+	status = ESP_OK;
+
+ota_upload_cleanup:
+	if (buf) {
+		free(buf);
+	}
+	if (status != ESP_OK) {
+		return ESP_FAIL;
+	}
 	ota_schedule_reboot_ms(3000);
 	return ESP_OK;
 }
@@ -706,13 +825,11 @@ static esp_err_t ota_fetch_handler(httpd_req_t *req) {
 	
 	ESP_LOGI(TAG, "OTA fetch complete, erasing data and rebooting soon");
 	
-	// Erase scan data partition for clean update
 	esp_err_t scan_clear_err = scan_storage_clear();
 	if (scan_clear_err != ESP_OK) {
 		ESP_LOGE(TAG, "Failed to clear scan data: %s", esp_err_to_name(scan_clear_err));
 	}
 	
-	// Erase NVS partition for clean configuration
 	esp_err_t nvs_err = nvs_flash_erase();
 	if (nvs_err != ESP_OK) {
 		ESP_LOGE(TAG, "Failed to erase NVS: %s", esp_err_to_name(nvs_err));
@@ -742,6 +859,32 @@ httpd_uri_t uri_cached_scan = {
     .uri = "/cached-scan",
     .method = HTTP_GET,
     .handler = cached_scan_handler,
+    .user_ctx = NULL
+};
+
+static esp_err_t wifi_scan_status_handler(httpd_req_t *req) {
+    ESP_LOGI(TAG, "Received scan status request");
+
+    bool in_progress = wifi_scan_is_in_progress();
+    uint32_t timestamp = wifi_scan_get_results_timestamp();
+    bool truncated = wifi_scan_was_truncated();
+
+    char response[200];
+    snprintf(response, sizeof(response),
+            "{\"scan_in_progress\":%s,\"last_scan_timestamp\":%lu,\"truncated\":%s}",
+            in_progress ? "true" : "false",
+            (unsigned long)timestamp,
+            truncated ? "true" : "false");
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, response);
+    return ESP_OK;
+}
+
+httpd_uri_t uri_wifi_scan_status = {
+    .uri = "/wifi/scan-status",
+    .method = HTTP_GET,
+    .handler = wifi_scan_status_handler,
     .user_ctx = NULL
 };
 
@@ -1147,7 +1290,8 @@ static esp_err_t scan_report_handler(httpd_req_t *req) {
         if (httpd_resp_send_chunk(req, ",", 1) != ESP_OK) return ESP_FAIL;
     }
     
-scan_record_t *latest = malloc(sizeof(scan_record_t));
+    // Use shared buffer instead of malloc
+    scan_record_t *latest = &shared_scan_buffer;
     
     if (latest && scan_storage_get_latest(latest) == ESP_OK) {
         uint8_t channel_usage[14] = {0};
@@ -1163,7 +1307,7 @@ scan_record_t *latest = malloc(sizeof(scan_record_t));
         
         // Send channel analysis
         len = snprintf(chunk, sizeof(chunk), "\"channel_analysis\":{\"channels\":[");
-        if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) { free(latest); return ESP_FAIL; }
+        if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) { return ESP_FAIL; }
         
         uint8_t most_congested = 0, max_aps = 0;
         bool first_ch = true;
@@ -1171,7 +1315,7 @@ scan_record_t *latest = malloc(sizeof(scan_record_t));
             if (channel_usage[i] > 0) {
                 len = snprintf(chunk, sizeof(chunk), "%s{\"channel\":%d,\"ap_count\":%d}",
                     first_ch ? "" : ",", i + 1, channel_usage[i]);
-                if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) { free(latest); return ESP_FAIL; }
+                if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) { return ESP_FAIL; }
                 first_ch = false;
                 if (channel_usage[i] > max_aps) { max_aps = channel_usage[i]; most_congested = i + 1; }
             }
@@ -1187,7 +1331,7 @@ scan_record_t *latest = malloc(sizeof(scan_record_t));
             most_congested, max_aps, security_counts[0], security_counts[1], 
             security_counts[2] + security_counts[3], security_counts[4], security_counts[5], open_percent,
             latest->header.ap_count, total_stations, avg_stations);
-        if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) { free(latest); return ESP_FAIL; }
+        if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) { return ESP_FAIL; }
         
         // Stream networks
         for (uint8_t i = 0; i < latest->header.ap_count; i++) {
@@ -1201,7 +1345,7 @@ scan_record_t *latest = malloc(sizeof(scan_record_t));
                 case 5: auth = "WPA2/WPA3"; break;
             }
             
-            char ap_vendor[48] = "Unknown";
+            char ap_vendor[64] = "Unknown";
             ouis_lookup_vendor(ap->bssid, ap_vendor, sizeof(ap_vendor));
             
             len = snprintf(chunk, sizeof(chunk),
@@ -1209,11 +1353,11 @@ scan_record_t *latest = malloc(sizeof(scan_record_t));
                 "\"rssi\":%d,\"stations\":%d,\"last_seen\":%lu,\"security\":\"%s\",\"vendor\":\"%s\",\"clients\":[",
                 i > 0 ? "," : "", ap->bssid[0], ap->bssid[1], ap->bssid[2], ap->bssid[3], ap->bssid[4], ap->bssid[5],
                 ap->ssid, ap->channel, ap->rssi, ap->station_count, (unsigned long)ap->last_seen, auth, ap_vendor);
-            if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) { free(latest); return ESP_FAIL; }
+            if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) { return ESP_FAIL; }
             
             // Stream clients
             for (uint8_t s = 0; s < ap->station_count && s < MAX_STATIONS_PER_AP; s++) {
-                char sta_vendor[48] = "Unknown";
+                char sta_vendor[64] = "Unknown";
                 ouis_lookup_vendor(ap->stations[s].mac, sta_vendor, sizeof(sta_vendor));
                 
                 len = snprintf(chunk, sizeof(chunk),
@@ -1221,26 +1365,24 @@ scan_record_t *latest = malloc(sizeof(scan_record_t));
                     s > 0 ? "," : "", ap->stations[s].mac[0], ap->stations[s].mac[1], ap->stations[s].mac[2],
                     ap->stations[s].mac[3], ap->stations[s].mac[4], ap->stations[s].mac[5],
                     ap->stations[s].rssi, (unsigned long)ap->stations[s].last_seen, sta_vendor);
-                if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) { free(latest); return ESP_FAIL; }
+                if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) { return ESP_FAIL; }
             }
             
-            if (httpd_resp_send_chunk(req, "]}", 2) != ESP_OK) { free(latest); return ESP_FAIL; }
+            if (httpd_resp_send_chunk(req, "]}", 2) != ESP_OK) { return ESP_FAIL; }
         }
         
-        if (httpd_resp_send_chunk(req, "]}", 2) != ESP_OK) { free(latest); return ESP_FAIL; }
+        if (httpd_resp_send_chunk(req, "]}", 2) != ESP_OK) { return ESP_FAIL; }
     } else {
         // No scan data - send empty defaults
         const char *empty = "\"channel_analysis\":{\"channels\":[],\"most_congested\":0,\"max_ap_count\":0},"
             "\"security_analysis\":{\"open\":0,\"wep\":0,\"wpa2\":0,\"wpa3\":0,\"wpa2_wpa3\":0,\"open_percent\":0},"
             "\"network_activity\":{\"current_aps\":0,\"total_stations\":0,\"avg_stations_per_ap\":0},\"networks\":[]}";
         if (httpd_resp_send_chunk(req, empty, strlen(empty)) != ESP_OK) { 
-            if (latest) free(latest);
-            return ESP_FAIL;
+            if (latest)             return ESP_FAIL;
         }
     }
     
-    if (latest) free(latest);
-    
+    if (latest)     
     // End chunked response
     if (httpd_resp_send_chunk(req, NULL, 0) != ESP_OK) return ESP_FAIL;
     
@@ -1662,6 +1804,8 @@ static esp_err_t webhook_config_get_handler(httpd_req_t *req) {
     cJSON_AddBoolToObject(root, "home_departure_alert", config.home_departure_alert);
     cJSON_AddBoolToObject(root, "home_arrival_alert", config.home_arrival_alert);
     cJSON_AddBoolToObject(root, "new_device_alert", config.new_device_alert);
+    cJSON_AddBoolToObject(root, "deauth_alert", config.deauth_alert);
+    cJSON_AddBoolToObject(root, "handshake_alert", config.handshake_alert);
     cJSON_AddBoolToObject(root, "all_events", config.all_events);
     cJSON_AddNumberToObject(root, "send_cursor", webhook_get_send_cursor());
     cJSON_AddNumberToObject(root, "total_events", scan_storage_get_event_count());
@@ -1723,6 +1867,16 @@ static esp_err_t webhook_config_set_handler(httpd_req_t *req) {
     cJSON *new_device_json = cJSON_GetObjectItem(root, "new_device_alert");
     if (new_device_json && cJSON_IsBool(new_device_json)) {
         config.new_device_alert = cJSON_IsTrue(new_device_json);
+    }
+    
+    cJSON *deauth_alert_json = cJSON_GetObjectItem(root, "deauth_alert");
+    if (deauth_alert_json && cJSON_IsBool(deauth_alert_json)) {
+        config.deauth_alert = cJSON_IsTrue(deauth_alert_json);
+    }
+    
+    cJSON *handshake_alert_json = cJSON_GetObjectItem(root, "handshake_alert");
+    if (handshake_alert_json && cJSON_IsBool(handshake_alert_json)) {
+        config.handshake_alert = cJSON_IsTrue(handshake_alert_json);
     }
     
     cJSON *all_events_json = cJSON_GetObjectItem(root, "all_events");
@@ -1862,15 +2016,43 @@ static esp_err_t home_ssids_remove_handler(httpd_req_t *req) {
 
 // Start the web server and register URI handlers
 httpd_handle_t start_webserver(void) {
+    ESP_LOGI(TAG, "=== WEB SERVER INITIALIZATION ===");
+    ESP_LOGI(TAG, "Free heap before start: %lu bytes", (unsigned long)esp_get_free_heap_size());
+    ESP_LOGI(TAG, "Min free heap ever: %lu bytes", (unsigned long)esp_get_minimum_free_heap_size());
+
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     /* increase available URI handler slots to allow additional routes (OTA, fetch, etc) */
     config.max_uri_handlers = 48;
+
+    // Memory optimization: reduce max sockets and enable aggressive purging
+    // LWIP_MAX_SOCKETS=6, httpd uses 3 internal, so max_open_sockets can be 3
+    config.max_open_sockets = 3;    // LWIP limit: 6 total - 3 internal = 3 available
+    config.lru_purge_enable = true; // Aggressively close idle connections
+
+    // Increase timeouts for large file transfers
+    config.send_wait_timeout = 20;  // Increase from 5 to 20 seconds
+    config.recv_wait_timeout = 10;  // Increase from 5 to 10 seconds
+
+    // Log configuration details
+    ESP_LOGI(TAG, "Config: max_uri_handlers=%d, task_priority=%d, stack_size=%d",
+             config.max_uri_handlers, config.task_priority, config.stack_size);
+    ESP_LOGI(TAG, "Config: server_port=%d, ctrl_port=%d, max_open_sockets=%d",
+             config.server_port, config.ctrl_port, config.max_open_sockets);
+    ESP_LOGI(TAG, "Config: max_resp_headers=%d, backlog_conn=%d, lru_purge_enable=%d",
+             config.max_resp_headers, config.backlog_conn, config.lru_purge_enable);
+    ESP_LOGI(TAG, "Config: recv_wait_timeout=%d, send_wait_timeout=%d",
+             config.recv_wait_timeout, config.send_wait_timeout);
+
     httpd_handle_t server = NULL;
 
+    ESP_LOGI(TAG, "Starting HTTP server...");
     if (httpd_start(&server, &config) == ESP_OK) {
+        ESP_LOGI(TAG, "HTTP server started successfully");
+        ESP_LOGI(TAG, "Free heap after httpd_start: %lu bytes", (unsigned long)esp_get_free_heap_size());
         httpd_register_uri_handler(server, &uri_get);
         httpd_register_uri_handler(server, &uri_scan);
         httpd_register_uri_handler(server, &uri_cached_scan);
+        httpd_register_uri_handler(server, &uri_wifi_scan_status);
         httpd_register_uri_handler(server, &uri_attack);
         httpd_register_uri_handler(server, &uri_attack_alt);
         httpd_register_uri_handler(server, &uri_stations);
@@ -1959,10 +2141,14 @@ httpd_handle_t start_webserver(void) {
         httpd_register_uri_handler(server, &uri_home_ssids_add);
         httpd_register_uri_handler(server, &uri_home_ssids_remove);
         httpd_register_uri_handler(server, &uri_home_ssids_refresh);
-        
-        ESP_LOGI(TAG, "Web Server started");
+
+        ESP_LOGI(TAG, "All URI handlers registered successfully");
+        ESP_LOGI(TAG, "Free heap after registration: %lu bytes", (unsigned long)esp_get_free_heap_size());
+        ESP_LOGI(TAG, "Web Server started on port 80");
+        ESP_LOGI(TAG, "=== WEB SERVER READY ===");
     } else {
-        ESP_LOGE(TAG, "Failed to start web server");
+        ESP_LOGE(TAG, "Failed to start web server!");
+        ESP_LOGE(TAG, "Free heap at failure: %lu bytes", (unsigned long)esp_get_free_heap_size());
     }
 
     return server;

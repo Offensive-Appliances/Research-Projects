@@ -23,7 +23,6 @@
 - Changed to use custom partition table for extra flash storage
 - Separated web interface into seperate js, css and html files
 - Revised web interface styling
-- Automatically populate WiFi Recon and Attack table in the background
 - Increased AP storage limit from 16 to 32 networks per scan
 
 

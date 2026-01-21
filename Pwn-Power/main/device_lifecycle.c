@@ -278,3 +278,176 @@ esp_err_t device_lifecycle_restore_device(const uint8_t *mac) {
     xSemaphoreGive(lifecycle_mutex);
     return ESP_OK;
 }
+
+void device_lifecycle_generate_deauth_event(const uint8_t *mac, uint32_t deauth_count) {
+    webhook_config_t webhook_config;
+    if (webhook_get_config(&webhook_config) != ESP_OK || !webhook_config.enabled || !webhook_config.deauth_alert) {
+        return;
+    }
+    
+    device_event_t event;
+    memset(&event, 0, sizeof(event));
+    
+    // set timestamp
+    event.uptime_sec = get_uptime_sec();
+    if (pwnpower_time_is_synced()) {
+        time_t now;
+        time(&now);
+        event.epoch_ts = (uint32_t)now;
+        event.time_valid = 1;
+    } else {
+        event.epoch_ts = 0;
+        event.time_valid = 0;
+    }
+    
+    // set event data
+    memcpy(event.mac, mac, 6);
+    event.event_type = DEVICE_EVENT_DEAUTH_DETECTED;
+    event.rssi = 0; // deauth frames don't have RSSI context
+    
+    // use default trust score for security events
+    event.trust_score = 50;
+    event.tracked = 0;
+    
+    // look up device flags from presence data
+    device_presence_t presence;
+    if (scan_storage_get_device_presence(mac, &presence) == ESP_OK) {
+        event.device_flags = presence.flags;
+        strncpy(event.vendor, presence.vendor, sizeof(event.vendor) - 1);
+    } else {
+        event.device_flags = 0;
+        strncpy(event.vendor, "Unknown", sizeof(event.vendor) - 1);
+    }
+    
+    // append to storage
+    esp_err_t err = scan_storage_append_device_event(&event);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to append deauth event: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "Deauth event generated for %02X:%02X:%02X:%02X:%02X:%02X (count=%lu)",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], (unsigned long)deauth_count);
+    }
+}
+
+void device_lifecycle_generate_batched_deauth_alert(uint32_t total_deauth_count, uint32_t scan_duration_sec) {
+    static uint32_t last_deauth_count = 0;
+    static uint32_t last_event_time = 0;
+
+    webhook_config_t webhook_config;
+    if (webhook_get_config(&webhook_config) != ESP_OK || !webhook_config.enabled || !webhook_config.deauth_alert) {
+        return;
+    }
+
+    if (total_deauth_count == 0) {
+        return; // Don't send alert for zero deauth frames
+    }
+
+    // Deduplication: prevent duplicate events within 60 seconds with same count
+    uint32_t current_time = get_uptime_sec();
+    if (last_deauth_count == total_deauth_count &&
+        (current_time - last_event_time) < 60) {
+        ESP_LOGW(TAG, "Skipping duplicate deauth alert (count=%lu, time_delta=%lu sec)",
+                 (unsigned long)total_deauth_count, (unsigned long)(current_time - last_event_time));
+        return;
+    }
+
+    last_deauth_count = total_deauth_count;
+    last_event_time = current_time;
+    
+    device_event_t event;
+    memset(&event, 0, sizeof(event));
+    
+    // set timestamp
+    event.uptime_sec = get_uptime_sec();
+    if (pwnpower_time_is_synced()) {
+        time_t now;
+        time(&now);
+        event.epoch_ts = (uint32_t)now;
+        event.time_valid = 1;
+    } else {
+        event.epoch_ts = 0;
+        event.time_valid = 0;
+    }
+    
+    // set event data for batched alert
+    memset(event.mac, 0, 6); // Use zero MAC for batched events
+    event.event_type = DEVICE_EVENT_DEAUTH_DETECTED;
+    event.rssi = (int8_t)(total_deauth_count > 255 ? 255 : total_deauth_count); // Store count in RSSI field
+    
+    // use default trust score for security events
+    event.trust_score = 50;
+    event.tracked = 0;
+    event.device_flags = 0;
+    strncpy(event.vendor, "Security Monitor", sizeof(event.vendor) - 1);
+    
+    // Create custom event message for batched alert
+    char event_message[256];
+    snprintf(event_message, sizeof(event_message), 
+             "🚨 **Deauth Attack Detected**\n"
+             "**%lu** deauth frames detected in %lu seconds\n"
+             "This may indicate an active attack on the network",
+             (unsigned long)total_deauth_count, (unsigned long)scan_duration_sec);
+    
+    // append to storage with custom message
+    esp_err_t err = scan_storage_append_device_event(&event);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to append batched deauth event: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "Batched deauth alert generated: %lu frames in %lu seconds", 
+                 (unsigned long)total_deauth_count, (unsigned long)scan_duration_sec);
+    }
+}
+
+void device_lifecycle_generate_handshake_event(const uint8_t *bssid, const uint8_t *client_mac, int eapol_count) {
+    webhook_config_t webhook_config;
+    if (webhook_get_config(&webhook_config) != ESP_OK || !webhook_config.enabled || !webhook_config.handshake_alert) {
+        return;
+    }
+    
+    device_event_t event;
+    memset(&event, 0, sizeof(event));
+    
+    // set timestamp
+    event.uptime_sec = get_uptime_sec();
+    if (pwnpower_time_is_synced()) {
+        time_t now;
+        time(&now);
+        event.epoch_ts = (uint32_t)now;
+        event.time_valid = 1;
+    } else {
+        event.epoch_ts = 0;
+        event.time_valid = 0;
+    }
+    
+    // set event data - use client MAC if available, otherwise BSSID
+    if (client_mac && memcmp(client_mac, "\x00\x00\x00\x00\x00\x00", 6) != 0) {
+        memcpy(event.mac, client_mac, 6);
+    } else {
+        memcpy(event.mac, bssid, 6);
+    }
+    event.event_type = DEVICE_EVENT_HANDSHAKE_CAPTURED;
+    event.rssi = -70; // typical RSSI for handshake capture
+    
+    // use higher trust score for successful handshake captures
+    event.trust_score = 60;
+    event.tracked = 1;
+    
+    // look up device flags from presence data
+    device_presence_t presence;
+    if (scan_storage_get_device_presence(event.mac, &presence) == ESP_OK) {
+        event.device_flags = presence.flags;
+        strncpy(event.vendor, presence.vendor, sizeof(event.vendor) - 1);
+    } else {
+        event.device_flags = 0;
+        strncpy(event.vendor, "Unknown", sizeof(event.vendor) - 1);
+    }
+    
+    // append to storage
+    esp_err_t err = scan_storage_append_device_event(&event);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to append handshake event: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "Handshake event generated for %02X:%02X:%02X:%02X:%02X:%02X (EAPOL=%d)",
+                 event.mac[0], event.mac[1], event.mac[2], event.mac[3], event.mac[4], event.mac[5], eapol_count);
+    }
+}

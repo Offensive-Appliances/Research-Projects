@@ -12,7 +12,7 @@
 #include <string.h>
 
 #define TAG "IdleScanner"
-#define IDLE_TASK_STACK 8192
+#define IDLE_TASK_STACK 4096  // Reduced from 8192 to save memory
 #define CHECK_INTERVAL_MS 5000
 
 static TaskHandle_t idle_task_handle = NULL;

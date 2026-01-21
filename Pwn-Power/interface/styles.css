@@ -10,6 +10,10 @@
     --success: #0f0;
     --warning: #ff0;
     --danger: #f00;
+    --bottleneck-low: #22c55e;
+    --bottleneck-medium: #f59e0b;
+    --bottleneck-high: #ef4444;
+    --bottleneck-critical: #dc2626;
 }
 
 * { box-sizing: border-box; }
@@ -823,4 +827,181 @@ body.privacy-mode .pii-url:hover {
 
 body.privacy-mode .privacy-indicator {
     display: block;
+}
+
+/* Network Bottleneck Panel Styles */
+.bottleneck-score-circle {
+    width: 60px;
+    height: 60px;
+    border-radius: 50%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background: var(--bottleneck-low);
+    position: relative;
+    border: 3px solid rgba(255,255,255,0.1);
+    transition: all 0.3s ease;
+}
+
+/* Dynamic border colors based on severity class */
+.bottleneck-score-circle.low {
+    border-color: var(--bottleneck-low);
+}
+
+.bottleneck-score-circle.medium {
+    border-color: var(--bottleneck-medium);
+}
+
+.bottleneck-score-circle.high {
+    border-color: var(--bottleneck-high);
+}
+
+.bottleneck-score-circle.critical {
+    border-color: var(--bottleneck-critical);
+}
+
+.bottleneck-score-circle::before {
+    content: '';
+    position: absolute;
+    inset: 3px;
+    border-radius: 50%;
+    background: var(--bg-card);
+}
+
+.bottleneck-score-circle .score-value {
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--text-primary);
+    z-index: 1;
+}
+
+.bottleneck-score-circle .score-label {
+    font-size: 9px;
+    color: var(--text-muted);
+    z-index: 1;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.bottleneck-severity {
+    font-weight: 600;
+    font-size: 14px;
+    margin-bottom: 2px;
+}
+
+.bottleneck-severity.low { color: var(--bottleneck-low); }
+.bottleneck-severity.medium { color: var(--bottleneck-medium); }
+.bottleneck-severity.high { color: var(--bottleneck-high); }
+.bottleneck-severity.critical { color: var(--bottleneck-critical); }
+
+.bottleneck-metric {
+    background: rgba(255,255,255,0.02);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 12px;
+    transition: all 0.2s ease;
+}
+
+.bottleneck-metric:hover {
+    background: rgba(255,255,255,0.04);
+    border-color: rgba(255,255,255,0.12);
+}
+
+.metric-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 8px;
+}
+
+.metric-name {
+    font-weight: 500;
+    font-size: 12px;
+    flex: 1;
+}
+
+.metric-score {
+    font-weight: 700;
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+.metric-bar {
+    height: 4px;
+    background: rgba(255,255,255,0.1);
+    border-radius: 2px;
+    margin-bottom: 6px;
+    overflow: hidden;
+}
+
+.metric-fill {
+    height: 100%;
+    border-radius: 2px;
+    transition: width 0.3s ease;
+    background: var(--bottleneck-low);
+}
+
+.metric-fill.medium { background: var(--bottleneck-medium); }
+.metric-fill.high { background: var(--bottleneck-high); }
+.metric-fill.critical { background: var(--bottleneck-critical); }
+
+.metric-detail {
+    font-size: 10px;
+    color: var(--text-muted);
+    line-height: 1.3;
+}
+
+.bottleneck-recommendations {
+    background: rgba(255,255,255,0.02);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 12px;
+}
+
+.recommendation-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 8px;
+    background: rgba(255,255,255,0.02);
+    border-radius: 6px;
+    border-left: 3px solid var(--bottleneck-medium);
+    font-size: 11px;
+    line-height: 1.4;
+}
+
+.recommendation-item.high {
+    border-left-color: var(--bottleneck-high);
+}
+
+.recommendation-item.critical {
+    border-left-color: var(--bottleneck-critical);
+}
+
+.recommendation-priority {
+    font-weight: 600;
+    color: var(--bottleneck-medium);
+    text-transform: uppercase;
+    font-size: 9px;
+    margin-bottom: 2px;
+}
+
+.recommendation-priority.high { color: var(--bottleneck-high); }
+.recommendation-priority.critical { color: var(--bottleneck-critical); }
+
+.recommendation-title {
+    font-weight: 500;
+    margin-bottom: 2px;
+}
+
+.recommendation-desc {
+    color: var(--text-muted);
+    margin-bottom: 4px;
+}
+
+.recommendation-impact {
+    font-size: 10px;
+    color: var(--bottleneck-low);
+    font-weight: 500;
 }

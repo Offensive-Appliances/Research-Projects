@@ -19,8 +19,9 @@
 #define NVS_KEY_CONFIG "config"
 #define NVS_KEY_CURSOR "cursor"
 #define NVS_KEY_WRITE_IDX "write_idx"
-#define WEBHOOK_TASK_STACK 16384
+#define WEBHOOK_TASK_STACK 6144  // Reduced from 16384 to save memory
 #define CHECK_INTERVAL_MS 10000
+#define MAX_RETRY_ATTEMPTS 3
 
 static webhook_config_t current_config;
 static uint32_t send_cursor = 0;
@@ -30,6 +31,10 @@ static volatile bool task_running = false;
 static esp_http_client_handle_t webhook_client = NULL;
 static char webhook_client_url[WEBHOOK_URL_MAX_LEN] = {0};
 static const uint32_t max_events_per_cycle = 5;
+
+// Track retry attempts for the current failing event
+static uint32_t current_event_cursor = 0xFFFFFFFF;
+static uint8_t retry_count = 0;
 
 esp_err_t webhook_init(void) {
     // load config from nvs
@@ -45,6 +50,8 @@ esp_err_t webhook_init(void) {
             current_config.home_departure_alert = true;
             current_config.home_arrival_alert = false;
             current_config.new_device_alert = true;
+            current_config.deauth_alert = false;
+            current_config.handshake_alert = false;
             current_config.all_events = false;
         }
         
@@ -60,6 +67,8 @@ esp_err_t webhook_init(void) {
         current_config.home_departure_alert = true;
         current_config.home_arrival_alert = false;
         current_config.new_device_alert = true;
+        current_config.deauth_alert = false;
+        current_config.handshake_alert = false;
         current_config.all_events = false;
         send_cursor = 0;
         last_write_idx = 0;
@@ -85,10 +94,7 @@ static esp_http_client_handle_t get_webhook_client(void) {
         return NULL;
     }
 
-    if (webhook_client && strcmp(webhook_client_url, current_config.url) == 0) {
-        return webhook_client;
-    }
-
+    // Always cleanup and recreate client to avoid stale connections
     if (webhook_client) {
         esp_http_client_cleanup(webhook_client);
         webhook_client = NULL;
@@ -98,15 +104,18 @@ static esp_http_client_handle_t get_webhook_client(void) {
     esp_http_client_config_t config = {
         .url = current_config.url,
         .method = HTTP_METHOD_POST,
-        .timeout_ms = 10000,
+        .timeout_ms = 15000,
         .crt_bundle_attach = esp_crt_bundle_attach,
-        .keep_alive_enable = true,
+        .keep_alive_enable = false,  // Disable keep-alive to avoid connection reuse issues
+        .is_async = false,
     };
 
     webhook_client = esp_http_client_init(&config);
     if (webhook_client) {
         strncpy(webhook_client_url, current_config.url, sizeof(webhook_client_url) - 1);
         webhook_client_url[sizeof(webhook_client_url) - 1] = '\0';
+    } else {
+        ESP_LOGE(TAG, "Failed to initialize HTTP client");
     }
 
     return webhook_client;
@@ -201,13 +210,22 @@ static esp_err_t send_event(const device_event_t *event) {
     
     cJSON *root = cJSON_CreateObject();
     
-    const char *event_names[] = {"first_seen", "arrived", "left", "returned"};
-    const char *event_labels[] = {"First Seen", "Arrived", "Left", "Returned"};
+    const char *event_names[] = {"first_seen", "arrived", "left", "returned", "deauth_detected", "handshake_captured"};
+    const char *event_labels[] = {"First Seen", "Arrived", "Left", "Returned", "Deauth Detected", "Handshake Captured"};
     
     char mac_str[18];
-    snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
-             event->mac[0], event->mac[1], event->mac[2],
-             event->mac[3], event->mac[4], event->mac[5]);
+    bool is_batched_deauth = false;
+    
+    // Check if this is a batched deauth event (all zeros MAC)
+    if (event->event_type == DEVICE_EVENT_DEAUTH_DETECTED &&
+        memcmp(event->mac, "\x00\x00\x00\x00\x00\x00", 6) == 0) {
+        is_batched_deauth = true;
+        snprintf(mac_str, sizeof(mac_str), "Multiple Sources");
+    } else {
+        snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 event->mac[0], event->mac[1], event->mac[2],
+                 event->mac[3], event->mac[4], event->mac[5]);
+    }
     
     bool is_discord = (strstr(current_config.url, "discord.com/api/webhooks") != NULL) ||
                       (strstr(current_config.url, "discordapp.com/api/webhooks") != NULL);
@@ -259,6 +277,17 @@ static esp_err_t send_event(const device_event_t *event) {
         } else if (event->event_type == DEVICE_EVENT_RETURNED) {
             title = "Device Returned";
             color = 0x57F287;
+        } else if (event->event_type == DEVICE_EVENT_DEAUTH_DETECTED) {
+            if (is_batched_deauth) {
+                title = "Deauth Attack Detected";
+                color = 0xFF0000; // red for security alert
+            } else {
+                title = "Deauth Frame Detected";
+                color = 0xFEE75C; // yellow for security warning
+            }
+        } else if (event->event_type == DEVICE_EVENT_HANDSHAKE_CAPTURED) {
+            title = "Handshake Captured";
+            color = 0x57F287; // green for success
         }
 
         const char *event_label = event_labels[event->event_type];
@@ -270,8 +299,15 @@ static esp_err_t send_event(const device_event_t *event) {
         cJSON_AddNumberToObject(embed, "color", color);
 
         char description[192];
-        snprintf(description, sizeof(description), "**Event:** %s\n**MAC:** `%s`\n**Vendor:** %s",
-                 event_label, mac_str, vendor_clean);
+        if (is_batched_deauth) {
+            snprintf(description, sizeof(description), 
+                     "**Security Alert: Multiple Deauth Frames Detected**\n\n"
+                     "This may indicate an active deauthentication attack targeting your network.\n"
+                     "Consider checking for unauthorized access attempts.");
+        } else {
+            snprintf(description, sizeof(description), "**Event:** %s\n**MAC:** `%s`\n**Vendor:** %s",
+                     event_label, mac_str, vendor_clean);
+        }
         cJSON_AddStringToObject(embed, "description", description);
 
         cJSON *fields = cJSON_CreateArray();
@@ -291,9 +327,17 @@ static esp_err_t send_event(const device_event_t *event) {
         cJSON_AddItemToArray(fields, f_trust);
 
         char rssi_str[16];
-        snprintf(rssi_str, sizeof(rssi_str), "%d", (int)event->rssi);
+        if (is_batched_deauth) {
+            snprintf(rssi_str, sizeof(rssi_str), "%d frames", (int)event->rssi);
+        } else {
+            snprintf(rssi_str, sizeof(rssi_str), "%d dBm", (int)event->rssi);
+        }
         cJSON *f_rssi = cJSON_CreateObject();
-        cJSON_AddStringToObject(f_rssi, "name", "RSSI");
+        if (is_batched_deauth) {
+            cJSON_AddStringToObject(f_rssi, "name", "Frames Detected");
+        } else {
+            cJSON_AddStringToObject(f_rssi, "name", "RSSI");
+        }
         cJSON_AddStringToObject(f_rssi, "value", rssi_str);
         cJSON_AddBoolToObject(f_rssi, "inline", true);
         cJSON_AddItemToArray(fields, f_rssi);
@@ -401,15 +445,17 @@ static esp_err_t send_event(const device_event_t *event) {
     }
     
     free(json_str);
-    
+
+    // Always cleanup client after use to prevent state issues
+    reset_webhook_client();
+
     vTaskDelay(pdMS_TO_TICKS(100));
-    
+
     if (err == ESP_OK && status_code >= 200 && status_code < 300) {
         ESP_LOGI(TAG, "Webhook sent successfully (status=%d)", status_code);
         return ESP_OK;
     } else {
         ESP_LOGW(TAG, "Webhook failed (err=%d, status=%d)", err, status_code);
-        reset_webhook_client();
         return ESP_FAIL;
     }
 }
@@ -489,6 +535,16 @@ static void webhook_dispatcher_task(void *arg) {
                     should_send = true;
                 }
                 
+                if (current_config.deauth_alert && 
+                    event.event_type == DEVICE_EVENT_DEAUTH_DETECTED) {
+                    should_send = true;
+                }
+                
+                if (current_config.handshake_alert && 
+                    event.event_type == DEVICE_EVENT_HANDSHAKE_CAPTURED) {
+                    should_send = true;
+                }
+                
                 if (current_config.tracked_only && is_known_device && 
                     (event.event_type == DEVICE_EVENT_FIRST_SEEN || 
                      event.event_type == DEVICE_EVENT_ARRIVED ||
@@ -502,17 +558,39 @@ static void webhook_dispatcher_task(void *arg) {
                 }
             }
             
+            // Check if this is a new event or retry of the same event
+            if (current_event_cursor != send_cursor) {
+                // New event, reset retry counter
+                current_event_cursor = send_cursor;
+                retry_count = 0;
+            }
+
             // attempt send
             err = send_event(&event);
             if (err == ESP_OK) {
+                // Success - advance cursor and reset retry tracking
                 send_cursor++;
+                current_event_cursor = 0xFFFFFFFF;
+                retry_count = 0;
+
                 if (total_events >= MAX_DEVICE_EVENTS && send_cursor >= total_events) {
                     last_write_idx = write_idx;
                 }
                 persist_cursor_state();
                 sent_this_cycle++;
             } else {
-                // failed, will retry later
+                // Failed - increment retry counter for logging
+                retry_count++;
+                ESP_LOGW(TAG, "Event at cursor %lu failed (attempt %d), will retry",
+                         (unsigned long)send_cursor, retry_count);
+
+                // Reset HTTP client on persistent failures
+                if (retry_count >= MAX_RETRY_ATTEMPTS) {
+                    reset_webhook_client();
+                    retry_count = 0; // Reset for next cycle
+                }
+
+                // Break and retry later
                 break;
             }
             
