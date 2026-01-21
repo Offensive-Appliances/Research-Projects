@@ -13,6 +13,7 @@
   - Deauths seen
   - Rouge APs detected
   - Persistent device tracking
+  - Network bottleneck analysis
 - Added a Network History section with:
   - AP and STA history
   - Channel congestion history

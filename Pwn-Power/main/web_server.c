@@ -1612,10 +1612,10 @@ static esp_err_t history_samples_handler(httpd_req_t *req) {
     if (max_samples > 5040) max_samples = 5040;  // limit to 7 days worth
     
     uint32_t history_count = scan_storage_get_history_count();
-    ESP_LOGI(TAG, "history_samples_handler: total_count=%u, max_samples=%u", history_count, max_samples);
+    ESP_LOGD(TAG, "history_samples_handler: total_count=%u, max_samples=%u", history_count, max_samples);
     uint32_t remaining = (history_count > max_samples) ? max_samples : history_count;
     uint32_t start_idx = (history_count > max_samples) ? (history_count - max_samples) : 0;
-    ESP_LOGI(TAG, "history_samples_handler: start_idx=%u, remaining=%u", start_idx, remaining);
+    ESP_LOGD(TAG, "history_samples_handler: start_idx=%u, remaining=%u", start_idx, remaining);
     
     #define HISTORY_CHUNK_SIZE 100
     history_sample_t *chunk = malloc(sizeof(history_sample_t) * HISTORY_CHUNK_SIZE);
@@ -1635,7 +1635,7 @@ static esp_err_t history_samples_handler(httpd_req_t *req) {
         uint32_t request_count = remaining > HISTORY_CHUNK_SIZE ? HISTORY_CHUNK_SIZE : remaining;
         uint32_t actual = 0;
         esp_err_t err = scan_storage_get_history_samples_window(start_idx, request_count, chunk, &actual);
-        ESP_LOGI(TAG, "history_samples_handler: requested=%u, actual=%u", request_count, actual);
+        ESP_LOGD(TAG, "history_samples_handler: requested=%u, actual=%u", request_count, actual);
         if (err != ESP_OK) {
             free(chunk);
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to read samples");

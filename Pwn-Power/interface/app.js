@@ -5,6 +5,56 @@ let selectedClients = {};
 let scanInterval = null;
 let agoTicker = null;
 let privacyMode = false;
+let wifiStatusCache = { data: null, timestamp: 0, pending: null };
+let scanReportCache = { data: null, timestamp: 0, pending: null };
+let manualScanBusy = false;
+let bgScanBusy = false;
+
+let refreshNetworkIntelligence = async () => {
+    await Promise.all([loadDeviceIntelligence(), loadBottleneckAnalysis()]);
+};
+
+const scheduleIdle = (fn) => {
+    if (typeof requestIdleCallback === 'function') {
+        requestIdleCallback(fn);
+    } else {
+        setTimeout(fn, 0);
+    }
+};
+
+function setBusyState(manualBusy, backgroundBusy) {
+    manualScanBusy = typeof manualBusy === 'boolean' ? manualBusy : manualScanBusy;
+    bgScanBusy = typeof backgroundBusy === 'boolean' ? backgroundBusy : bgScanBusy;
+
+    const banner = document.getElementById('scan-busy-banner');
+    if (banner) {
+        if (manualScanBusy) {
+            banner.textContent = 'Manual scan in progress – actions are temporarily blocked.';
+            banner.style.display = 'block';
+        } else if (bgScanBusy) {
+            banner.textContent = 'Background scan running – some actions are temporarily blocked.';
+            banner.style.display = 'block';
+        } else {
+            banner.style.display = 'none';
+        }
+    }
+}
+
+function anyScanBusy() {
+    return manualScanBusy || bgScanBusy;
+}
+
+function isBlockedAction(actionLabel = 'This action') {
+    if (manualScanBusy) {
+        showToast(`${actionLabel} is blocked while a manual scan is running.`);
+        return true;
+    }
+    if (bgScanBusy) {
+        showToast(`${actionLabel} is blocked while a background scan is running.`);
+        return true;
+    }
+    return false;
+}
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
@@ -13,6 +63,44 @@ function togglePrivacyMode() {
     privacyMode = !privacyMode;
     localStorage.setItem('privacyMode', privacyMode);
     applyPrivacyMode();
+}
+
+async function getScanReport(force = false) {
+    const now = Date.now();
+    if (!force && scanReportCache.data && now - scanReportCache.timestamp < 5000) {
+        return scanReportCache.data;
+    }
+    if (scanReportCache.pending) return scanReportCache.pending;
+
+    scanReportCache.pending = fetchJSON('/scan/report').then((res) => {
+        scanReportCache.data = res;
+        scanReportCache.timestamp = Date.now();
+        scanReportCache.pending = null;
+        return res;
+    }).catch((e) => {
+        scanReportCache.pending = null;
+        throw e;
+    });
+    return scanReportCache.pending;
+}
+
+async function getWifiStatus(force = false) {
+    const now = Date.now();
+    if (!force && wifiStatusCache.data && now - wifiStatusCache.timestamp < 5000) {
+        return wifiStatusCache.data;
+    }
+    if (wifiStatusCache.pending) return wifiStatusCache.pending;
+
+    wifiStatusCache.pending = fetchJSON('/wifi/status').then((res) => {
+        wifiStatusCache.data = res;
+        wifiStatusCache.timestamp = Date.now();
+        wifiStatusCache.pending = null;
+        return res;
+    }).catch((e) => {
+        wifiStatusCache.pending = null;
+        throw e;
+    });
+    return wifiStatusCache.pending;
 }
 
 function applyPrivacyMode() {
@@ -108,9 +196,10 @@ async function fetchJSON(url, opts = {}) {
 }
 
 async function loadScanData(preventNewScan = false) {
-    // Always try cached data first
-    let data = await fetchJSON('/cached-scan');
-    const status = await fetchJSON('/wifi/status');
+    const [data, status] = await Promise.all([
+        fetchJSON('/cached-scan'),
+        getWifiStatus()
+    ]);
 
     // Check if scan is in progress
     if (data && data.scan_in_progress) {
@@ -389,13 +478,19 @@ try {
 
 async function checkScanStatus() {
     const status = await fetchJSON('/wifi/scan-status');
-    return status?.scan_in_progress || false;
+    const inProgress = status?.scan_in_progress || false;
+    if (inProgress) {
+        setBusyState(true, bgScanBusy);
+    }
+    return inProgress;
 }
 
 // Track the active scan abort controller to prevent retries
 let activeScanController = null;
 
 async function triggerScan() {
+    if (isBlockedAction('Manual scan')) return;
+
     console.log('=== triggerScan() called at', new Date().toISOString(), '===');
     console.log('Current state: scanInProgress=', scanInProgress);
     console.trace('Call stack:'); // Show where this was called from
@@ -406,6 +501,7 @@ async function triggerScan() {
 
     if (scanInProgress || backendScanning) {
         console.warn('Scan already in progress, aborting');
+        setBusyState(true, bgScanBusy);
         showToast('Scan already in progress');
         return;
     }
@@ -419,6 +515,7 @@ async function triggerScan() {
 
     console.log('Starting new scan, creating AbortController...');
     scanInProgress = true;
+    setBusyState(true, bgScanBusy);
     // Store scan start time in sessionStorage to survive page reloads
     try {
         sessionStorage.setItem('lastScanTime', Date.now().toString());
@@ -458,6 +555,7 @@ async function triggerScan() {
     } finally {
         activeScanController = null;
         scanInProgress = false;
+        setBusyState(false, bgScanBusy);
         // Clear the scan lock
         try {
             sessionStorage.removeItem('lastScanTime');
@@ -468,6 +566,7 @@ async function triggerScan() {
 }
 
 async function startDeauth() {
+    if (isBlockedAction('Deauth attack')) return;
     if (!selectedAP) return showToast('Select a target first');
     
     const targets = selectedClients[selectedAP.MAC] || [];
@@ -487,6 +586,7 @@ async function startDeauth() {
 }
 
 async function startHandshake() {
+    if (isBlockedAction('Handshake capture')) return;
     if (!selectedAP) return showToast('Select a target first');
     
     const targets = selectedClients[selectedAP.MAC] || [];
@@ -526,10 +626,14 @@ async function updateBgScanStatus() {
         }
     }
     if (count) count.textContent = data.record_count || 0;
+
+    setBusyState(manualScanBusy, data.state === 'running');
 }
 
 async function triggerBgScan() {
+    if (isBlockedAction('Background scan')) return;
     showWarningPopup('Scanning will temporarily interrupt your connection. You may need to reconnect or refresh this page after the scan completes.');
+    setBusyState(manualScanBusy, true);
     await fetchJSON('/scan/trigger', { method: 'POST' });
     setTimeout(updateBgScanStatus, 1000);
 }
@@ -614,7 +718,7 @@ async function saveApConfig(e) {
 }
 
 async function loadNetworkStatus() {
-    const data = await fetchJSON('/wifi/status');
+    const data = await getWifiStatus(true);
     const dot = $('#net-status-dot');
     const text = $('#net-status-text');
     const info = $('#net-info');
@@ -668,6 +772,7 @@ async function forgetNetwork() {
 }
 
 async function connectToNetwork(e) {
+    if (isBlockedAction('Connect')) return;
     e.preventDefault();
     const ssid = $('#net-ssid').value;
     const pass = $('#net-pass').value;
@@ -723,14 +828,17 @@ async function loadHandshakes() {
     if (!container) return;
     
     try {
-        const arr = await fetchJSON('/captures') || [];
-        
+        const [arrRaw, statusRes] = await Promise.all([
+            fetchJSON('/captures'),
+            getWifiStatus()
+        ]);
+
+        const arr = arrRaw || [];
         if (arr.length === 0) {
             container.innerHTML = '<div class="muted">No captures yet</div>';
             return;
         }
-        
-        const statusRes = await fetchJSON('/wifi/status');
+
         const uptime = statusRes?.uptime || 0;
         
         const nowMs = Date.now();
@@ -831,7 +939,7 @@ async function loadDeviceIntelligence() {
             fetchJSON('/intelligence'),
             fetchJSON('/devices/presence'),
             fetchJSON('/devices/list'),
-            fetchJSON('/scan/report')
+            getScanReport()
         ]);
         
         if (!intelligence || !presence || !deviceList) {
@@ -2089,7 +2197,7 @@ function renderCharts(samples, timeRange = null) {
 async function drawSSIDClientsChart(canvasId, samples) {
     if (!samples || samples.length === 0) return;
 
-    const data = await fetchJSON('/scan/report');
+    const data = await getScanReport();
     const hashToSsid = new Map();
     if (data && data.networks) {
         data.networks.forEach(net => {
@@ -2408,18 +2516,26 @@ async function testWebhook(e) {
 
 document.addEventListener('DOMContentLoaded', () => {
     initPrivacyMode();
-    loadScanData(true); // Only load cached data on page load
-    loadApConfig();
-    loadNetworkStatus();
-    loadHandshakes();
-    loadGpioStatus();
-    updateBgScanStatus();
-    loadScanSettings();
-    loadDeviceIntelligence();
-    loadHistoryCharts(7);
-    loadHomeSSIDs();
-    loadWebhookConfig();
-    loadBottleneckAnalysis(); // Initialize bottleneck detector
+
+    // Fire initial data loads in parallel to reduce blocking
+    Promise.all([
+        loadScanData(true), // Only load cached data on page load
+        loadApConfig(),
+        loadNetworkStatus(),
+        loadGpioStatus(),
+        updateBgScanStatus(),
+        loadScanSettings(),
+        refreshNetworkIntelligence(),
+        loadHistoryCharts(7),
+        loadWebhookConfig(),
+        loadBottleneckAnalysis() // Initialize bottleneck detector
+    ]).catch(() => {
+        // errors already logged per fetchJSON; keep page load resilient
+    });
+
+    // Non-urgent fetches after paint
+    scheduleIdle(() => loadHandshakes());
+    scheduleIdle(() => loadHomeSSIDs());
 
     // Sync device sort dropdown with currentSort state
     const deviceSort = $('#device-sort');
@@ -2429,7 +2545,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     addTrackedInterval(loadNetworkStatus, 10000);
     addTrackedInterval(updateBgScanStatus, 5000);
-    addTrackedInterval(loadDeviceIntelligence, 15000); // Reduced from 60s to 15s for better responsiveness
+    addTrackedInterval(refreshNetworkIntelligence, 15000); // Reduced from 60s to 15s for better responsiveness
     addTrackedInterval(loadBottleneckAnalysis, 30000); // Update bottleneck analysis every 30 seconds
     if (!agoTicker) agoTicker = addTrackedInterval(updateAgoTick, 1000);
 
@@ -2643,18 +2759,20 @@ class NetworkBottleneckDetector {
 }
 
 const bottleneckDetector = new NetworkBottleneckDetector();
+const BOTTLENECK_DEBUG = false;
 
 async function loadBottleneckAnalysis() {
-    console.log('[BOTTLENECK] Starting bottleneck analysis...');
+    if (BOTTLENECK_DEBUG) console.log('[BOTTLENECK] Starting bottleneck analysis...');
     try {
         // Use scan/report endpoint which has the networks array (not /intelligence/unified)
         const [reportData, historyData] = await Promise.all([
             fetchJSON('/scan/report'),
             fetchJSON('/history/samples?days=3')  // Get 3 days of history for timing analysis
         ]);
-
-        console.log('[BOTTLENECK] Raw reportData:', reportData);
-        console.log('[BOTTLENECK] Raw historyData:', historyData);
+        if (BOTTLENECK_DEBUG) {
+            console.log('[BOTTLENECK] Raw reportData:', reportData);
+            console.log('[BOTTLENECK] Raw historyData:', historyData);
+        }
 
         if (!reportData) {
             console.error('[BOTTLENECK] No reportData received!');
@@ -2668,7 +2786,7 @@ async function loadBottleneckAnalysis() {
             return;
         }
 
-        console.log('[BOTTLENECK] Network count:', reportData.networks.length);
+        if (BOTTLENECK_DEBUG) console.log('[BOTTLENECK] Network count:', reportData.networks.length);
 
         // Extract data for bottleneck analysis from network scan report
         const channelCounts = Array(13).fill(0);
@@ -2682,14 +2800,16 @@ async function loadBottleneckAnalysis() {
                 ? network.clients.length
                 : (network.stations || 0);
 
-            console.log(`[BOTTLENECK] Network ${idx}:`, {
-                ssid: network.ssid,
-                channel: network.channel,
-                clientsRaw: network.clients,
-                stationsRaw: network.stations,
-                clientCount: clientCount,
-                rssi: network.rssi
-            });
+            if (BOTTLENECK_DEBUG) {
+                console.log(`[BOTTLENECK] Network ${idx}:`, {
+                    ssid: network.ssid,
+                    channel: network.channel,
+                    clientsRaw: network.clients,
+                    stationsRaw: network.stations,
+                    clientCount: clientCount,
+                    rssi: network.rssi
+                });
+            }
 
             if (network.channel >= 1 && network.channel <= 13) {
                 channelCounts[network.channel - 1]++;
@@ -2708,29 +2828,31 @@ async function loadBottleneckAnalysis() {
             }
         });
 
-        console.log('[BOTTLENECK] Extracted data:', {
-            channelCounts,
-            clientCounts,
-            rssiValues,
-            ssidData: Array.from(ssidData.entries())
-        });
+        if (BOTTLENECK_DEBUG) {
+            console.log('[BOTTLENECK] Extracted data:', {
+                channelCounts,
+                clientCounts,
+                rssiValues,
+                ssidData: Array.from(ssidData.entries())
+            });
+        }
 
         // Calculate bottlenecks with enhanced data
-        console.log('[BOTTLENECK] Calculating channel bottleneck...');
+        if (BOTTLENECK_DEBUG) console.log('[BOTTLENECK] Calculating channel bottleneck...');
         const channelBottleneck = bottleneckDetector.calculateChannelBottleneck(channelCounts);
-        console.log('[BOTTLENECK] Channel result:', channelBottleneck);
+        if (BOTTLENECK_DEBUG) console.log('[BOTTLENECK] Channel result:', channelBottleneck);
 
-        console.log('[BOTTLENECK] Calculating capacity bottleneck...');
+        if (BOTTLENECK_DEBUG) console.log('[BOTTLENECK] Calculating capacity bottleneck...');
         const capacityBottleneck = bottleneckDetector.calculateCapacityBottleneck(clientCounts, reportData.networks.length);
-        console.log('[BOTTLENECK] Capacity result:', capacityBottleneck);
+        if (BOTTLENECK_DEBUG) console.log('[BOTTLENECK] Capacity result:', capacityBottleneck);
 
-        console.log('[BOTTLENECK] Calculating signal bottleneck...');
+        if (BOTTLENECK_DEBUG) console.log('[BOTTLENECK] Calculating signal bottleneck...');
         const signalBottleneck = bottleneckDetector.calculateSignalBottleneck(rssiValues);
-        console.log('[BOTTLENECK] Signal result:', signalBottleneck);
+        if (BOTTLENECK_DEBUG) console.log('[BOTTLENECK] Signal result:', signalBottleneck);
 
-        console.log('[BOTTLENECK] Calculating timing bottleneck...');
+        if (BOTTLENECK_DEBUG) console.log('[BOTTLENECK] Calculating timing bottleneck...');
         const timingBottleneck = bottleneckDetector.calculateTimingBottleneck(historyData?.samples || []);
-        console.log('[BOTTLENECK] Timing result:', timingBottleneck);
+        if (BOTTLENECK_DEBUG) console.log('[BOTTLENECK] Timing result:', timingBottleneck);
 
         const bottlenecks = {
             channel: channelBottleneck,
@@ -2748,18 +2870,18 @@ async function loadBottleneckAnalysis() {
                 avgRssi: data.rssi.reduce((a, b) => a + b, 0) / data.rssi.length,
                 avgClientsPerAP: data.clients / data.count
             }));
-            console.log('[BOTTLENECK] Added SSID analysis:', bottlenecks.capacity.ssidAnalysis);
+            if (BOTTLENECK_DEBUG) console.log('[BOTTLENECK] Added SSID analysis:', bottlenecks.capacity.ssidAnalysis);
         }
 
-        console.log('[BOTTLENECK] Getting overall score...');
+        if (BOTTLENECK_DEBUG) console.log('[BOTTLENECK] Getting overall score...');
         const analysis = bottleneckDetector.getOverallBottleneckScore(bottlenecks);
-        console.log('[BOTTLENECK] Final analysis:', analysis);
+        if (BOTTLENECK_DEBUG) console.log('[BOTTLENECK] Final analysis:', analysis);
 
         updateBottleneckPanel(analysis);
 
     } catch (error) {
         console.error('[BOTTLENECK] Failed to load bottleneck analysis:', error);
-        console.error('[BOTTLENECK] Error stack:', error.stack);
+        if (BOTTLENECK_DEBUG) console.error('[BOTTLENECK] Error stack:', error.stack);
         updateBottleneckPanel(null);
     }
 }

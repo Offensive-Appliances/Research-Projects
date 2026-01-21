@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="theme-color" content="#0d1117">
     <title>PwnPower</title>
     <link rel="stylesheet" href="styles.css">
 </head>
@@ -14,6 +15,7 @@
             <span id="privacy-icon">◉</span>
         </button>
     </header>
+    <div id="scan-busy-banner" class="warning-banner" style="display:none;">Scan in progress…</div>
     
     <main>
         <section id="wifi" class="section">
@@ -318,7 +320,7 @@
                 </div>
 
                 <div class="btn-group" style="margin-top:16px;">
-                    <button class="btn btn-primary" onclick="loadDeviceIntelligence()">Refresh</button>
+                    <button class="btn btn-primary" onclick="refreshNetworkIntelligence()">Refresh</button>
                 </div>
             </div>
         </section>

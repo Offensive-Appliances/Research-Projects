@@ -400,11 +400,11 @@ static esp_err_t send_event(const device_event_t *event) {
     if (!json_str) return ESP_ERR_NO_MEM;
     
     if (is_discord) {
-        ESP_LOGI(TAG, "Discord payload length: %d", (int)strlen(json_str));
+        ESP_LOGD(TAG, "Discord payload length: %d", (int)strlen(json_str));
         if (strlen(json_str) > 6000) {
             ESP_LOGW(TAG, "Discord payload may be too long for Discord (6000+ chars)");
         }
-        ESP_LOGI(TAG, "Discord payload: %s", json_str);
+        ESP_LOGD(TAG, "Discord payload: %s", json_str);
     }
     
     // send http post
@@ -421,7 +421,7 @@ static esp_err_t send_event(const device_event_t *event) {
     int status_code = esp_http_client_get_status_code(client);
     int content_length = esp_http_client_get_content_length(client);
 
-    ESP_LOGI(TAG, "HTTP response: status=%d, content_length=%d, err=%d", status_code, content_length, err);
+    ESP_LOGD(TAG, "HTTP response: status=%d, content_length=%d, err=%d", status_code, content_length, err);
 
     // Read response body if available
     char resp[256] = {0};
@@ -440,13 +440,9 @@ static esp_err_t send_event(const device_event_t *event) {
         }
     } else if (err == ESP_OK && (status_code < 200 || status_code >= 300)) {
         if (strlen(resp) > 0) {
-            ESP_LOGW(TAG, "Webhook response body: %s", resp);
+            ESP_LOGD(TAG, "Webhook response body: %s", resp);
         }
     }
-    
-    free(json_str);
-
-    // Always cleanup client after use to prevent state issues
     reset_webhook_client();
 
     vTaskDelay(pdMS_TO_TICKS(100));
