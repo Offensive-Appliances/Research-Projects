@@ -18,6 +18,8 @@
   - AP and STA history
   - Channel congestion history
 - Added ability to send configurable alerts to a webhook
+- Enabled HTTPS with on-device self-signed cert
+- Added mDNS support for pwnpower.local on PwnPower AP
 
 ### Changed
 - Merged WiFi Recon and Attack sections into a single section

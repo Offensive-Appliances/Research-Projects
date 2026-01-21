@@ -19,6 +19,7 @@ idf_component_register(
         "ouis.c"
         "monitor_uptime.c"
         "json_utils.c"
+        "tls_cert.c"
     INCLUDE_DIRS
         "."
     EMBED_FILES
@@ -28,6 +29,7 @@ idf_component_register(
         mdns
         esp_wifi
         esp_http_server
+        esp_https_server
         esp_http_client
         nvs_flash
         app_update

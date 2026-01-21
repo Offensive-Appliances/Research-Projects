@@ -1,4 +1,5 @@
 #include "esp_http_server.h"
+#include "esp_https_server.h"
 #include "esp_log.h"
 #include "http_parser.h"
 #include "wifi_scan.h"
@@ -26,8 +27,10 @@
 #include "driver/gpio.h"
 #include "monitor_uptime.h"
 #include "json_utils.h"
+#include "tls_cert.h"
 #include <stddef.h>
 #include <time.h>
+#include <string.h>
 
 extern const uint8_t _binary_web_content_gz_h_start[] asm("_binary_web_content_gz_h_start");
 extern const uint8_t _binary_web_content_gz_h_end[] asm("_binary_web_content_gz_h_end");
@@ -56,6 +59,14 @@ static bool s_smartplug_inited = false;
 typedef struct { uint8_t bssid[6]; int channel; int duration; uint8_t stas[MAX_HS_STA][6]; int sta_count; } hs_args_t;
 static TaskHandle_t hs_task_handle = NULL;
 static hs_args_t hs_args;
+
+static httpd_handle_t s_https_server = NULL;
+static httpd_handle_t s_http_redirect_server = NULL; // unused (redirect disabled)
+static tls_cert_bundle_t s_tls_bundle;
+
+static esp_err_t register_routes(httpd_handle_t server);
+static httpd_handle_t start_https_server(void);
+static httpd_handle_t start_http_redirect_server(void);
 
 // simple STA connection helpers used by the web UI
 static volatile bool g_sta_connected = false;
@@ -172,9 +183,7 @@ static void hs_task(void *arg) {
 static esp_err_t index_handler(httpd_req_t *req) {
     update_last_request_time();
 
-    ESP_LOGI(TAG, "=== ROOT REQUEST START ===");
-    ESP_LOGI(TAG, "Free heap: %lu bytes", (unsigned long)esp_get_free_heap_size());
-    ESP_LOGI(TAG, "Min free heap ever: %lu bytes", (unsigned long)esp_get_minimum_free_heap_size());
+    ESP_LOGD(TAG, "ROOT start heap=%lu min=%lu", (unsigned long)esp_get_free_heap_size(), (unsigned long)esp_get_minimum_free_heap_size());
 
     // Check for If-None-Match header (ETag-based caching)
     char etag_buf[64];
@@ -182,14 +191,14 @@ static esp_err_t index_handler(httpd_req_t *req) {
     if (httpd_req_get_hdr_value_str(req, "If-None-Match", etag_buf, buf_len) == ESP_OK) {
         // Client has cached version, check if it matches
         if (strcmp(etag_buf, "\"pwn-v1\"") == 0) {
-            ESP_LOGI(TAG, "Client has valid cached UI, sending 304 Not Modified");
+            ESP_LOGD(TAG, "Cached UI 304");
             httpd_resp_set_status(req, "304 Not Modified");
             httpd_resp_send(req, NULL, 0);
             return ESP_OK;
         }
     }
 
-    ESP_LOGI(TAG, "Sending fresh UI (%u bytes)", (unsigned int)WEB_UI_GZ_SIZE);
+    ESP_LOGD(TAG, "Sending UI (%u bytes)", (unsigned int)WEB_UI_GZ_SIZE);
 
     // Set caching headers to reduce repeated loads
     httpd_resp_set_type(req, "text/html");
@@ -201,14 +210,10 @@ static esp_err_t index_handler(httpd_req_t *req) {
     // httpd_resp_send reads directly from flash and only buffers what fits in TCP window
     esp_err_t ret = httpd_resp_send(req, WEB_UI_GZ, WEB_UI_GZ_SIZE);
 
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "UI sent successfully");
-    } else {
-        ESP_LOGE(TAG, "Failed to send UI: %s", esp_err_to_name(ret));
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "UI send failed: %s", esp_err_to_name(ret));
     }
-
-    ESP_LOGI(TAG, "Free heap after send: %lu bytes", (unsigned long)esp_get_free_heap_size());
-    ESP_LOGI(TAG, "=== ROOT REQUEST END ===");
+    ESP_LOGD(TAG, "ROOT end heap=%lu", (unsigned long)esp_get_free_heap_size());
 
     return ret;
 }
@@ -220,8 +225,7 @@ static char last_client_ip[INET6_ADDRSTRLEN] = {0};
 static esp_err_t wifi_scan_handler(httpd_req_t *req) {
     update_last_request_time();
 
-    ESP_LOGI(TAG, "=== /scan REQUEST ===");
-    ESP_LOGI(TAG, "Free heap: %lu bytes", (unsigned long)esp_get_free_heap_size());
+    ESP_LOGD(TAG, "scan req heap=%lu", (unsigned long)esp_get_free_heap_size());
 
     // Get timing information
     uint32_t current_time = (uint32_t)(esp_timer_get_time() / 1000); // milliseconds
@@ -241,12 +245,12 @@ static esp_err_t wifi_scan_handler(httpd_req_t *req) {
         strncpy(last_client_ip, addr_str, sizeof(last_client_ip) - 1);
         last_client_ip[sizeof(last_client_ip) - 1] = '\0';
 
-        ESP_LOGI(TAG, "=== SCAN REQUEST #%lu === from %s%s, fd=%d, time_since_last=%lums",
+        ESP_LOGD(TAG, "SCAN #%lu from %s%s fd=%d dt=%lums",
                  (unsigned long)scan_request_count, addr_str,
-                 same_client ? " (SAME CLIENT)" : " (DIFFERENT CLIENT)",
+                 same_client ? " (same)" : " (new)",
                  sockfd, (unsigned long)time_since_last);
     } else {
-        ESP_LOGI(TAG, "=== SCAN REQUEST #%lu === fd=%d, time_since_last=%lums",
+        ESP_LOGD(TAG, "SCAN #%lu fd=%d dt=%lums",
                  (unsigned long)scan_request_count, sockfd, (unsigned long)time_since_last);
     }
 
@@ -511,8 +515,7 @@ static esp_err_t station_scan_handler(httpd_req_t *req) {
 
 // New handler that ONLY returns cached results without triggering a scan
 static esp_err_t cached_scan_handler(httpd_req_t *req) {
-    ESP_LOGI(TAG, "=== /cached-scan REQUEST ===");
-    ESP_LOGI(TAG, "Free heap: %lu bytes", (unsigned long)esp_get_free_heap_size());
+    ESP_LOGD(TAG, "cached-scan heap=%lu", (unsigned long)esp_get_free_heap_size());
 
     // Get cached results with metadata
     const char *cached_results = wifi_scan_get_results();
@@ -2014,142 +2017,140 @@ static esp_err_t home_ssids_remove_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-// Start the web server and register URI handlers
+// Register all application routes on the given server (HTTPS)
+static esp_err_t register_routes(httpd_handle_t server) {
+    httpd_register_uri_handler(server, &uri_get);
+    httpd_register_uri_handler(server, &uri_scan);
+    httpd_register_uri_handler(server, &uri_cached_scan);
+    httpd_register_uri_handler(server, &uri_wifi_scan_status);
+    httpd_register_uri_handler(server, &uri_attack);
+    httpd_register_uri_handler(server, &uri_attack_alt);
+    httpd_register_uri_handler(server, &uri_stations);
+    httpd_register_uri_handler(server, &uri_handshake);
+    httpd_register_uri_handler(server, &uri_handshake_alt);
+    httpd_register_uri_handler(server, &uri_hs_pcap);
+    httpd_register_uri_handler(server, &uri_capture_history);
+    httpd_register_uri_handler(server, &uri_security_stats);
+    httpd_register_uri_handler(server, &uri_general_capture);
+    httpd_register_uri_handler(server, &uri_ota);
+    httpd_register_uri_handler(server, &uri_ota_fetch);
+    httpd_register_uri_handler(server, &uri_wifi_status);
+
+    httpd_uri_t uri_gpio_set = { .uri = "/gpio", .method = HTTP_POST, .handler = gpio_set_handler, .user_ctx = NULL };
+    httpd_uri_t uri_gpio_status = { .uri = "/gpio/status", .method = HTTP_GET, .handler = gpio_status_handler, .user_ctx = NULL };
+    httpd_register_uri_handler(server, &uri_gpio_set);
+    httpd_register_uri_handler(server, &uri_gpio_status);
+
+    httpd_uri_t uri_wifi_connect = { .uri = "/wifi/connect", .method = HTTP_POST, .handler = wifi_connect_handler, .user_ctx = NULL };
+    httpd_register_uri_handler(server, &uri_wifi_connect);
+
+    httpd_uri_t uri_wifi_settings = { .uri = "/wifi/settings", .method = HTTP_POST, .handler = wifi_settings_handler, .user_ctx = NULL };
+    httpd_uri_t uri_wifi_disconnect = { .uri = "/wifi/disconnect", .method = HTTP_POST, .handler = wifi_disconnect_handler, .user_ctx = NULL };
+    httpd_register_uri_handler(server, &uri_wifi_settings);
+    httpd_register_uri_handler(server, &uri_wifi_disconnect);
+
+    httpd_uri_t uri_scan_report = { .uri = "/scan/report", .method = HTTP_GET, .handler = scan_report_handler, .user_ctx = NULL };
+    httpd_uri_t uri_scan_timeline = { .uri = "/scan/timeline", .method = HTTP_GET, .handler = scan_timeline_handler, .user_ctx = NULL };
+    httpd_uri_t uri_scan_trigger = { .uri = "/scan/trigger", .method = HTTP_POST, .handler = scan_trigger_handler, .user_ctx = NULL };
+    httpd_uri_t uri_scan_status = { .uri = "/scan/status", .method = HTTP_GET, .handler = scan_status_handler, .user_ctx = NULL };
+    httpd_uri_t uri_scan_config_get = { .uri = "/scan/settings", .method = HTTP_GET, .handler = scan_config_get_handler, .user_ctx = NULL };
+    httpd_uri_t uri_scan_config = { .uri = "/scan/settings", .method = HTTP_POST, .handler = scan_config_handler, .user_ctx = NULL };
+    httpd_uri_t uri_scan_clear = { .uri = "/scan/clear", .method = HTTP_POST, .handler = scan_clear_handler, .user_ctx = NULL };
+    httpd_uri_t uri_intelligence = { .uri = "/intelligence", .method = HTTP_GET, .handler = intelligence_handler, .user_ctx = NULL };
+    httpd_uri_t uri_device_presence = { .uri = "/devices/presence", .method = HTTP_GET, .handler = device_presence_handler, .user_ctx = NULL };
+    httpd_uri_t uri_unified_intelligence = { .uri = "/intelligence/unified", .method = HTTP_GET, .handler = unified_intelligence_handler, .user_ctx = NULL };
+    httpd_register_uri_handler(server, &uri_scan_report);
+    httpd_register_uri_handler(server, &uri_scan_timeline);
+    httpd_register_uri_handler(server, &uri_scan_trigger);
+    httpd_register_uri_handler(server, &uri_scan_status);
+    httpd_register_uri_handler(server, &uri_scan_config_get);
+    httpd_register_uri_handler(server, &uri_scan_config);
+    httpd_register_uri_handler(server, &uri_scan_clear);
+    httpd_register_uri_handler(server, &uri_intelligence);
+    httpd_register_uri_handler(server, &uri_device_presence);
+    httpd_register_uri_handler(server, &uri_unified_intelligence);
+
+    httpd_uri_t uri_ap_config_get = { .uri = "/ap/config", .method = HTTP_GET, .handler = ap_config_get_handler, .user_ctx = NULL };
+    httpd_uri_t uri_ap_config_set = { .uri = "/ap/config", .method = HTTP_POST, .handler = ap_config_set_handler, .user_ctx = NULL };
+    httpd_register_uri_handler(server, &uri_ap_config_get);
+    httpd_register_uri_handler(server, &uri_ap_config_set);
+
+    httpd_uri_t uri_history_samples = { .uri = "/history/samples", .method = HTTP_GET, .handler = history_samples_handler, .user_ctx = NULL };
+    httpd_uri_t uri_devices_list = { .uri = "/devices/list", .method = HTTP_GET, .handler = devices_list_handler, .user_ctx = NULL };
+    httpd_uri_t uri_devices_update = { .uri = "/devices/update", .method = HTTP_POST, .handler = devices_update_handler, .user_ctx = NULL };
+    httpd_uri_t uri_webhook_config_get = { .uri = "/webhook/config", .method = HTTP_GET, .handler = webhook_config_get_handler, .user_ctx = NULL };
+    httpd_uri_t uri_webhook_config_set = { .uri = "/webhook/config", .method = HTTP_POST, .handler = webhook_config_set_handler, .user_ctx = NULL };
+    httpd_uri_t uri_webhook_test = { .uri = "/webhook/test", .method = HTTP_POST, .handler = webhook_test_handler, .user_ctx = NULL };
+    httpd_uri_t uri_home_ssids_get = { .uri = "/home-ssids", .method = HTTP_GET, .handler = home_ssids_get_handler, .user_ctx = NULL };
+    httpd_uri_t uri_home_ssids_add = { .uri = "/home-ssids/add", .method = HTTP_POST, .handler = home_ssids_add_handler, .user_ctx = NULL };
+    httpd_uri_t uri_home_ssids_remove = { .uri = "/home-ssids/remove", .method = HTTP_POST, .handler = home_ssids_remove_handler, .user_ctx = NULL };
+    httpd_uri_t uri_home_ssids_refresh = { .uri = "/home-ssids/refresh", .method = HTTP_POST, .handler = home_ssids_refresh_handler, .user_ctx = NULL };
+    httpd_register_uri_handler(server, &uri_history_samples);
+    httpd_register_uri_handler(server, &uri_devices_list);
+    httpd_register_uri_handler(server, &uri_devices_update);
+    httpd_register_uri_handler(server, &uri_webhook_config_get);
+    httpd_register_uri_handler(server, &uri_webhook_config_set);
+    httpd_register_uri_handler(server, &uri_webhook_test);
+    httpd_register_uri_handler(server, &uri_home_ssids_get);
+    httpd_register_uri_handler(server, &uri_home_ssids_add);
+    httpd_register_uri_handler(server, &uri_home_ssids_remove);
+    httpd_register_uri_handler(server, &uri_home_ssids_refresh);
+
+    ESP_LOGI(TAG, "All URI handlers registered successfully");
+    ESP_LOGI(TAG, "Free heap after registration: %lu bytes", (unsigned long)esp_get_free_heap_size());
+    return ESP_OK;
+}
+
+static esp_err_t redirect_handler(httpd_req_t *req) {
+    httpd_resp_set_status(req, "301 Moved Permanently");
+    httpd_resp_set_hdr(req, "Location", "https://192.168.4.1/");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
+static httpd_handle_t start_https_server(void) {
+    if (!tls_cert_load_or_generate(&s_tls_bundle)) {
+        ESP_LOGE(TAG, "TLS certificate generation failed");
+        return NULL;
+    }
+
+    httpd_ssl_config_t conf = HTTPD_SSL_CONFIG_DEFAULT();
+    conf.port_secure = 443;
+    conf.servercert = (const uint8_t *)s_tls_bundle.cert_pem;
+    conf.servercert_len = strlen(s_tls_bundle.cert_pem) + 1;
+    conf.prvtkey_pem = (const uint8_t *)s_tls_bundle.key_pem;
+    conf.prvtkey_len = strlen(s_tls_bundle.key_pem) + 1;
+    conf.httpd.max_uri_handlers = 48;
+    conf.httpd.max_open_sockets = 3; // allow an extra TLS socket if heap permits
+    conf.httpd.backlog_conn = 2;
+    conf.httpd.lru_purge_enable = true;
+    conf.httpd.send_wait_timeout = 8;   // slightly longer to finish TLS flight
+    conf.httpd.recv_wait_timeout = 8;
+    conf.httpd.keep_alive_enable = false;
+    conf.httpd.stack_size = 7168;       // more stack for TLS crypto
+
+    httpd_handle_t server = NULL;
+    esp_err_t err = httpd_ssl_start(&server, &conf);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "HTTPS server started on :443");
+        register_routes(server);
+    } else {
+        ESP_LOGE(TAG, "Failed to start HTTPS server: %s", esp_err_to_name(err));
+    }
+    return server;
+}
+
 httpd_handle_t start_webserver(void) {
-    ESP_LOGI(TAG, "=== WEB SERVER INITIALIZATION ===");
+    ESP_LOGI(TAG, "=== WEB SERVER INITIALIZATION (HTTPS + redirect) ===");
     ESP_LOGI(TAG, "Free heap before start: %lu bytes", (unsigned long)esp_get_free_heap_size());
     ESP_LOGI(TAG, "Min free heap ever: %lu bytes", (unsigned long)esp_get_minimum_free_heap_size());
 
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    /* increase available URI handler slots to allow additional routes (OTA, fetch, etc) */
-    config.max_uri_handlers = 48;
-
-    // Memory optimization: reduce max sockets and enable aggressive purging
-    // LWIP_MAX_SOCKETS=6, httpd uses 3 internal, so max_open_sockets can be 3
-    config.max_open_sockets = 3;    // LWIP limit: 6 total - 3 internal = 3 available
-    config.lru_purge_enable = true; // Aggressively close idle connections
-
-    // Increase timeouts for large file transfers
-    config.send_wait_timeout = 20;  // Increase from 5 to 20 seconds
-    config.recv_wait_timeout = 10;  // Increase from 5 to 10 seconds
-
-    // Log configuration details
-    ESP_LOGI(TAG, "Config: max_uri_handlers=%d, task_priority=%d, stack_size=%d",
-             config.max_uri_handlers, config.task_priority, config.stack_size);
-    ESP_LOGI(TAG, "Config: server_port=%d, ctrl_port=%d, max_open_sockets=%d",
-             config.server_port, config.ctrl_port, config.max_open_sockets);
-    ESP_LOGI(TAG, "Config: max_resp_headers=%d, backlog_conn=%d, lru_purge_enable=%d",
-             config.max_resp_headers, config.backlog_conn, config.lru_purge_enable);
-    ESP_LOGI(TAG, "Config: recv_wait_timeout=%d, send_wait_timeout=%d",
-             config.recv_wait_timeout, config.send_wait_timeout);
-
-    httpd_handle_t server = NULL;
-
-    ESP_LOGI(TAG, "Starting HTTP server...");
-    if (httpd_start(&server, &config) == ESP_OK) {
-        ESP_LOGI(TAG, "HTTP server started successfully");
-        ESP_LOGI(TAG, "Free heap after httpd_start: %lu bytes", (unsigned long)esp_get_free_heap_size());
-        httpd_register_uri_handler(server, &uri_get);
-        httpd_register_uri_handler(server, &uri_scan);
-        httpd_register_uri_handler(server, &uri_cached_scan);
-        httpd_register_uri_handler(server, &uri_wifi_scan_status);
-        httpd_register_uri_handler(server, &uri_attack);
-        httpd_register_uri_handler(server, &uri_attack_alt);
-        httpd_register_uri_handler(server, &uri_stations);
-        httpd_register_uri_handler(server, &uri_handshake);
-        httpd_register_uri_handler(server, &uri_handshake_alt);
-        httpd_register_uri_handler(server, &uri_hs_pcap);
-        httpd_register_uri_handler(server, &uri_capture_history);
-        httpd_register_uri_handler(server, &uri_security_stats);
-        httpd_register_uri_handler(server, &uri_general_capture);
-        httpd_register_uri_handler(server, &uri_ota);
-        httpd_register_uri_handler(server, &uri_ota_fetch);
-        // register wifi status endpoint
-        httpd_register_uri_handler(server, &uri_wifi_status);
-        // register gpio endpoints for smart plug
-        httpd_uri_t uri_gpio_set = {
-            .uri = "/gpio",
-            .method = HTTP_POST,
-            .handler = gpio_set_handler,
-            .user_ctx = NULL
-        };
-        httpd_uri_t uri_gpio_status = {
-            .uri = "/gpio/status",
-            .method = HTTP_GET,
-            .handler = gpio_status_handler,
-            .user_ctx = NULL
-        };
-        httpd_register_uri_handler(server, &uri_gpio_set);
-        httpd_register_uri_handler(server, &uri_gpio_status);
-        // wifi connect endpoint for providing internet during OTA
-        httpd_uri_t uri_wifi_connect = {
-            .uri = "/wifi/connect",
-            .method = HTTP_POST,
-            .handler = wifi_connect_handler,
-            .user_ctx = NULL
-        };
-        httpd_register_uri_handler(server, &uri_wifi_connect);
-        
-        httpd_uri_t uri_wifi_settings = { .uri = "/wifi/settings", .method = HTTP_POST, .handler = wifi_settings_handler, .user_ctx = NULL };
-        httpd_uri_t uri_wifi_disconnect = { .uri = "/wifi/disconnect", .method = HTTP_POST, .handler = wifi_disconnect_handler, .user_ctx = NULL };
-        httpd_register_uri_handler(server, &uri_wifi_settings);
-        httpd_register_uri_handler(server, &uri_wifi_disconnect);
-        
-        httpd_uri_t uri_scan_report = { .uri = "/scan/report", .method = HTTP_GET, .handler = scan_report_handler, .user_ctx = NULL };
-        httpd_uri_t uri_scan_timeline = { .uri = "/scan/timeline", .method = HTTP_GET, .handler = scan_timeline_handler, .user_ctx = NULL };
-        httpd_uri_t uri_scan_trigger = { .uri = "/scan/trigger", .method = HTTP_POST, .handler = scan_trigger_handler, .user_ctx = NULL };
-        httpd_uri_t uri_scan_status = { .uri = "/scan/status", .method = HTTP_GET, .handler = scan_status_handler, .user_ctx = NULL };
-        httpd_uri_t uri_scan_config_get = { .uri = "/scan/settings", .method = HTTP_GET, .handler = scan_config_get_handler, .user_ctx = NULL };
-        httpd_uri_t uri_scan_config = { .uri = "/scan/settings", .method = HTTP_POST, .handler = scan_config_handler, .user_ctx = NULL };
-        httpd_uri_t uri_scan_clear = { .uri = "/scan/clear", .method = HTTP_POST, .handler = scan_clear_handler, .user_ctx = NULL };
-        httpd_uri_t uri_intelligence = { .uri = "/intelligence", .method = HTTP_GET, .handler = intelligence_handler, .user_ctx = NULL };
-        httpd_uri_t uri_device_presence = { .uri = "/devices/presence", .method = HTTP_GET, .handler = device_presence_handler, .user_ctx = NULL };
-        httpd_uri_t uri_unified_intelligence = { .uri = "/intelligence/unified", .method = HTTP_GET, .handler = unified_intelligence_handler, .user_ctx = NULL };
-        httpd_register_uri_handler(server, &uri_scan_report);
-        httpd_register_uri_handler(server, &uri_scan_timeline);
-        httpd_register_uri_handler(server, &uri_scan_trigger);
-        httpd_register_uri_handler(server, &uri_scan_status);
-        httpd_register_uri_handler(server, &uri_scan_config_get);
-        httpd_register_uri_handler(server, &uri_scan_config);
-        httpd_register_uri_handler(server, &uri_scan_clear);
-        httpd_register_uri_handler(server, &uri_intelligence);
-        httpd_register_uri_handler(server, &uri_device_presence);
-        httpd_register_uri_handler(server, &uri_unified_intelligence);
-        
-        httpd_uri_t uri_ap_config_get = { .uri = "/ap/config", .method = HTTP_GET, .handler = ap_config_get_handler, .user_ctx = NULL };
-        httpd_uri_t uri_ap_config_set = { .uri = "/ap/config", .method = HTTP_POST, .handler = ap_config_set_handler, .user_ctx = NULL };
-        httpd_register_uri_handler(server, &uri_ap_config_get);
-        httpd_register_uri_handler(server, &uri_ap_config_set);
-        
-        httpd_uri_t uri_history_samples = { .uri = "/history/samples", .method = HTTP_GET, .handler = history_samples_handler, .user_ctx = NULL };
-        httpd_uri_t uri_devices_list = { .uri = "/devices/list", .method = HTTP_GET, .handler = devices_list_handler, .user_ctx = NULL };
-        httpd_uri_t uri_devices_update = { .uri = "/devices/update", .method = HTTP_POST, .handler = devices_update_handler, .user_ctx = NULL };
-        httpd_uri_t uri_webhook_config_get = { .uri = "/webhook/config", .method = HTTP_GET, .handler = webhook_config_get_handler, .user_ctx = NULL };
-        httpd_uri_t uri_webhook_config_set = { .uri = "/webhook/config", .method = HTTP_POST, .handler = webhook_config_set_handler, .user_ctx = NULL };
-        httpd_uri_t uri_webhook_test = { .uri = "/webhook/test", .method = HTTP_POST, .handler = webhook_test_handler, .user_ctx = NULL };
-        httpd_uri_t uri_home_ssids_get = { .uri = "/home-ssids", .method = HTTP_GET, .handler = home_ssids_get_handler, .user_ctx = NULL };
-        httpd_uri_t uri_home_ssids_add = { .uri = "/home-ssids/add", .method = HTTP_POST, .handler = home_ssids_add_handler, .user_ctx = NULL };
-        httpd_uri_t uri_home_ssids_remove = { .uri = "/home-ssids/remove", .method = HTTP_POST, .handler = home_ssids_remove_handler, .user_ctx = NULL };
-        httpd_uri_t uri_home_ssids_refresh = { .uri = "/home-ssids/refresh", .method = HTTP_POST, .handler = home_ssids_refresh_handler, .user_ctx = NULL };
-        httpd_register_uri_handler(server, &uri_history_samples);
-        httpd_register_uri_handler(server, &uri_devices_list);
-        httpd_register_uri_handler(server, &uri_devices_update);
-        httpd_register_uri_handler(server, &uri_webhook_config_get);
-        httpd_register_uri_handler(server, &uri_webhook_config_set);
-        httpd_register_uri_handler(server, &uri_webhook_test);
-        httpd_register_uri_handler(server, &uri_home_ssids_get);
-        httpd_register_uri_handler(server, &uri_home_ssids_add);
-        httpd_register_uri_handler(server, &uri_home_ssids_remove);
-        httpd_register_uri_handler(server, &uri_home_ssids_refresh);
-
-        ESP_LOGI(TAG, "All URI handlers registered successfully");
-        ESP_LOGI(TAG, "Free heap after registration: %lu bytes", (unsigned long)esp_get_free_heap_size());
-        ESP_LOGI(TAG, "Web Server started on port 80");
-        ESP_LOGI(TAG, "=== WEB SERVER READY ===");
-    } else {
-        ESP_LOGE(TAG, "Failed to start web server!");
-        ESP_LOGE(TAG, "Free heap at failure: %lu bytes", (unsigned long)esp_get_free_heap_size());
+    s_https_server = start_https_server();
+    if (!s_https_server) {
+        ESP_LOGE(TAG, "HTTPS server failed to start");
+        return NULL;
     }
 
-    return server;
+    ESP_LOGI(TAG, "=== WEB SERVER READY (HTTPS only) ===");
+    return s_https_server;
 }
