@@ -3,6 +3,7 @@
 ## v2.0
 
 ### Added
+- Secure login flow with token-based API protection for the web UI
 - Privacy mode toggle to censor PII (MACs, SSIDs, vendors) for demos and content creation
 - Configuration of onboard WiFi AP
 - Option to connect device to home network with access over mDNS (pwnpower.local)

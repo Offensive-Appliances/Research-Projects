@@ -27,6 +27,57 @@ body {
     line-height: 1.5;
 }
 
+.login-screen {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: radial-gradient(circle at 20% 20%, rgba(179, 23, 23, 0.2), transparent 35%),
+                radial-gradient(circle at 80% 30%, rgba(255,255,255,0.05), transparent 40%),
+                var(--bg-secondary);
+    z-index: 200;
+    padding: 24px;
+}
+
+.login-card {
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    padding: 24px;
+    width: 100%;
+    max-width: 360px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.35), 0 0 0 1px rgba(255,255,255,0.03);
+}
+
+.login-card h2 { margin: 0 0 8px 0; }
+.login-card .muted { margin: 0 0 16px 0; }
+
+.input-group {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 12px;
+}
+
+.input-group label { font-size: 12px; color: var(--text-muted); }
+
+.login-card input[type="password"],
+.login-card input[type="text"] {
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 10px 12px;
+    color: var(--text-primary);
+    font-size: 14px;
+}
+
+.error-text {
+    color: var(--danger);
+    font-size: 12px;
+    margin-top: 8px;
+}
+
 header {
     background: var(--bg-primary);
     padding: 16px 20px;

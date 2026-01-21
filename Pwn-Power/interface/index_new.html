@@ -8,16 +8,30 @@
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-    <header>
-        <h1>PwnPower</h1>
-        <div class="subtitle">Offensive Appliances Research</div>
-        <button id="privacy-toggle" class="privacy-btn" onclick="togglePrivacyMode()" title="Toggle Privacy Mode for demos">
-            <span id="privacy-icon">◉</span>
-        </button>
-    </header>
-    <div id="scan-busy-banner" class="warning-banner" style="display:none;">Scan in progress…</div>
-    
-    <main>
+    <div id="login-screen" class="login-screen" style="display:none;">
+        <div class="login-card">
+            <h2>Secure Login</h2>
+            <p class="muted">Enter the device UI password to continue.</p>
+            <div class="input-group">
+                <label for="login-password">Password</label>
+                <input type="password" id="login-password" autocomplete="current-password" placeholder="••••••••" />
+            </div>
+            <button class="btn btn-primary" id="login-submit">Unlock</button>
+            <div id="login-error" class="error-text" style="display:none;">Invalid password. Try again.</div>
+        </div>
+    </div>
+
+    <div id="app-shell" style="display:none;">
+        <header>
+            <h1>PwnPower</h1>
+            <div class="subtitle">Offensive Appliances Research</div>
+            <button id="privacy-toggle" class="privacy-btn" onclick="togglePrivacyMode()" title="Toggle Privacy Mode for demos">
+                <span id="privacy-icon">◉</span>
+            </button>
+        </header>
+        <div id="scan-busy-banner" class="warning-banner" style="display:none;">Scan in progress…</div>
+        
+        <main>
         <section id="wifi" class="section">
             <div class="section-title" onclick="toggleSection('wifi')">
                 <h2>WiFi Recon & Attacks</h2>
@@ -470,6 +484,19 @@
                         </div>
                     </div>
                     <div class="card">
+                        <h4>Login Security</h4>
+                        <div class="muted" id="auth-status-text">Loading auth status…</div>
+                        <form id="auth-form" style="display:flex;flex-direction:column;gap:8px;">
+                            <input type="password" id="auth-current" placeholder="Current password (leave blank if disabled)" autocomplete="current-password">
+                            <input type="password" id="auth-new" placeholder="New password (8-64 chars, or empty to disable)" autocomplete="new-password">
+                            <div class="btn-group">
+                                <button type="submit" class="btn btn-primary">Update Login</button>
+                                <button type="button" class="btn" onclick="disableLogin()">Disable Login</button>
+                            </div>
+                        </form>
+                        <div id="auth-message" class="muted" style="margin-top:8px;"></div>
+                    </div>
+                    <div class="card">
                         <h4>Home Networks</h4>
                         <div class="muted" style="margin-bottom:12px;">Devices seen on these networks are automatically marked as "Home"</div>
                         <div style="margin-bottom:8px;">
@@ -532,13 +559,3 @@
                         <div class="muted">Educational purposes only</div>
                     </div>
                 </div>
-            </div>
-        </section>
-    </main>
-    
-    <div class="privacy-indicator">Privacy Mode Active</div>
-    <script src="app.js"></script>
-</body>
-</html>
-
-</html>

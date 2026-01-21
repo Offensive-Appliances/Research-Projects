@@ -9,6 +9,9 @@ let wifiStatusCache = { data: null, timestamp: 0, pending: null };
 let scanReportCache = { data: null, timestamp: 0, pending: null };
 let manualScanBusy = false;
 let bgScanBusy = false;
+let authToken = null;
+let appInitialized = false;
+let authPasswordEnabled = true;
 
 let refreshNetworkIntelligence = async () => {
     await Promise.all([loadDeviceIntelligence(), loadBottleneckAnalysis()]);
@@ -21,6 +24,49 @@ const scheduleIdle = (fn) => {
         setTimeout(fn, 0);
     }
 };
+
+async function fetchAuthed(url, opts = {}) {
+    const headers = Object.assign({}, opts.headers || {});
+    if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+    return fetch(url, { ...opts, headers });
+}
+
+async function loadAuthStatus() {
+    const res = await fetchJSON('/auth/status');
+    const textEl = document.getElementById('auth-status-text');
+    if (!res) {
+        if (textEl) textEl.textContent = 'Auth status unavailable';
+        return;
+    }
+    authPasswordEnabled = !!res.has_password;
+    if (textEl) textEl.textContent = res.authorized ? 'Login required (authorized)' : 'Login required (not authorized)';
+    if (!authPasswordEnabled) {
+        if (textEl) textEl.textContent = 'Login disabled (no password set)';
+    }
+}
+
+async function updateAuthPassword(newPassword, currentPassword = '') {
+    const res = await fetchJSON('/auth/password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ current_password: currentPassword, new_password: newPassword })
+    });
+    return res;
+}
+
+async function disableLogin() {
+    const current = document.getElementById('auth-current')?.value || '';
+    const msg = document.getElementById('auth-message');
+    const res = await updateAuthPassword('', current);
+    if (res && res.status === 'updated') {
+        if (msg) msg.textContent = 'Login disabled. Interface is open until a new password is set.';
+        authToken = null;
+        localStorage.removeItem('authToken');
+        await loadAuthStatus();
+    } else {
+        if (msg) msg.textContent = 'Failed to disable login (check current password)';
+    }
+}
 
 function setBusyState(manualBusy, backgroundBusy) {
     manualScanBusy = typeof manualBusy === 'boolean' ? manualBusy : manualScanBusy;
@@ -37,6 +83,189 @@ function setBusyState(manualBusy, backgroundBusy) {
         } else {
             banner.style.display = 'none';
         }
+    }
+}
+
+async function fetchJSON(url, opts = {}) {
+    try {
+        const headers = Object.assign({}, opts.headers || {});
+        if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+
+        const res = await fetch(url, { ...opts, headers });
+        if (!res.ok) {
+            console.error(`HTTP error for ${url}: ${res.status} ${res.statusText}`);
+            if (res.status === 401) {
+                await loadAuthStatus();
+                if (authPasswordEnabled) showLogin();
+            }
+            return null;
+        }
+        const text = await res.text();
+        if (!text || text.length === 0) {
+            console.error(`Empty response from ${url}`);
+            return null;
+        }
+        try {
+            return JSON.parse(text);
+        } catch (parseErr) {
+            console.error(`JSON parse error for ${url}:`, parseErr);
+            console.error(`Response length: ${text.length}, First 200 chars:`, text.substring(0, 200));
+            console.error(`Last 200 chars:`, text.substring(Math.max(0, text.length - 200)));
+            return null;
+        }
+    } catch (e) {
+        console.error(`Fetch error for ${url}:`, e);
+        return null;
+    }
+}
+
+function initApp() {
+    initPrivacyMode();
+
+    // Fire initial data loads in parallel to reduce blocking
+    Promise.all([
+        loadScanData(true),
+        loadApConfig(),
+        loadNetworkStatus(),
+        loadGpioStatus(),
+        updateBgScanStatus(),
+        loadScanSettings(),
+        refreshNetworkIntelligence(),
+        loadHistoryCharts(7),
+        loadWebhookConfig(),
+        loadBottleneckAnalysis(),
+        loadAuthStatus()
+    ]).catch(() => {
+        // errors already logged per fetchJSON; keep page load resilient
+    });
+
+    // Non-urgent fetches after paint
+    scheduleIdle(() => loadHandshakes());
+    scheduleIdle(() => loadHomeSSIDs());
+
+    // Sync device sort dropdown with currentSort state
+    const deviceSort = $('#device-sort');
+    if (deviceSort) {
+        deviceSort.value = deviceIntelligenceData.currentSort;
+    }
+
+    addTrackedInterval(loadNetworkStatus, 10000);
+    addTrackedInterval(updateBgScanStatus, 5000);
+    addTrackedInterval(refreshNetworkIntelligence, 15000); // Reduced from 60s to 15s for better responsiveness
+    addTrackedInterval(loadBottleneckAnalysis, 30000); // Update bottleneck analysis every 30 seconds
+    if (!agoTicker) agoTicker = addTrackedInterval(updateAgoTick, 1000);
+
+    const apForm = $('#ap-config-form');
+    if (apForm) apForm.onsubmit = saveApConfig;
+
+    const netForm = $('#network-form');
+    if (netForm) netForm.onsubmit = connectToNetwork;
+
+    const webhookForm = $('#webhook-form');
+    if (webhookForm) webhookForm.onsubmit = saveWebhookConfig;
+
+    const authForm = $('#auth-form');
+    if (authForm) authForm.onsubmit = async (e) => {
+        e.preventDefault();
+        const newPassword = document.getElementById('auth-new')?.value || '';
+        const currentPassword = document.getElementById('auth-current')?.value || '';
+        const res = await updateAuthPassword(newPassword, currentPassword);
+        const msg = document.getElementById('auth-message');
+        if (res && res.status === 'updated') {
+            if (msg) msg.textContent = res.disabled ? 'Login disabled. Interface is open until a new password is set.' : 'Password updated.';
+            document.getElementById('auth-new').value = '';
+            document.getElementById('auth-current').value = '';
+            await loadAuthStatus();
+        } else {
+            if (msg) msg.textContent = 'Failed to update password (check current password)';
+        }
+    };
+}
+
+function showLogin(error = false) {
+    if (!authPasswordEnabled) return; // do not show overlay when login disabled
+    const login = document.getElementById('login-screen');
+    const app = document.getElementById('app-shell');
+    if (login) login.style.display = 'flex';
+    if (app) app.style.display = 'none';
+    const err = document.getElementById('login-error');
+    if (err) err.style.display = error ? 'block' : 'none';
+
+    authToken = null;
+    localStorage.removeItem('authToken');
+}
+
+function showAppShell() {
+    const login = document.getElementById('login-screen');
+    const app = document.getElementById('app-shell');
+    if (login) login.style.display = 'none';
+    if (app) app.style.display = 'block';
+}
+
+async function attemptLogin(password) {
+    const res = await fetchJSON('/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password })
+    });
+    if (res && res.token) {
+        authToken = res.token;
+        localStorage.setItem('authToken', authToken);
+        showLogin(false);
+        showAppShell();
+        if (!appInitialized) {
+            initApp();
+            appInitialized = true;
+        }
+        return true;
+    }
+    showLogin(true);
+    return false;
+}
+
+async function checkAuthAndStart() {
+    authToken = localStorage.getItem('authToken') || null;
+    const status = await fetchJSON('/auth/status');
+    if (status && status.authorized) {
+        showAppShell();
+        if (!appInitialized) {
+            initApp();
+            appInitialized = true;
+        }
+    } else if (status && status.has_password === false) {
+        authPasswordEnabled = false;
+        showAppShell();
+        if (!appInitialized) {
+            initApp();
+            appInitialized = true;
+        }
+    } else if (!status) {
+        // if status unavailable (e.g., transient TLS error), keep current view
+        if (appInitialized) {
+            showAppShell();
+        }
+    } else {
+        showLogin(false);
+    }
+}
+
+function initLoginUI() {
+    const btn = document.getElementById('login-submit');
+    const input = document.getElementById('login-password');
+    if (btn) {
+        btn.onclick = async () => {
+            const pass = input?.value || '';
+            if (!pass) return showLogin(true);
+            await attemptLogin(pass);
+        };
+    }
+    if (input) {
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                btn?.click();
+            }
+        });
     }
 }
 
@@ -167,32 +396,6 @@ function showWarningPopup(msg) {
     
     overlay.appendChild(popup);
     document.body.appendChild(overlay);
-}
-
-async function fetchJSON(url, opts = {}) {
-    try {
-        const res = await fetch(url, opts);
-        if (!res.ok) {
-            console.error(`HTTP error for ${url}: ${res.status} ${res.statusText}`);
-            return null;
-        }
-        const text = await res.text();
-        if (!text || text.length === 0) {
-            console.error(`Empty response from ${url}`);
-            return null;
-        }
-        try {
-            return JSON.parse(text);
-        } catch (parseErr) {
-            console.error(`JSON parse error for ${url}:`, parseErr);
-            console.error(`Response length: ${text.length}, First 200 chars:`, text.substring(0, 200));
-            console.error(`Last 200 chars:`, text.substring(Math.max(0, text.length - 200)));
-            return null;
-        }
-    } catch (e) {
-        console.error(`Fetch error for ${url}:`, e);
-        return null;
-    }
 }
 
 async function loadScanData(preventNewScan = false) {
@@ -529,7 +732,7 @@ async function triggerScan() {
 
     try {
         // The /scan endpoint is blocking and completes the scan before returning
-        const result = await fetch('/scan', { signal: activeScanController.signal });
+        const result = await fetchAuthed('/scan', { signal: activeScanController.signal });
 
         // Check if request was successful
         if (result && result.ok) {
@@ -2515,48 +2718,8 @@ async function testWebhook(e) {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-    initPrivacyMode();
-
-    // Fire initial data loads in parallel to reduce blocking
-    Promise.all([
-        loadScanData(true), // Only load cached data on page load
-        loadApConfig(),
-        loadNetworkStatus(),
-        loadGpioStatus(),
-        updateBgScanStatus(),
-        loadScanSettings(),
-        refreshNetworkIntelligence(),
-        loadHistoryCharts(7),
-        loadWebhookConfig(),
-        loadBottleneckAnalysis() // Initialize bottleneck detector
-    ]).catch(() => {
-        // errors already logged per fetchJSON; keep page load resilient
-    });
-
-    // Non-urgent fetches after paint
-    scheduleIdle(() => loadHandshakes());
-    scheduleIdle(() => loadHomeSSIDs());
-
-    // Sync device sort dropdown with currentSort state
-    const deviceSort = $('#device-sort');
-    if (deviceSort) {
-        deviceSort.value = deviceIntelligenceData.currentSort;
-    }
-
-    addTrackedInterval(loadNetworkStatus, 10000);
-    addTrackedInterval(updateBgScanStatus, 5000);
-    addTrackedInterval(refreshNetworkIntelligence, 15000); // Reduced from 60s to 15s for better responsiveness
-    addTrackedInterval(loadBottleneckAnalysis, 30000); // Update bottleneck analysis every 30 seconds
-    if (!agoTicker) agoTicker = addTrackedInterval(updateAgoTick, 1000);
-
-    const apForm = $('#ap-config-form');
-    if (apForm) apForm.onsubmit = saveApConfig;
-
-    const netForm = $('#network-form');
-    if (netForm) netForm.onsubmit = connectToNetwork;
-
-    const webhookForm = $('#webhook-form');
-    if (webhookForm) webhookForm.onsubmit = saveWebhookConfig;
+    initLoginUI();
+    checkAuthAndStart();
 });
 
 window.addEventListener('beforeunload', cleanupAllResources);

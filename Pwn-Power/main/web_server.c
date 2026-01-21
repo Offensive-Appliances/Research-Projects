@@ -28,6 +28,8 @@
 #include "monitor_uptime.h"
 #include "json_utils.h"
 #include "tls_cert.h"
+#include "nvs.h"
+#include "esp_random.h"
 #include <stddef.h>
 #include <time.h>
 #include <string.h>
@@ -64,9 +66,13 @@ static httpd_handle_t s_https_server = NULL;
 static httpd_handle_t s_http_redirect_server = NULL; // unused (redirect disabled)
 static tls_cert_bundle_t s_tls_bundle;
 
+static char s_ui_password[65] = {0};
+static char s_auth_token[65] = {0};
+
 static esp_err_t register_routes(httpd_handle_t server);
 static httpd_handle_t start_https_server(void);
 static httpd_handle_t start_http_redirect_server(void);
+static esp_err_t wifi_status_handler(httpd_req_t *req);
 
 // simple STA connection helpers used by the web UI
 static volatile bool g_sta_connected = false;
@@ -89,6 +95,266 @@ uint32_t webserver_get_last_request_time(void) {
 
 static void update_last_request_time(void) {
     g_last_request_time = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+}
+
+static void auth_generate_token(void) {
+    for (int i = 0; i < 32; i++) {
+        uint8_t b = (uint8_t)(esp_random() & 0xFF);
+        snprintf(&s_auth_token[i * 2], 3, "%02x", b);
+    }
+    s_auth_token[64] = '\0';
+}
+
+static void auth_load_password(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("ui_auth", NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS for auth: %s", esp_err_to_name(err));
+        strncpy(s_ui_password, "pwnpower", sizeof(s_ui_password) - 1);
+        return;
+    }
+
+    size_t len = sizeof(s_ui_password);
+    err = nvs_get_str(handle, "password", s_ui_password, &len);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        strncpy(s_ui_password, "pwnpower", sizeof(s_ui_password) - 1);
+        nvs_set_str(handle, "password", s_ui_password);
+        nvs_commit(handle);
+        ESP_LOGI(TAG, "Initialized default UI password");
+    } else if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to read auth password: %s", esp_err_to_name(err));
+        strncpy(s_ui_password, "pwnpower", sizeof(s_ui_password) - 1);
+    }
+
+    nvs_close(handle);
+}
+
+static bool auth_is_authorized(httpd_req_t *req) {
+    // If password is unset/empty, auth is effectively disabled
+    if (s_ui_password[0] == '\0') {
+        return true;
+    }
+
+    // 1) Bearer header
+    char auth_hdr[128] = {0};
+    if (httpd_req_get_hdr_value_str(req, "Authorization", auth_hdr, sizeof(auth_hdr)) != ESP_OK) {
+        auth_hdr[0] = '\0';
+    }
+
+    const char prefix[] = "Bearer ";
+    size_t prefix_len = strlen(prefix);
+    if (strncmp(auth_hdr, prefix, prefix_len) == 0) {
+        const char *token = auth_hdr + prefix_len;
+        if (strlen(token) == strlen(s_auth_token) && s_auth_token[0] != '\0' && strcmp(token, s_auth_token) == 0) {
+            return true;
+        }
+    }
+
+    // 2) Cookie fallback
+    char cookie_hdr[256] = {0};
+    if (httpd_req_get_hdr_value_str(req, "Cookie", cookie_hdr, sizeof(cookie_hdr)) == ESP_OK) {
+        const char *p = strstr(cookie_hdr, "auth_token=");
+        if (p) {
+            p += strlen("auth_token=");
+            char token_buf[65] = {0};
+            int i = 0;
+            while (*p && *p != ';' && i < (int)sizeof(token_buf) - 1) {
+                token_buf[i++] = *p++;
+            }
+            token_buf[i] = '\0';
+            if (strlen(token_buf) == strlen(s_auth_token) && strcmp(token_buf, s_auth_token) == 0) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static bool auth_require(httpd_req_t *req) {
+    if (auth_is_authorized(req)) return true;
+
+    ESP_LOGW(TAG, "Auth rejected uri=%s", req->uri);
+    httpd_resp_set_status(req, "401 Unauthorized");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "WWW-Authenticate", "Bearer");
+    httpd_resp_sendstr(req, "{\"error\":\"unauthorized\"}");
+    return false;
+}
+
+static esp_err_t auth_status_handler(httpd_req_t *req) {
+    update_last_request_time();
+    bool ok = auth_is_authorized(req);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "authorized", ok);
+    cJSON_AddBoolToObject(root, "has_password", strlen(s_ui_password) > 0);
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json);
+    cJSON_free(json);
+    return ESP_OK;
+}
+
+static esp_err_t auth_login_handler(httpd_req_t *req) {
+    update_last_request_time();
+    char buf[96];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing body");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+
+    cJSON *pass = cJSON_GetObjectItem(root, "password");
+    if (!cJSON_IsString(pass)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "password required");
+        return ESP_FAIL;
+    }
+
+    if (s_ui_password[0] != '\0' && strcmp(pass->valuestring, s_ui_password) != 0) {
+        cJSON_Delete(root);
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_sendstr(req, "{\"error\":\"invalid\"}");
+        return ESP_FAIL;
+    }
+
+    auth_generate_token();
+    cJSON_Delete(root);
+
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddStringToObject(res, "token", s_auth_token);
+    char *json = cJSON_PrintUnformatted(res);
+    cJSON_Delete(res);
+
+    // also set cookie for browsers to auto-send
+    httpd_resp_set_hdr(req, "Set-Cookie", "auth_token=");
+    char cookie_val[96];
+    snprintf(cookie_val, sizeof(cookie_val), "auth_token=%s; Path=/; HttpOnly", s_auth_token);
+    httpd_resp_set_hdr(req, "Set-Cookie", cookie_val);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json);
+    cJSON_free(json);
+    return ESP_OK;
+}
+
+static esp_err_t auth_logout_handler(httpd_req_t *req) {
+    update_last_request_time();
+    s_auth_token[0] = '\0';
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Set-Cookie", "auth_token=; Path=/; Max-Age=0");
+    httpd_resp_sendstr(req, "{\"status\":\"logged_out\"}");
+    return ESP_OK;
+}
+
+static esp_err_t auth_password_handler(httpd_req_t *req) {
+    update_last_request_time();
+    bool authed = auth_is_authorized(req);
+
+    char buf[160];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing body");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+
+    cJSON *current = cJSON_GetObjectItem(root, "current_password");
+    cJSON *next = cJSON_GetObjectItem(root, "new_password");
+    if (!cJSON_IsString(next) || strlen(next->valuestring) >= sizeof(s_ui_password)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Password must be 0-64 chars");
+        return ESP_FAIL;
+    }
+
+    size_t new_len = strlen(next->valuestring);
+    bool disabling = new_len == 0;
+    if (!disabling && new_len < 8) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Password must be 8-64 chars or empty to disable");
+        return ESP_FAIL;
+    }
+
+    if (!authed) {
+        if (s_ui_password[0] != '\0') {
+            if (!cJSON_IsString(current) || strcmp(current->valuestring, s_ui_password) != 0) {
+                cJSON_Delete(root);
+                httpd_resp_set_status(req, "401 Unauthorized");
+                httpd_resp_sendstr(req, "{\"error\":\"invalid\"}");
+                return ESP_FAIL;
+            }
+        }
+    }
+
+    nvs_handle_t handle;
+    if (nvs_open("ui_auth", NVS_READWRITE, &handle) != ESP_OK) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "NVS error");
+        return ESP_FAIL;
+    }
+    esp_err_t err = nvs_set_str(handle, "password", next->valuestring);
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+
+    if (err != ESP_OK) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save password");
+        return ESP_FAIL;
+    }
+
+    strncpy(s_ui_password, next->valuestring, sizeof(s_ui_password) - 1);
+    s_ui_password[sizeof(s_ui_password) - 1] = '\0';
+    s_auth_token[0] = '\0';
+
+    cJSON_Delete(root);
+
+    httpd_resp_set_hdr(req, "Set-Cookie", "auth_token=; Path=/; Max-Age=0");
+
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddStringToObject(res, "status", "updated");
+    cJSON_AddBoolToObject(res, "disabled", disabling);
+    char *json = cJSON_PrintUnformatted(res);
+    cJSON_Delete(res);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json);
+    cJSON_free(json);
+    return ESP_OK;
+}
+
+typedef esp_err_t (*route_handler_fn)(httpd_req_t *req);
+
+static esp_err_t authed_handler(httpd_req_t *req) {
+    route_handler_fn fn = (route_handler_fn)req->user_ctx;
+    if (!fn) return ESP_FAIL;
+    if (!auth_require(req)) return ESP_OK; // already responded 401
+    return fn(req);
+}
+
+static httpd_uri_t uri_auth_status = { .uri = "/auth/status", .method = HTTP_GET, .handler = auth_status_handler, .user_ctx = NULL };
+static httpd_uri_t uri_auth_login = { .uri = "/auth/login", .method = HTTP_POST, .handler = auth_login_handler, .user_ctx = NULL };
+static httpd_uri_t uri_auth_logout = { .uri = "/auth/logout", .method = HTTP_POST, .handler = auth_logout_handler, .user_ctx = NULL };
+static httpd_uri_t uri_auth_password = { .uri = "/auth/password", .method = HTTP_POST, .handler = auth_password_handler, .user_ctx = NULL };
+
+static void register_authed(httpd_handle_t server, const char *uri, httpd_method_t method, route_handler_fn fn) {
+    httpd_uri_t cfg = { .uri = uri, .method = method, .handler = authed_handler, .user_ctx = fn };
+    httpd_register_uri_handler(server, &cfg);
 }
 
 static void ip_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
@@ -851,19 +1117,12 @@ httpd_uri_t uri_get = {
     .user_ctx = NULL
 };
 
-httpd_uri_t uri_scan = {
-    .uri = "/scan",
-    .method = HTTP_GET,
-    .handler = wifi_scan_handler,
-    .user_ctx = NULL
-};
+#define AUTHE_URI(name, path, verb, fn) \
+    httpd_uri_t name = { .uri = path, .method = verb, .handler = authed_handler, .user_ctx = fn }
 
-httpd_uri_t uri_cached_scan = {
-    .uri = "/cached-scan",
-    .method = HTTP_GET,
-    .handler = cached_scan_handler,
-    .user_ctx = NULL
-};
+AUTHE_URI(uri_scan, "/scan", HTTP_GET, wifi_scan_handler);
+AUTHE_URI(uri_cached_scan, "/cached-scan", HTTP_GET, cached_scan_handler);
+AUTHE_URI(uri_wifi_status, "/wifi/status", HTTP_GET, wifi_status_handler);
 
 static esp_err_t wifi_scan_status_handler(httpd_req_t *req) {
     ESP_LOGI(TAG, "Received scan status request");
@@ -884,46 +1143,16 @@ static esp_err_t wifi_scan_status_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-httpd_uri_t uri_wifi_scan_status = {
-    .uri = "/wifi/scan-status",
-    .method = HTTP_GET,
-    .handler = wifi_scan_status_handler,
-    .user_ctx = NULL
-};
+AUTHE_URI(uri_wifi_scan_status, "/wifi/scan-status", HTTP_GET, wifi_scan_status_handler);
 
-httpd_uri_t uri_attack = {
-    .uri = "/start-attack",
-    .method = HTTP_POST,
-    .handler = startattack_handler,
-    .user_ctx = NULL
-};
+AUTHE_URI(uri_attack, "/start-attack", HTTP_POST, startattack_handler);
+AUTHE_URI(uri_attack_alt, "/attack", HTTP_POST, startattack_handler);
 
-httpd_uri_t uri_attack_alt = {
-    .uri = "/attack",
-    .method = HTTP_POST,
-    .handler = startattack_handler,
-    .user_ctx = NULL
-};
+AUTHE_URI(uri_stations, "/scan-stations", HTTP_GET, station_scan_handler);
 
-httpd_uri_t uri_stations = {
-    .uri = "/scan-stations",
-    .method = HTTP_GET,
-    .handler = station_scan_handler
-};
+AUTHE_URI(uri_handshake, "/handshake-capture", HTTP_POST, handshake_handler);
 
-httpd_uri_t uri_handshake = {
-    .uri = "/handshake-capture",
-    .method = HTTP_POST,
-    .handler = handshake_handler,
-    .user_ctx = NULL
-};
-
-httpd_uri_t uri_handshake_alt = {
-    .uri = "/handshake",
-    .method = HTTP_POST,
-    .handler = handshake_handler,
-    .user_ctx = NULL
-};
+AUTHE_URI(uri_handshake_alt, "/handshake", HTTP_POST, handshake_handler);
 
 typedef struct { int channel; int duration; } gc_args_t;
 static void gc_task(void *arg) {
@@ -981,12 +1210,7 @@ static esp_err_t general_capture_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-httpd_uri_t uri_hs_pcap = {
-    .uri = "/handshake.pcap",
-    .method = HTTP_GET,
-    .handler = handshake_pcap_handler,
-    .user_ctx = NULL
-};
+AUTHE_URI(uri_hs_pcap, "/handshake.pcap", HTTP_GET, handshake_pcap_handler);
 
 static esp_err_t capture_history_handler(httpd_req_t *req) {
     update_last_request_time();
@@ -995,12 +1219,7 @@ static esp_err_t capture_history_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-httpd_uri_t uri_capture_history = {
-    .uri = "/captures",
-    .method = HTTP_GET,
-    .handler = capture_history_handler,
-    .user_ctx = NULL
-};
+AUTHE_URI(uri_capture_history, "/captures", HTTP_GET, capture_history_handler);
 
 static esp_err_t security_stats_handler(httpd_req_t *req) {
     update_last_request_time();
@@ -1009,33 +1228,13 @@ static esp_err_t security_stats_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-httpd_uri_t uri_security_stats = {
-    .uri = "/security/stats",
-    .method = HTTP_GET,
-    .handler = security_stats_handler,
-    .user_ctx = NULL
-};
+AUTHE_URI(uri_security_stats, "/security/stats", HTTP_GET, security_stats_handler);
 
-httpd_uri_t uri_general_capture = {
-    .uri = "/capture",
-    .method = HTTP_POST,
-    .handler = general_capture_handler,
-    .user_ctx = NULL
-};
+AUTHE_URI(uri_general_capture, "/capture", HTTP_POST, general_capture_handler);
 
-httpd_uri_t uri_ota = {
-	.uri = "/ota",
-	.method = HTTP_POST,
-	.handler = ota_upload_handler,
-	.user_ctx = NULL
-};
+AUTHE_URI(uri_ota, "/ota", HTTP_POST, ota_upload_handler);
 
-httpd_uri_t uri_ota_fetch = {
-	.uri = "/ota/fetch",
-	.method = HTTP_POST,
-	.handler = ota_fetch_handler,
-	.user_ctx = NULL
-};
+AUTHE_URI(uri_ota_fetch, "/ota/fetch", HTTP_POST, ota_fetch_handler);
 
 static esp_err_t wifi_connect_handler(httpd_req_t *req) {
     char buf[256] = {0};
@@ -1256,13 +1455,6 @@ static esp_err_t gpio_status_handler(httpd_req_t *req) {
     cJSON_Delete(res);
     return ESP_OK;
 }
-
-httpd_uri_t uri_wifi_status = {
-    .uri = "/wifi/status",
-    .method = HTTP_GET,
-    .handler = wifi_status_handler,
-    .user_ctx = NULL
-};
 
 static esp_err_t scan_report_handler(httpd_req_t *req) {
     char chunk[512];
@@ -2034,67 +2226,43 @@ static esp_err_t register_routes(httpd_handle_t server) {
     httpd_register_uri_handler(server, &uri_general_capture);
     httpd_register_uri_handler(server, &uri_ota);
     httpd_register_uri_handler(server, &uri_ota_fetch);
+    httpd_register_uri_handler(server, &uri_auth_status);
+    httpd_register_uri_handler(server, &uri_auth_login);
+    httpd_register_uri_handler(server, &uri_auth_logout);
+    httpd_register_uri_handler(server, &uri_auth_password);
     httpd_register_uri_handler(server, &uri_wifi_status);
 
-    httpd_uri_t uri_gpio_set = { .uri = "/gpio", .method = HTTP_POST, .handler = gpio_set_handler, .user_ctx = NULL };
-    httpd_uri_t uri_gpio_status = { .uri = "/gpio/status", .method = HTTP_GET, .handler = gpio_status_handler, .user_ctx = NULL };
-    httpd_register_uri_handler(server, &uri_gpio_set);
-    httpd_register_uri_handler(server, &uri_gpio_status);
+    register_authed(server, "/gpio", HTTP_POST, gpio_set_handler);
+    register_authed(server, "/gpio/status", HTTP_GET, gpio_status_handler);
 
-    httpd_uri_t uri_wifi_connect = { .uri = "/wifi/connect", .method = HTTP_POST, .handler = wifi_connect_handler, .user_ctx = NULL };
-    httpd_register_uri_handler(server, &uri_wifi_connect);
+    register_authed(server, "/wifi/connect", HTTP_POST, wifi_connect_handler);
+    register_authed(server, "/wifi/settings", HTTP_POST, wifi_settings_handler);
+    register_authed(server, "/wifi/disconnect", HTTP_POST, wifi_disconnect_handler);
 
-    httpd_uri_t uri_wifi_settings = { .uri = "/wifi/settings", .method = HTTP_POST, .handler = wifi_settings_handler, .user_ctx = NULL };
-    httpd_uri_t uri_wifi_disconnect = { .uri = "/wifi/disconnect", .method = HTTP_POST, .handler = wifi_disconnect_handler, .user_ctx = NULL };
-    httpd_register_uri_handler(server, &uri_wifi_settings);
-    httpd_register_uri_handler(server, &uri_wifi_disconnect);
+    register_authed(server, "/scan/report", HTTP_GET, scan_report_handler);
+    register_authed(server, "/scan/timeline", HTTP_GET, scan_timeline_handler);
+    register_authed(server, "/scan/trigger", HTTP_POST, scan_trigger_handler);
+    register_authed(server, "/scan/status", HTTP_GET, scan_status_handler);
+    register_authed(server, "/scan/settings", HTTP_GET, scan_config_get_handler);
+    register_authed(server, "/scan/settings", HTTP_POST, scan_config_handler);
+    register_authed(server, "/scan/clear", HTTP_POST, scan_clear_handler);
+    register_authed(server, "/intelligence", HTTP_GET, intelligence_handler);
+    register_authed(server, "/devices/presence", HTTP_GET, device_presence_handler);
+    register_authed(server, "/intelligence/unified", HTTP_GET, unified_intelligence_handler);
 
-    httpd_uri_t uri_scan_report = { .uri = "/scan/report", .method = HTTP_GET, .handler = scan_report_handler, .user_ctx = NULL };
-    httpd_uri_t uri_scan_timeline = { .uri = "/scan/timeline", .method = HTTP_GET, .handler = scan_timeline_handler, .user_ctx = NULL };
-    httpd_uri_t uri_scan_trigger = { .uri = "/scan/trigger", .method = HTTP_POST, .handler = scan_trigger_handler, .user_ctx = NULL };
-    httpd_uri_t uri_scan_status = { .uri = "/scan/status", .method = HTTP_GET, .handler = scan_status_handler, .user_ctx = NULL };
-    httpd_uri_t uri_scan_config_get = { .uri = "/scan/settings", .method = HTTP_GET, .handler = scan_config_get_handler, .user_ctx = NULL };
-    httpd_uri_t uri_scan_config = { .uri = "/scan/settings", .method = HTTP_POST, .handler = scan_config_handler, .user_ctx = NULL };
-    httpd_uri_t uri_scan_clear = { .uri = "/scan/clear", .method = HTTP_POST, .handler = scan_clear_handler, .user_ctx = NULL };
-    httpd_uri_t uri_intelligence = { .uri = "/intelligence", .method = HTTP_GET, .handler = intelligence_handler, .user_ctx = NULL };
-    httpd_uri_t uri_device_presence = { .uri = "/devices/presence", .method = HTTP_GET, .handler = device_presence_handler, .user_ctx = NULL };
-    httpd_uri_t uri_unified_intelligence = { .uri = "/intelligence/unified", .method = HTTP_GET, .handler = unified_intelligence_handler, .user_ctx = NULL };
-    httpd_register_uri_handler(server, &uri_scan_report);
-    httpd_register_uri_handler(server, &uri_scan_timeline);
-    httpd_register_uri_handler(server, &uri_scan_trigger);
-    httpd_register_uri_handler(server, &uri_scan_status);
-    httpd_register_uri_handler(server, &uri_scan_config_get);
-    httpd_register_uri_handler(server, &uri_scan_config);
-    httpd_register_uri_handler(server, &uri_scan_clear);
-    httpd_register_uri_handler(server, &uri_intelligence);
-    httpd_register_uri_handler(server, &uri_device_presence);
-    httpd_register_uri_handler(server, &uri_unified_intelligence);
+    register_authed(server, "/ap/config", HTTP_GET, ap_config_get_handler);
+    register_authed(server, "/ap/config", HTTP_POST, ap_config_set_handler);
 
-    httpd_uri_t uri_ap_config_get = { .uri = "/ap/config", .method = HTTP_GET, .handler = ap_config_get_handler, .user_ctx = NULL };
-    httpd_uri_t uri_ap_config_set = { .uri = "/ap/config", .method = HTTP_POST, .handler = ap_config_set_handler, .user_ctx = NULL };
-    httpd_register_uri_handler(server, &uri_ap_config_get);
-    httpd_register_uri_handler(server, &uri_ap_config_set);
-
-    httpd_uri_t uri_history_samples = { .uri = "/history/samples", .method = HTTP_GET, .handler = history_samples_handler, .user_ctx = NULL };
-    httpd_uri_t uri_devices_list = { .uri = "/devices/list", .method = HTTP_GET, .handler = devices_list_handler, .user_ctx = NULL };
-    httpd_uri_t uri_devices_update = { .uri = "/devices/update", .method = HTTP_POST, .handler = devices_update_handler, .user_ctx = NULL };
-    httpd_uri_t uri_webhook_config_get = { .uri = "/webhook/config", .method = HTTP_GET, .handler = webhook_config_get_handler, .user_ctx = NULL };
-    httpd_uri_t uri_webhook_config_set = { .uri = "/webhook/config", .method = HTTP_POST, .handler = webhook_config_set_handler, .user_ctx = NULL };
-    httpd_uri_t uri_webhook_test = { .uri = "/webhook/test", .method = HTTP_POST, .handler = webhook_test_handler, .user_ctx = NULL };
-    httpd_uri_t uri_home_ssids_get = { .uri = "/home-ssids", .method = HTTP_GET, .handler = home_ssids_get_handler, .user_ctx = NULL };
-    httpd_uri_t uri_home_ssids_add = { .uri = "/home-ssids/add", .method = HTTP_POST, .handler = home_ssids_add_handler, .user_ctx = NULL };
-    httpd_uri_t uri_home_ssids_remove = { .uri = "/home-ssids/remove", .method = HTTP_POST, .handler = home_ssids_remove_handler, .user_ctx = NULL };
-    httpd_uri_t uri_home_ssids_refresh = { .uri = "/home-ssids/refresh", .method = HTTP_POST, .handler = home_ssids_refresh_handler, .user_ctx = NULL };
-    httpd_register_uri_handler(server, &uri_history_samples);
-    httpd_register_uri_handler(server, &uri_devices_list);
-    httpd_register_uri_handler(server, &uri_devices_update);
-    httpd_register_uri_handler(server, &uri_webhook_config_get);
-    httpd_register_uri_handler(server, &uri_webhook_config_set);
-    httpd_register_uri_handler(server, &uri_webhook_test);
-    httpd_register_uri_handler(server, &uri_home_ssids_get);
-    httpd_register_uri_handler(server, &uri_home_ssids_add);
-    httpd_register_uri_handler(server, &uri_home_ssids_remove);
-    httpd_register_uri_handler(server, &uri_home_ssids_refresh);
+    register_authed(server, "/history/samples", HTTP_GET, history_samples_handler);
+    register_authed(server, "/devices/list", HTTP_GET, devices_list_handler);
+    register_authed(server, "/devices/update", HTTP_POST, devices_update_handler);
+    register_authed(server, "/webhook/config", HTTP_GET, webhook_config_get_handler);
+    register_authed(server, "/webhook/config", HTTP_POST, webhook_config_set_handler);
+    register_authed(server, "/webhook/test", HTTP_POST, webhook_test_handler);
+    register_authed(server, "/home-ssids", HTTP_GET, home_ssids_get_handler);
+    register_authed(server, "/home-ssids/add", HTTP_POST, home_ssids_add_handler);
+    register_authed(server, "/home-ssids/remove", HTTP_POST, home_ssids_remove_handler);
+    register_authed(server, "/home-ssids/refresh", HTTP_POST, home_ssids_refresh_handler);
 
     ESP_LOGI(TAG, "All URI handlers registered successfully");
     ESP_LOGI(TAG, "Free heap after registration: %lu bytes", (unsigned long)esp_get_free_heap_size());
@@ -2114,6 +2282,9 @@ static httpd_handle_t start_https_server(void) {
         return NULL;
     }
 
+    auth_load_password();
+    auth_generate_token();
+
     httpd_ssl_config_t conf = HTTPD_SSL_CONFIG_DEFAULT();
     conf.port_secure = 443;
     conf.servercert = (const uint8_t *)s_tls_bundle.cert_pem;
@@ -2121,12 +2292,12 @@ static httpd_handle_t start_https_server(void) {
     conf.prvtkey_pem = (const uint8_t *)s_tls_bundle.key_pem;
     conf.prvtkey_len = strlen(s_tls_bundle.key_pem) + 1;
     conf.httpd.max_uri_handlers = 48;
-    conf.httpd.max_open_sockets = 3; // allow an extra TLS socket if heap permits
+    conf.httpd.max_open_sockets = 3; // limited by LWIP_MAX_SOCKETS (HTTPD uses 3 internally)
     conf.httpd.backlog_conn = 2;
     conf.httpd.lru_purge_enable = true;
-    conf.httpd.send_wait_timeout = 8;   // slightly longer to finish TLS flight
-    conf.httpd.recv_wait_timeout = 8;
-    conf.httpd.keep_alive_enable = false;
+    conf.httpd.send_wait_timeout = 5;   // slightly longer to finish TLS flight
+    conf.httpd.recv_wait_timeout = 5;
+    conf.httpd.keep_alive_enable = true;
     conf.httpd.stack_size = 7168;       // more stack for TLS crypto
 
     httpd_handle_t server = NULL;
