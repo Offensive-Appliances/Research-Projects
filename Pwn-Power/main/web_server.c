@@ -67,7 +67,7 @@ static TaskHandle_t hs_task_handle = NULL;
 static hs_args_t hs_args;
 
 static httpd_handle_t s_https_server = NULL;
-static httpd_handle_t s_http_redirect_server = NULL; // unused (redirect disabled)
+static httpd_handle_t s_http_redirect_server = NULL; // http->https redirect server
 static tls_cert_bundle_t s_tls_bundle;
 
 static char s_ui_password[65] = {0};
@@ -1935,8 +1935,8 @@ static esp_err_t history_samples_handler(httpd_req_t *req) {
     uint32_t start_idx = (history_count > max_samples) ? (history_count - max_samples) : 0;
     ESP_LOGD(TAG, "history_samples_handler: start_idx=%u, remaining=%u", start_idx, remaining);
     
-    // Larger chunk size for fewer flash read operations (48 bytes * 300 = 14.4KB)
-    #define HISTORY_CHUNK_SIZE 300
+    // Chunk size for flash read operations (48 bytes * 200 = 9.6KB, fits in fragmented heap)
+    #define HISTORY_CHUNK_SIZE 150
     history_sample_t *chunk = malloc(sizeof(history_sample_t) * HISTORY_CHUNK_SIZE);
     if (!chunk) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
@@ -2428,10 +2428,50 @@ static esp_err_t register_routes(httpd_handle_t server) {
 }
 
 static esp_err_t redirect_handler(httpd_req_t *req) {
+    char host[128] = {0};
+    if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK) {
+        strlcpy(host, "192.168.4.1", sizeof(host));
+    }
+
+    char location[192];
+    int written = snprintf(location, sizeof(location), "https://%s/", host);
+    if (written <= 0 || written >= (int)sizeof(location)) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Redirect failed");
+        return ESP_FAIL;
+    }
+
     httpd_resp_set_status(req, "301 Moved Permanently");
-    httpd_resp_set_hdr(req, "Location", "https://192.168.4.1/");
+    httpd_resp_set_hdr(req, "Location", location);
     httpd_resp_send(req, NULL, 0);
     return ESP_OK;
+}
+
+static httpd_handle_t start_http_redirect_server(void) {
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 80;
+    config.lru_purge_enable = true;
+    config.max_uri_handlers = 4;
+    config.uri_match_fn = httpd_uri_match_wildcard;
+
+    httpd_uri_t redirect_uri = {
+        .uri = "/*",
+        .method = HTTP_GET,
+        .handler = redirect_handler,
+        .user_ctx = NULL,
+        .is_websocket = false,
+        .handle_ws_control_frames = false,
+        .supported_subprotocol = NULL,
+    };
+
+    httpd_handle_t server = NULL;
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_register_uri_handler(server, &redirect_uri);
+        ESP_LOGI(TAG, "HTTP redirect server started on :80");
+    } else {
+        ESP_LOGW(TAG, "Failed to start HTTP redirect server");
+    }
+
+    return server;
 }
 
 // Connection open handler - checks heap health before accepting HTTPS connections
@@ -2496,6 +2536,11 @@ httpd_handle_t start_webserver(void) {
     if (!s_https_server) {
         ESP_LOGE(TAG, "HTTPS server failed to start");
         return NULL;
+    }
+
+    // Optional HTTP redirect server (best-effort, non-fatal)
+    if (!s_http_redirect_server) {
+        s_http_redirect_server = start_http_redirect_server();
     }
 
     ESP_LOGI(TAG, "=== WEB SERVER READY (HTTPS only) ===");
