@@ -21,6 +21,7 @@
 - Added ability to send configurable alerts to a webhook
 - Enabled HTTPS with on-device self-signed cert
 - Added mDNS support for pwnpower.local on PwnPower AP
+- Added a first time boot setup wizard
 
 ### Changed
 - Merged WiFi Recon and Attack sections into a single section

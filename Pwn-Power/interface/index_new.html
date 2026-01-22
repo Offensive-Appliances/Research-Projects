@@ -21,6 +21,124 @@
         </div>
     </div>
 
+    <div id="wizard-screen" class="wizard-screen" style="display:none;">
+        <div class="wizard-container">
+            <div class="wizard-header">
+                <h2>Welcome to PwnPower</h2>
+                <div class="wizard-progress">
+                    <div class="wizard-step active" data-step="1">1</div>
+                    <div class="wizard-step" data-step="2">2</div>
+                    <div class="wizard-step" data-step="3">3</div>
+                    <div class="wizard-step" data-step="4">4</div>
+                    <div class="wizard-step" data-step="5">5</div>
+                </div>
+            </div>
+
+            <div class="wizard-page active" id="wizard-page-1">
+                <h3>Operating Mode</h3>
+                <p class="muted">Choose how PwnPower should operate</p>
+                <div class="wizard-options">
+                    <label class="wizard-option">
+                        <input type="radio" name="mode" value="standalone" checked>
+                        <div class="option-content">
+                            <strong>Standalone Mode</strong>
+                            <span class="muted">No internet required. Time won't be synced but all features work.</span>
+                        </div>
+                    </label>
+                    <label class="wizard-option">
+                        <input type="radio" name="mode" value="connected">
+                        <div class="option-content">
+                            <strong>Connected Mode</strong>
+                            <span class="muted">Connect to your home WiFi for time sync, mDNS access (pwnpower.local), and webhook alerts.</span>
+                        </div>
+                    </label>
+                </div>
+            </div>
+
+            <div class="wizard-page" id="wizard-page-2">
+                <h3>Home Network</h3>
+                <p class="muted">Connect to your home WiFi network</p>
+                <div id="wizard-network-form">
+                    <div class="input-group">
+                        <label>Network SSID</label>
+                        <input type="text" id="wizard-net-ssid" placeholder="Your WiFi name">
+                    </div>
+                    <div class="input-group">
+                        <label>Password</label>
+                        <input type="password" id="wizard-net-pass" placeholder="WiFi password">
+                    </div>
+                    <label class="wizard-checkbox">
+                        <input type="checkbox" id="wizard-keep-ap" checked>
+                        <span>Keep internal AP active when connected</span>
+                    </label>
+                    <label class="wizard-checkbox">
+                        <input type="checkbox" id="wizard-auto-connect" checked>
+                        <span>Auto-connect on boot</span>
+                    </label>
+                </div>
+                <div class="muted" style="margin-top:12px;font-size:11px;">You can skip this step and configure later.</div>
+            </div>
+
+            <div class="wizard-page" id="wizard-page-3">
+                <h3>Internal Access Point</h3>
+                <p class="muted">Configure the device's WiFi network</p>
+                <div class="input-group">
+                    <label>AP Name (SSID)</label>
+                    <input type="text" id="wizard-ap-ssid" placeholder="PwnPower" maxlength="32">
+                </div>
+                <div class="input-group">
+                    <label>AP Password (8+ chars or empty for open)</label>
+                    <input type="password" id="wizard-ap-pass" placeholder="Leave empty for open network">
+                </div>
+                <div class="muted" style="margin-top:12px;font-size:11px;">Default: Open network named "PwnPower". Change for better security.</div>
+            </div>
+
+            <div class="wizard-page" id="wizard-page-4">
+                <h3>Login Security</h3>
+                <p class="muted">Configure interface access password</p>
+                <div class="input-group">
+                    <label>New Password (8-64 chars, or empty to disable)</label>
+                    <input type="password" id="wizard-auth-password" placeholder="Leave empty to disable login">
+                </div>
+                <div class="muted" style="margin-top:12px;font-size:11px;">
+                    Default: Password disabled (open access). Set a password for better security.
+                </div>
+                <div class="muted" style="margin-top:8px;font-size:11px;">
+                    You can change this later in the Network Connection section.
+                </div>
+            </div>
+
+            <div class="wizard-page" id="wizard-page-5">
+                <h3>Scanning & Alerts</h3>
+                <p class="muted">Configure background scanning and webhook notifications</p>
+                <div style="display:flex;flex-direction:column;gap:12px;">
+                    <label class="wizard-checkbox">
+                        <input type="checkbox" id="wizard-bg-scan" checked>
+                        <span>Enable background scanning</span>
+                    </label>
+                    <div class="input-group" style="margin-left:24px;">
+                        <label>Scan interval (minutes)</label>
+                        <input type="number" id="wizard-scan-interval" min="1" max="60" value="5" style="width:80px;">
+                    </div>
+                    <div class="wizard-divider"></div>
+                    <label class="wizard-checkbox">
+                        <input type="checkbox" id="wizard-webhook-enabled">
+                        <span>Enable Discord/Webhook alerts</span>
+                    </label>
+                    <div class="input-group" id="wizard-webhook-url-group" style="margin-left:24px;display:none;">
+                        <label>Webhook URL</label>
+                        <input type="url" id="wizard-webhook-url" placeholder="https://discord.com/api/webhooks/...">
+                    </div>
+                </div>
+            </div>
+
+            <div class="wizard-nav">
+                <button class="btn" id="wizard-prev" style="visibility:hidden;">Back</button>
+                <button class="btn btn-primary" id="wizard-next">Next</button>
+            </div>
+        </div>
+    </div>
+
     <div id="app-shell" style="display:none;">
         <header>
             <h1>PwnPower</h1>

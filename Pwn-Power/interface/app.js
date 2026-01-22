@@ -236,17 +236,8 @@ function initApp() {
     };
 }
 
-function showLogin(error = false) {
-    if (!authPasswordEnabled) return; // do not show overlay when login disabled
-    const login = document.getElementById('login-screen');
-    const app = document.getElementById('app-shell');
-    if (login) login.style.display = 'flex';
-    if (app) app.style.display = 'none';
-    const err = document.getElementById('login-error');
-    if (err) err.style.display = error ? 'block' : 'none';
-
-    authToken = null;
-    localStorage.removeItem('authToken');
+function showLogin(showUnauthorized) {
+    // Backend handles redirect to /login - this is a no-op now
 }
 
 function showAppShell() {
@@ -265,7 +256,6 @@ async function attemptLogin(password) {
     if (res && res.token) {
         authToken = res.token;
         localStorage.setItem('authToken', authToken);
-        showLogin(false);
         showAppShell();
         if (!appInitialized) {
             initApp();
@@ -273,54 +263,31 @@ async function attemptLogin(password) {
         }
         return true;
     }
-    showLogin(true);
     return false;
 }
 
 async function checkAuthAndStart() {
+    const wizardCompleted = await checkWizardStatus();
+    if (!wizardCompleted) {
+        showWizard();
+        return;
+    }
+
     authToken = localStorage.getItem('authToken') || null;
     const status = await fetchJSON('/auth/status');
-    if (status && status.authorized) {
-        showAppShell();
-        if (!appInitialized) {
-            initApp();
-            appInitialized = true;
-        }
-    } else if (status && status.has_password === false) {
-        authPasswordEnabled = false;
-        showAppShell();
-        if (!appInitialized) {
-            initApp();
-            appInitialized = true;
-        }
-    } else if (!status) {
-        // if status unavailable (e.g., transient TLS error), keep current view
-        if (appInitialized) {
-            showAppShell();
-        }
-    } else {
-        showLogin(false);
+    if (status) {
+        authPasswordEnabled = !!status.has_password;
+    }
+    
+    showAppShell();
+    if (!appInitialized) {
+        initApp();
+        appInitialized = true;
     }
 }
 
 function initLoginUI() {
-    const btn = document.getElementById('login-submit');
-    const input = document.getElementById('login-password');
-    if (btn) {
-        btn.onclick = async () => {
-            const pass = input?.value || '';
-            if (!pass) return showLogin(true);
-            await attemptLogin(pass);
-        };
-    }
-    if (input) {
-        input.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') {
-                e.preventDefault();
-                btn?.click();
-            }
-        });
-    }
+    // Legacy embedded login UI - no longer used, login is now on separate /login page
 }
 
 function anyScanBusy() {
@@ -2337,4 +2304,214 @@ function toggleBottleneckDetails() {
     
     // Update button text
     event.target.textContent = isVisible ? 'Details' : 'Hide Details';
+}
+
+let wizardCurrentStep = 1;
+const wizardTotalSteps = 5;
+let wizardMode = 'standalone';
+
+async function checkWizardStatus() {
+    const res = await fetchJSON('/wizard/status');
+    return res ? res.completed : true;
+}
+
+function showWizard() {
+    const wizard = document.getElementById('wizard-screen');
+    const app = document.getElementById('app-shell');
+    const login = document.getElementById('login-screen');
+    if (wizard) wizard.style.display = 'flex';
+    if (app) app.style.display = 'none';
+    if (login) login.style.display = 'none';
+    initWizardUI();
+}
+
+function hideWizard() {
+    const wizard = document.getElementById('wizard-screen');
+    if (wizard) wizard.style.display = 'none';
+}
+
+function initWizardUI() {
+    const prevBtn = document.getElementById('wizard-prev');
+    const nextBtn = document.getElementById('wizard-next');
+    const webhookEnabled = document.getElementById('wizard-webhook-enabled');
+    const webhookUrlGroup = document.getElementById('wizard-webhook-url-group');
+
+    if (prevBtn) {
+        prevBtn.onclick = () => wizardNavigate(-1);
+    }
+    if (nextBtn) {
+        nextBtn.onclick = () => wizardNavigate(1);
+    }
+
+    if (webhookEnabled) {
+        webhookEnabled.onchange = () => {
+            if (webhookUrlGroup) {
+                webhookUrlGroup.style.display = webhookEnabled.checked ? 'block' : 'none';
+            }
+        };
+    }
+
+    document.querySelectorAll('input[name="mode"]').forEach(radio => {
+        radio.onchange = () => {
+            wizardMode = radio.value;
+        };
+    });
+
+    updateWizardUI();
+}
+
+function updateWizardUI() {
+    const prevBtn = document.getElementById('wizard-prev');
+    const nextBtn = document.getElementById('wizard-next');
+
+    document.querySelectorAll('.wizard-step').forEach(step => {
+        const stepNum = parseInt(step.dataset.step);
+        step.classList.remove('active', 'completed');
+        if (stepNum === wizardCurrentStep) {
+            step.classList.add('active');
+        } else if (stepNum < wizardCurrentStep) {
+            step.classList.add('completed');
+        }
+    });
+
+    document.querySelectorAll('.wizard-page').forEach(page => {
+        page.classList.remove('active');
+    });
+    const currentPage = document.getElementById(`wizard-page-${wizardCurrentStep}`);
+    if (currentPage) currentPage.classList.add('active');
+
+    if (prevBtn) {
+        prevBtn.style.visibility = wizardCurrentStep > 1 ? 'visible' : 'hidden';
+    }
+    if (nextBtn) {
+        nextBtn.textContent = wizardCurrentStep === wizardTotalSteps ? 'Finish' : 'Next';
+    }
+
+    if (wizardCurrentStep === 2) {
+        const networkForm = document.getElementById('wizard-network-form');
+        if (networkForm) {
+            networkForm.style.display = wizardMode === 'connected' ? 'block' : 'none';
+        }
+    }
+}
+
+async function wizardNavigate(direction) {
+    if (direction > 0 && wizardCurrentStep === wizardTotalSteps) {
+        await finishWizard();
+        return;
+    }
+
+    const newStep = wizardCurrentStep + direction;
+    if (newStep < 1 || newStep > wizardTotalSteps) return;
+
+    if (wizardMode === 'standalone' && wizardCurrentStep === 1 && direction > 0) {
+        wizardCurrentStep = 3;
+    } else if (wizardMode === 'standalone' && wizardCurrentStep === 3 && direction < 0) {
+        wizardCurrentStep = 1;
+    } else {
+        wizardCurrentStep = newStep;
+    }
+
+    updateWizardUI();
+}
+
+async function finishWizard() {
+    const nextBtn = document.getElementById('wizard-next');
+    if (nextBtn) {
+        nextBtn.disabled = true;
+        nextBtn.textContent = 'Saving...';
+    }
+
+    try {
+        if (wizardMode === 'connected') {
+            const ssid = document.getElementById('wizard-net-ssid')?.value;
+            const pass = document.getElementById('wizard-net-pass')?.value || '';
+            const keepAp = document.getElementById('wizard-keep-ap')?.checked ?? true;
+            const autoConnect = document.getElementById('wizard-auto-connect')?.checked ?? true;
+
+            if (ssid) {
+                await fetchJSON('/wifi/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ap_while_connected: keepAp, auto_connect: autoConnect })
+                });
+
+                await fetchJSON('/wifi/connect', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ssid, password: pass })
+                });
+            }
+        }
+
+        const apSsid = document.getElementById('wizard-ap-ssid')?.value;
+        const apPass = document.getElementById('wizard-ap-pass')?.value || '';
+        if (apSsid) {
+            await fetchJSON('/ap/config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ssid: apSsid, password: apPass })
+            });
+        }
+
+        const authPassword = document.getElementById('wizard-auth-password')?.value || '';
+        if (authPassword.length >= 8) {
+            await fetchJSON('/auth/password', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ current_password: '', new_password: authPassword })
+            });
+        }
+
+        const bgScan = document.getElementById('wizard-bg-scan')?.checked ?? true;
+        const scanInterval = parseInt(document.getElementById('wizard-scan-interval')?.value || 5) * 60;
+        await fetchJSON('/scan/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ bg_enabled: bgScan, bg_interval: scanInterval })
+        });
+
+        const webhookEnabled = document.getElementById('wizard-webhook-enabled')?.checked ?? false;
+        const webhookUrl = document.getElementById('wizard-webhook-url')?.value || '';
+        if (webhookEnabled && webhookUrl) {
+            await fetchJSON('/webhook/config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enabled: true, url: webhookUrl })
+            });
+        }
+
+        await fetchJSON('/wizard/complete', { method: 'POST' });
+
+        hideWizard();
+        
+        if (authPassword && authPassword.length >= 8) {
+            showToast('Setup complete! You will need to login with your new password.');
+            showLogin(false);
+        } else {
+            showAppShell();
+            if (!appInitialized) {
+                initApp();
+                appInitialized = true;
+            }
+            showToast('Setup complete!');
+        }
+    } catch (e) {
+        console.error('Wizard error:', e);
+        showToast('Setup failed, please try again');
+    } finally {
+        if (nextBtn) {
+            nextBtn.disabled = false;
+            nextBtn.textContent = 'Finish';
+        }
+    }
+}
+
+async function checkWizardAndStart() {
+    const wizardCompleted = await checkWizardStatus();
+    if (!wizardCompleted) {
+        showWizard();
+        return false;
+    }
+    return true;
 }

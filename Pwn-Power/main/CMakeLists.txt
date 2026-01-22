@@ -24,6 +24,7 @@ idf_component_register(
         "."
     EMBED_FILES
         "web_content.gz.h"
+        "login_content.gz.h"
         "ouis.json"
     REQUIRES
         mdns

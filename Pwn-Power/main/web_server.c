@@ -36,9 +36,13 @@
 
 extern const uint8_t _binary_web_content_gz_h_start[] asm("_binary_web_content_gz_h_start");
 extern const uint8_t _binary_web_content_gz_h_end[] asm("_binary_web_content_gz_h_end");
+extern const uint8_t _binary_login_content_gz_h_start[] asm("_binary_login_content_gz_h_start");
+extern const uint8_t _binary_login_content_gz_h_end[] asm("_binary_login_content_gz_h_end");
 
 #define WEB_UI_GZ         ((const char *)_binary_web_content_gz_h_start)
 #define WEB_UI_GZ_SIZE    ((size_t)(_binary_web_content_gz_h_end - _binary_web_content_gz_h_start))
+#define LOGIN_UI_GZ       ((const char *)_binary_login_content_gz_h_start)
+#define LOGIN_UI_GZ_SIZE  ((size_t)(_binary_login_content_gz_h_end - _binary_login_content_gz_h_start))
 
 extern bool pwnpower_time_is_synced(void);
 // some SDK versions expose gpio_pad_select_gpio as esp_rom_gpio_pad_select_gpio
@@ -73,6 +77,8 @@ static esp_err_t register_routes(httpd_handle_t server);
 static httpd_handle_t start_https_server(void);
 static httpd_handle_t start_http_redirect_server(void);
 static esp_err_t wifi_status_handler(httpd_req_t *req);
+static bool wizard_is_completed(void);
+static bool auth_is_authorized(httpd_req_t *req);
 
 // simple STA connection helpers used by the web UI
 static volatile bool g_sta_connected = false;
@@ -110,20 +116,18 @@ static void auth_load_password(void) {
     esp_err_t err = nvs_open("ui_auth", NVS_READWRITE, &handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to open NVS for auth: %s", esp_err_to_name(err));
-        strncpy(s_ui_password, "pwnpower", sizeof(s_ui_password) - 1);
+        s_ui_password[0] = '\0';
         return;
     }
 
     size_t len = sizeof(s_ui_password);
     err = nvs_get_str(handle, "password", s_ui_password, &len);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
-        strncpy(s_ui_password, "pwnpower", sizeof(s_ui_password) - 1);
-        nvs_set_str(handle, "password", s_ui_password);
-        nvs_commit(handle);
-        ESP_LOGI(TAG, "Initialized default UI password");
+        s_ui_password[0] = '\0';
+        ESP_LOGI(TAG, "No UI password set - auth disabled");
     } else if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to read auth password: %s", esp_err_to_name(err));
-        strncpy(s_ui_password, "pwnpower", sizeof(s_ui_password) - 1);
+        s_ui_password[0] = '\0';
     }
 
     nvs_close(handle);
@@ -352,6 +356,78 @@ static httpd_uri_t uri_auth_login = { .uri = "/auth/login", .method = HTTP_POST,
 static httpd_uri_t uri_auth_logout = { .uri = "/auth/logout", .method = HTTP_POST, .handler = auth_logout_handler, .user_ctx = NULL };
 static httpd_uri_t uri_auth_password = { .uri = "/auth/password", .method = HTTP_POST, .handler = auth_password_handler, .user_ctx = NULL };
 
+#define NVS_WIZARD_NAMESPACE "wizard"
+#define NVS_WIZARD_KEY "completed"
+
+static bool wizard_is_completed(void) {
+    nvs_handle_t handle;
+    if (nvs_open(NVS_WIZARD_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) {
+        return false;
+    }
+    uint8_t val = 0;
+    nvs_get_u8(handle, NVS_WIZARD_KEY, &val);
+    nvs_close(handle);
+    return val != 0;
+}
+
+static esp_err_t wizard_set_completed(bool completed) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(NVS_WIZARD_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+    err = nvs_set_u8(handle, NVS_WIZARD_KEY, completed ? 1 : 0);
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    return err;
+}
+
+static esp_err_t wizard_status_handler(httpd_req_t *req) {
+    update_last_request_time();
+    bool completed = wizard_is_completed();
+    
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "completed", completed);
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json);
+    cJSON_free(json);
+    return ESP_OK;
+}
+
+static esp_err_t wizard_complete_handler(httpd_req_t *req) {
+    update_last_request_time();
+    
+    esp_err_t err = wizard_set_completed(true);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save wizard state");
+        return ESP_FAIL;
+    }
+    
+    ESP_LOGI(TAG, "Setup wizard completed");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+    return ESP_OK;
+}
+
+static esp_err_t wizard_reset_handler(httpd_req_t *req) {
+    update_last_request_time();
+    
+    esp_err_t err = wizard_set_completed(false);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to reset wizard state");
+        return ESP_FAIL;
+    }
+    
+    ESP_LOGI(TAG, "Setup wizard reset");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+    return ESP_OK;
+}
+
+static httpd_uri_t uri_wizard_status = { .uri = "/wizard/status", .method = HTTP_GET, .handler = wizard_status_handler, .user_ctx = NULL };
+static httpd_uri_t uri_wizard_complete = { .uri = "/wizard/complete", .method = HTTP_POST, .handler = wizard_complete_handler, .user_ctx = NULL };
+
 static void register_authed(httpd_handle_t server, const char *uri, httpd_method_t method, route_handler_fn fn) {
     httpd_uri_t cfg = { .uri = uri, .method = method, .handler = authed_handler, .user_ctx = fn };
     httpd_register_uri_handler(server, &cfg);
@@ -449,13 +525,22 @@ static void hs_task(void *arg) {
 static esp_err_t index_handler(httpd_req_t *req) {
     update_last_request_time();
 
-    ESP_LOGD(TAG, "ROOT start heap=%lu min=%lu", (unsigned long)esp_get_free_heap_size(), (unsigned long)esp_get_minimum_free_heap_size());
+    ESP_LOGI(TAG, "index_handler called, heap=%lu", (unsigned long)esp_get_free_heap_size());
 
-    // Check for If-None-Match header (ETag-based caching)
+    bool wizard_done = wizard_is_completed();
+    ESP_LOGI(TAG, "Wizard completed: %s", wizard_done ? "yes" : "no");
+    
+    if (wizard_done && !auth_is_authorized(req)) {
+        ESP_LOGI(TAG, "Redirecting to login page");
+        httpd_resp_set_status(req, "302 Found");
+        httpd_resp_set_hdr(req, "Location", "/login");
+        httpd_resp_send(req, NULL, 0);
+        return ESP_OK;
+    }
+
     char etag_buf[64];
     size_t buf_len = sizeof(etag_buf);
     if (httpd_req_get_hdr_value_str(req, "If-None-Match", etag_buf, buf_len) == ESP_OK) {
-        // Client has cached version, check if it matches
         if (strcmp(etag_buf, "\"pwn-v1\"") == 0) {
             ESP_LOGD(TAG, "Cached UI 304");
             httpd_resp_set_status(req, "304 Not Modified");
@@ -466,14 +551,11 @@ static esp_err_t index_handler(httpd_req_t *req) {
 
     ESP_LOGD(TAG, "Sending UI (%u bytes)", (unsigned int)WEB_UI_GZ_SIZE);
 
-    // Set caching headers to reduce repeated loads
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
-    httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=3600");  // Cache for 1 hour
-    httpd_resp_set_hdr(req, "ETag", "\"pwn-v1\"");  // Version tag for cache validation
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    httpd_resp_set_hdr(req, "ETag", "\"pwn-v1\"");
 
-    // Use regular send - it's more memory efficient than chunking!
-    // httpd_resp_send reads directly from flash and only buffers what fits in TCP window
     esp_err_t ret = httpd_resp_send(req, WEB_UI_GZ, WEB_UI_GZ_SIZE);
 
     if (ret != ESP_OK) {
@@ -483,6 +565,21 @@ static esp_err_t index_handler(httpd_req_t *req) {
 
     return ret;
 }
+
+static esp_err_t login_page_handler(httpd_req_t *req) {
+    update_last_request_time();
+    
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    
+    esp_err_t ret = httpd_resp_send(req, LOGIN_UI_GZ, LOGIN_UI_GZ_SIZE);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Login page send failed: %s", esp_err_to_name(ret));
+    }
+    return ret;
+}
+
 // Handler for scanning Wi-Fi networks
 static uint32_t last_scan_request_time = 0;
 static uint32_t scan_request_count = 0;
@@ -1117,6 +1214,13 @@ httpd_uri_t uri_get = {
     .uri = "/",
     .method = HTTP_GET,
     .handler = index_handler,
+    .user_ctx = NULL
+};
+
+httpd_uri_t uri_login_page = {
+    .uri = "/login",
+    .method = HTTP_GET,
+    .handler = login_page_handler,
     .user_ctx = NULL
 };
 
@@ -2262,6 +2366,7 @@ static esp_err_t home_ssids_remove_handler(httpd_req_t *req) {
 // Register all application routes on the given server (HTTPS)
 static esp_err_t register_routes(httpd_handle_t server) {
     httpd_register_uri_handler(server, &uri_get);
+    httpd_register_uri_handler(server, &uri_login_page);
     httpd_register_uri_handler(server, &uri_scan);
     httpd_register_uri_handler(server, &uri_cached_scan);
     httpd_register_uri_handler(server, &uri_wifi_scan_status);
@@ -2281,6 +2386,9 @@ static esp_err_t register_routes(httpd_handle_t server) {
     httpd_register_uri_handler(server, &uri_auth_logout);
     httpd_register_uri_handler(server, &uri_auth_password);
     httpd_register_uri_handler(server, &uri_wifi_status);
+    httpd_register_uri_handler(server, &uri_wizard_status);
+    httpd_register_uri_handler(server, &uri_wizard_complete);
+    register_authed(server, "/wizard/reset", HTTP_POST, wizard_reset_handler);
 
     register_authed(server, "/gpio", HTTP_POST, gpio_set_handler);
     register_authed(server, "/gpio/status", HTTP_GET, gpio_status_handler);

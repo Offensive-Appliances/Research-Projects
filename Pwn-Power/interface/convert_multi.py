@@ -37,7 +37,6 @@ def generate_web_bundle():
     js = (script_dir / 'app.js').read_text(encoding='utf-8')
     csv_js = (script_dir / 'csv_generator.js').read_text(encoding='utf-8')
 
-    # Combine charts.js, CSV generator, and main app.js (charts first as app.js depends on it)
     combined_js = charts_js + '\n\n' + csv_js + '\n\n' + js
     combined_html = inline_assets(html, css, combined_js)
     print(f"Combined size before gzip: {len(combined_html)} bytes")
@@ -46,6 +45,14 @@ def generate_web_bundle():
     blob_path = output_dir / 'web_content.gz.h'
     blob_path.write_bytes(compressed)
     print(f"Created gzip blob: {blob_path} ({len(compressed)} bytes)")
+
+    login_html_path = script_dir / 'login.html'
+    if login_html_path.exists():
+        login_html = login_html_path.read_text(encoding='utf-8')
+        login_compressed = gzip.compress(login_html.encode('utf-8'), compresslevel=9)
+        login_blob_path = output_dir / 'login_content.gz.h'
+        login_blob_path.write_bytes(login_compressed)
+        print(f"Created login blob: {login_blob_path} ({len(login_compressed)} bytes)")
 
     remove_legacy_files(output_dir)
 
