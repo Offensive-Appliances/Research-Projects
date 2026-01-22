@@ -2458,9 +2458,6 @@ static httpd_handle_t start_http_redirect_server(void) {
         .method = HTTP_GET,
         .handler = redirect_handler,
         .user_ctx = NULL,
-        .is_websocket = false,
-        .handle_ws_control_frames = false,
-        .supported_subprotocol = NULL,
     };
 
     httpd_handle_t server = NULL;
