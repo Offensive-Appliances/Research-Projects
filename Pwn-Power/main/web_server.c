@@ -788,16 +788,18 @@ static esp_err_t cached_scan_handler(httpd_req_t *req) {
     uint32_t timestamp = wifi_scan_get_results_timestamp();
     bool truncated = wifi_scan_was_truncated();
     bool in_progress = wifi_scan_is_in_progress();
+    bool station_scan = wifi_scan_station_scan_running();
 
     httpd_resp_set_type(req, "application/json");
 
     // Build metadata string on stack (no malloc!)
-    char metadata[128];
+    char metadata[160];
     snprintf(metadata, sizeof(metadata),
-            ",\"timestamp\":%lu,\"truncated\":%s,\"scan_in_progress\":%s}",
+            ",\"timestamp\":%lu,\"truncated\":%s,\"scan_in_progress\":%s,\"station_scan_running\":%s}",
             (unsigned long)timestamp,
             truncated ? "true" : "false",
-            in_progress ? "true" : "false");
+            in_progress ? "true" : "false",
+            station_scan ? "true" : "false");
 
     if(cached_results && strlen(cached_results) > 2) {
         size_t cached_len = strlen(cached_results);
@@ -823,11 +825,12 @@ static esp_err_t cached_scan_handler(httpd_req_t *req) {
     }
 
     // Return empty JSON with metadata if we have no cached results
-    char empty_response[128];
+    char empty_response[192];
     snprintf(empty_response, sizeof(empty_response),
-            "{\"rows\":[],\"timestamp\":%lu,\"truncated\":false,\"scan_in_progress\":%s}",
+            "{\"rows\":[],\"timestamp\":%lu,\"truncated\":false,\"scan_in_progress\":%s,\"station_scan_running\":%s}",
             (unsigned long)timestamp,
-            in_progress ? "true" : "false");
+            in_progress ? "true" : "false",
+            station_scan ? "true" : "false");
     httpd_resp_sendstr(req, empty_response);
     return ESP_OK;
 }
@@ -1125,16 +1128,19 @@ AUTHE_URI(uri_cached_scan, "/cached-scan", HTTP_GET, cached_scan_handler);
 AUTHE_URI(uri_wifi_status, "/wifi/status", HTTP_GET, wifi_status_handler);
 
 static esp_err_t wifi_scan_status_handler(httpd_req_t *req) {
+    update_last_request_time();
     ESP_LOGI(TAG, "Received scan status request");
 
     bool in_progress = wifi_scan_is_in_progress();
+    bool station_scan = wifi_scan_station_scan_running();
     uint32_t timestamp = wifi_scan_get_results_timestamp();
     bool truncated = wifi_scan_was_truncated();
 
-    char response[200];
+    char response[256];
     snprintf(response, sizeof(response),
-            "{\"scan_in_progress\":%s,\"last_scan_timestamp\":%lu,\"truncated\":%s}",
+            "{\"scan_in_progress\":%s,\"station_scan_running\":%s,\"last_scan_timestamp\":%lu,\"truncated\":%s}",
             in_progress ? "true" : "false",
+            station_scan ? "true" : "false",
             (unsigned long)timestamp,
             truncated ? "true" : "false");
 
@@ -1422,6 +1428,7 @@ static esp_err_t gpio_set_handler(httpd_req_t *req) {
 
 // Handler to get GPIO status for smart plug
 static esp_err_t gpio_status_handler(httpd_req_t *req) {
+    update_last_request_time();
     char buf[32];
     const char *pin_q = httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK ? buf : NULL;
     int pin = SMARTPLUG_GPIO;
@@ -1457,6 +1464,7 @@ static esp_err_t gpio_status_handler(httpd_req_t *req) {
 }
 
 static esp_err_t scan_report_handler(httpd_req_t *req) {
+    update_last_request_time();
     char chunk[512];
     int len;
     
@@ -1633,6 +1641,7 @@ static esp_err_t unified_intelligence_handler(httpd_req_t *req) {
 }
 
 static esp_err_t scan_status_handler(httpd_req_t *req) {
+    update_last_request_time();
     cJSON *root = cJSON_CreateObject();
     
     bg_scan_state_t state = background_scan_get_state();
@@ -1662,6 +1671,7 @@ static esp_err_t scan_status_handler(httpd_req_t *req) {
 }
 
 static esp_err_t scan_config_get_handler(httpd_req_t *req) {
+    update_last_request_time();
     const bg_scan_config_t *bg_cfg = background_scan_get_config();
     const idle_scan_config_t *idle_cfg = idle_scanner_get_config();
     
@@ -1735,6 +1745,7 @@ static esp_err_t scan_clear_handler(httpd_req_t *req) {
 }
 
 static esp_err_t ap_config_get_handler(httpd_req_t *req) {
+    update_last_request_time();
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, ap_config_get_json());
     return ESP_OK;
@@ -1789,10 +1800,11 @@ static esp_err_t ap_config_set_handler(httpd_req_t *req) {
 
 static esp_err_t history_samples_handler(httpd_req_t *req) {
     update_last_request_time();
-    
-    // parse days parameter (default 7, max 30, min 0.1)
+
+    // parse query parameters
     float days = 7.0f;
-    char query[64];
+    uint32_t since_ts = 0;  // incremental update support
+    char query[128];
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
         char days_str[16];
         if (httpd_query_key_value(query, "days", days_str, sizeof(days_str)) == ESP_OK) {
@@ -1800,19 +1812,27 @@ static esp_err_t history_samples_handler(httpd_req_t *req) {
             if (days < 0.1f) days = 0.1f;
             if (days > 30.0f) days = 30.0f;
         }
+
+        // incremental updates: only return samples after since_ts
+        char since_str[16];
+        if (httpd_query_key_value(query, "since_ts", since_str, sizeof(since_str)) == ESP_OK) {
+            since_ts = (uint32_t)atoi(since_str);
+            ESP_LOGI(TAG, "Incremental update requested: since_ts=%lu", (unsigned long)since_ts);
+        }
     }
-    
+
     // limit samples to prevent oom (process in chunks)
-    uint32_t max_samples = (uint32_t)(days * 24.0f * 30.0f);  // 30 samples per hour
-    if (max_samples > 5040) max_samples = 5040;  // limit to 7 days worth
-    
+    uint32_t max_samples = MIN(5040, (uint32_t)(days * 720.0f));  // 30 samples per hour, cap at 7 days
+
     uint32_t history_count = scan_storage_get_history_count();
-    ESP_LOGD(TAG, "history_samples_handler: total_count=%u, max_samples=%u", history_count, max_samples);
+    ESP_LOGD(TAG, "history_samples_handler: total_count=%u, max_samples=%u, since_ts=%lu",
+             history_count, max_samples, (unsigned long)since_ts);
     uint32_t remaining = (history_count > max_samples) ? max_samples : history_count;
     uint32_t start_idx = (history_count > max_samples) ? (history_count - max_samples) : 0;
     ESP_LOGD(TAG, "history_samples_handler: start_idx=%u, remaining=%u", start_idx, remaining);
     
-    #define HISTORY_CHUNK_SIZE 100
+    // Larger chunk size for fewer flash read operations (48 bytes * 300 = 14.4KB)
+    #define HISTORY_CHUNK_SIZE 300
     history_sample_t *chunk = malloc(sizeof(history_sample_t) * HISTORY_CHUNK_SIZE);
     if (!chunk) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
@@ -1823,13 +1843,15 @@ static esp_err_t history_samples_handler(httpd_req_t *req) {
     uint32_t base_epoch = scan_storage_get_history_base_epoch();
     
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr_chunk(req, "{\"samples\":[");
+    // Compact format: {"s":[[epoch,ap,cli,[ch0-12],[[hash,cnt],...]],...]}
+    // Field order: [0]=epoch_ts, [1]=ap_count, [2]=client_count, [3]=channel_counts[13], [4]=ssid_clients[[hash,count],...]
+    httpd_resp_sendstr_chunk(req, "{\"s\":[");
     
     bool first = true;
     while (remaining > 0) {
         uint32_t request_count = remaining > HISTORY_CHUNK_SIZE ? HISTORY_CHUNK_SIZE : remaining;
         uint32_t actual = 0;
-        esp_err_t err = scan_storage_get_history_samples_window(start_idx, request_count, chunk, &actual);
+        esp_err_t err = scan_storage_get_history_samples_window(start_idx, request_count, chunk, &actual, base_epoch);
         ESP_LOGD(TAG, "history_samples_handler: requested=%u, actual=%u", request_count, actual);
         if (err != ESP_OK) {
             free(chunk);
@@ -1839,20 +1861,23 @@ static esp_err_t history_samples_handler(httpd_req_t *req) {
         
         for (uint32_t i = 0; i < actual; i++) {
             uint32_t epoch_ts = 0;
-            uint32_t uptime_sec = chunk[i].timestamp_delta_sec;
             bool time_valid = HISTORY_IS_TIME_VALID(chunk[i].flags);
-            
+
             if (time_valid && base_epoch > 0) {
                 epoch_ts = base_epoch + chunk[i].timestamp_delta_sec;
             }
-            
-            char buf[512];
-            snprintf(buf, sizeof(buf),
-                "%s{\"epoch_ts\":%lu,\"uptime_sec\":%lu,\"time_valid\":%s,\"ap_count\":%u,\"client_count\":%u,\"channel_counts\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u],\"ssid_clients\":[",
+
+            // incremental update: skip samples older than or equal to since_ts
+            if (since_ts > 0 && epoch_ts > 0 && epoch_ts <= since_ts) {
+                continue;
+            }
+
+            // Compact array format: [epoch_ts, ap_count, client_count, [channels], [[hash,count],...]]
+            static char buf[256];
+            int written = snprintf(buf, sizeof(buf),
+                "%s[%lu,%u,%u,[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u],[",
                 first ? "" : ",",
                 (unsigned long)epoch_ts,
-                (unsigned long)uptime_sec,
-                time_valid ? "true" : "false",
                 chunk[i].ap_count,
                 chunk[i].client_count,
                 chunk[i].channel_counts[0], chunk[i].channel_counts[1], chunk[i].channel_counts[2],
@@ -1860,31 +1885,54 @@ static esp_err_t history_samples_handler(httpd_req_t *req) {
                 chunk[i].channel_counts[6], chunk[i].channel_counts[7], chunk[i].channel_counts[8],
                 chunk[i].channel_counts[9], chunk[i].channel_counts[10], chunk[i].channel_counts[11],
                 chunk[i].channel_counts[12]);
+            if (written <= 0 || written >= (int)sizeof(buf)) {
+                free(chunk);
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "History JSON buffer overflow");
+                return ESP_FAIL;
+            }
+
+            if (httpd_resp_send_chunk(req, buf, (size_t)written) != ESP_OK) {
+                free(chunk);
+                ESP_LOGW(TAG, "Client disconnected during history stream");
+                return ESP_FAIL;
+            }
             first = false;
 
-            httpd_resp_sendstr_chunk(req, buf);
-            
+            // SSID clients as compact arrays: [[hash,count],[hash,count],...]
             uint8_t ssid_count = HISTORY_GET_SSID_COUNT(chunk[i].flags);
             for (uint8_t j = 0; j < ssid_count; j++) {
-                char ssid_buf[64];
-                snprintf(ssid_buf, sizeof(ssid_buf), "%s{\"hash\":%lu,\"count\":%u}",
-                    j > 0 ? "," : "",
+                char ssid_buf[48];
+                int ssid_written = snprintf(ssid_buf, sizeof(ssid_buf), "%s[%lu,%u]",
+                    j == 0 ? "" : ",",
                     (unsigned long)chunk[i].ssid_clients[j].ssid_hash,
                     chunk[i].ssid_clients[j].client_count);
-                httpd_resp_sendstr_chunk(req, ssid_buf);
+                if (ssid_written > 0) {
+                    size_t len = (ssid_written < (int)sizeof(ssid_buf)) ? (size_t)ssid_written : sizeof(ssid_buf);
+                    if (httpd_resp_send_chunk(req, ssid_buf, len) != ESP_OK) {
+                        free(chunk);
+                        ESP_LOGW(TAG, "Client disconnected during history stream");
+                        return ESP_FAIL;
+                    }
+                }
             }
-            
-            httpd_resp_sendstr_chunk(req, "]}");
+            if (httpd_resp_sendstr_chunk(req, "]]") != ESP_OK) {
+                free(chunk);
+                ESP_LOGW(TAG, "Client disconnected during history stream");
+                return ESP_FAIL;
+            }
+
+            if ((i & 0x1F) == 0) {
+                vTaskDelay(1);
+            }
         }
         
-        // advance by request_count (items read from flash), not actual (items after sanitize)
         start_idx += request_count;
         remaining -= request_count;
     }
     
     free(chunk);
     httpd_resp_sendstr_chunk(req, "]}");
-    httpd_resp_sendstr_chunk(req, NULL);  // finish chunked response
+    httpd_resp_sendstr_chunk(req, NULL);
     
     return ESP_OK;
 }
@@ -1989,6 +2037,7 @@ static esp_err_t devices_update_handler(httpd_req_t *req) {
 }
 
 static esp_err_t webhook_config_get_handler(httpd_req_t *req) {
+    update_last_request_time();
     webhook_config_t config;
     webhook_get_config(&config);
     
@@ -2115,6 +2164,7 @@ static esp_err_t webhook_test_handler(httpd_req_t *req) {
 }
 
 static esp_err_t home_ssids_get_handler(httpd_req_t *req) {
+    update_last_request_time();
     cJSON *root = cJSON_CreateObject();
     const char *connected = scan_storage_get_home_ssid();
     cJSON_AddStringToObject(root, "connected", connected ? connected : "");
@@ -2276,6 +2326,20 @@ static esp_err_t redirect_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// Connection open handler - checks heap health before accepting HTTPS connections
+static esp_err_t https_open_fn(httpd_handle_t hd, int sockfd) {
+    uint32_t free_heap = esp_get_free_heap_size();
+
+    // Reject connections if heap is critically low
+    // TLS handshakes need ~6-8KB for crypto buffers
+    if (free_heap < 10000) {
+        ESP_LOGW(TAG, "Rejecting connection: low heap (%lu bytes)", (unsigned long)free_heap);
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
 static httpd_handle_t start_https_server(void) {
     if (!tls_cert_load_or_generate(&s_tls_bundle)) {
         ESP_LOGE(TAG, "TLS certificate generation failed");
@@ -2292,13 +2356,17 @@ static httpd_handle_t start_https_server(void) {
     conf.prvtkey_pem = (const uint8_t *)s_tls_bundle.key_pem;
     conf.prvtkey_len = strlen(s_tls_bundle.key_pem) + 1;
     conf.httpd.max_uri_handlers = 48;
-    conf.httpd.max_open_sockets = 3; // limited by LWIP_MAX_SOCKETS (HTTPD uses 3 internally)
+    conf.httpd.max_open_sockets = 3;
     conf.httpd.backlog_conn = 2;
     conf.httpd.lru_purge_enable = true;
-    conf.httpd.send_wait_timeout = 5;   // slightly longer to finish TLS flight
+    conf.httpd.send_wait_timeout = 5;
     conf.httpd.recv_wait_timeout = 5;
     conf.httpd.keep_alive_enable = true;
-    conf.httpd.stack_size = 7168;       // more stack for TLS crypto
+    conf.httpd.keep_alive_idle = 5;
+    conf.httpd.keep_alive_interval = 2;
+    conf.httpd.keep_alive_count = 3;
+    conf.httpd.stack_size = 6144;
+    conf.httpd.open_fn = https_open_fn; // check heap health before accepting connections
 
     httpd_handle_t server = NULL;
     esp_err_t err = httpd_ssl_start(&server, &conf);

@@ -38,6 +38,9 @@ static bool new_results_available = false;
 static uint32_t scan_results_timestamp = 0;  // Timestamp when results were generated
 static bool scan_was_truncated = false;      // Flag if results were truncated due to size
 static volatile bool station_scan_active = false;
+static volatile bool station_scan_background = false;
+static TaskHandle_t s_station_scan_task = NULL;
+static cJSON *s_pending_ap_data = NULL;
 static SemaphoreHandle_t scan_mutex = NULL;
 static TaskHandle_t s_wifi_scan_task_handle = NULL;
 static void wifi_scan_task(void *arg);
@@ -468,7 +471,19 @@ void wifi_scan() {
         free(ap_records);
     }
 
-    // NOW DO STATION SCAN
+    // SAVE AP-ONLY RESULTS FIRST for fast UX feedback
+    xSemaphoreTake(scan_mutex, portMAX_DELAY);
+    esp_err_t ap_err = update_scan_results_json(root);
+    if (ap_err == ESP_OK) {
+        scan_results_timestamp = get_current_timestamp();
+        new_results_available = true;
+        ESP_LOGI(TAG, "AP scan complete - initial results available (%d APs)", cJSON_GetArraySize(rows));
+    }
+    scan_in_progress = false;
+    station_scan_background = true;
+    xSemaphoreGive(scan_mutex);
+
+    // NOW DO STATION SCAN (runs while UI can already show AP results)
     wifi_scan_stations();
     const char *station_json = wifi_scan_get_station_results();
     ESP_LOGI(TAG, "Station scan complete. Station JSON: %s", station_json);
@@ -599,10 +614,10 @@ void wifi_scan() {
     uint32_t scan_end_time = (uint32_t)(esp_timer_get_time() / 1000); // milliseconds
     uint32_t scan_duration = scan_end_time - scan_start_time;
 
-    scan_in_progress = false;
     new_results_available = true;
+    station_scan_background = false;
     last_scan_complete_time = scan_end_time; // Track when scan completed for debouncing
-    ESP_LOGI(TAG, "=== SCAN COMPLETE === at %lu ms, duration=%lu ms, setting scan_in_progress=false",
+    ESP_LOGI(TAG, "=== SCAN COMPLETE (with stations) === at %lu ms, duration=%lu ms",
              (unsigned long)scan_end_time, (unsigned long)scan_duration);
     xSemaphoreGive(scan_mutex);
 
@@ -798,6 +813,10 @@ bool wifi_scan_is_in_progress() {
     bool in_progress = scan_in_progress;
     xSemaphoreGive(scan_mutex);
     return in_progress;
+}
+
+bool wifi_scan_station_scan_running() {
+    return station_scan_background;
 }
 
 uint32_t wifi_scan_get_results_timestamp() {
@@ -1186,7 +1205,7 @@ void wifi_scan_stations() {
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_promiscuous_rx_cb(stations_sniffer);
 
-    uint32_t scan_time_ms = 8000;
+    uint32_t scan_time_ms = 4000;
     uint32_t dwell_time_ms = 200;
     int ch_count = known_channel_count > 0 ? known_channel_count : (int)dual_band_channels_size;
     uint32_t iterations = scan_time_ms / (dwell_time_ms * (uint32_t)ch_count);
@@ -1392,8 +1411,8 @@ static void probe_hidden_aps_internal(void) {
     esp_wifi_set_promiscuous_rx_cb(stations_sniffer);
     esp_wifi_set_promiscuous(true);
     
-    // Monitor for 10 seconds to catch client activity
-    vTaskDelay(pdMS_TO_TICKS(10000));
+    // Monitor for 5 seconds to catch client activity
+    vTaskDelay(pdMS_TO_TICKS(5000));
     
     esp_wifi_set_promiscuous(false);
     esp_wifi_set_promiscuous_rx_cb(NULL);

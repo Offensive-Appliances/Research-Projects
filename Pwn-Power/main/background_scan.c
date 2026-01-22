@@ -25,8 +25,10 @@ extern void scan_storage_set_history_base_epoch(uint32_t epoch);
 // External functions from wifi_scan.c for deauth detection
 extern uint32_t wifi_scan_get_deauth_count(void);
 extern void wifi_scan_increment_deauth_count(void);
+extern uint32_t webserver_get_last_request_time(void);
 
 #define TAG "BgScan"
+#define CLIENT_ACTIVITY_DEFER_SEC 8
 #define BG_SCAN_TASK_STACK 6144  // Reduced from 8192 to save memory
 #define BG_SCAN_TASK_PRIO 5
 
@@ -363,6 +365,13 @@ static void background_scan_task(void *arg) {
         
         if (!config.auto_scan && !was_triggered) continue;
         
+        uint32_t now = get_uptime_sec();
+        uint32_t last_req = webserver_get_last_request_time();
+        if (last_req > 0 && (now - last_req) < CLIENT_ACTIVITY_DEFER_SEC) {
+            ESP_LOGI(TAG, "Deferring scan - recent client activity (%lus ago)", (unsigned long)(now - last_req));
+            continue;
+        }
+        
         scan_state = BG_SCAN_RUNNING;
         ESP_LOGI(TAG, "=== BACKGROUND SCAN START ===");
         ESP_LOGI(TAG, "Free heap before scan: %lu bytes", (unsigned long)esp_get_free_heap_size());
@@ -397,13 +406,11 @@ static void background_scan_task(void *arg) {
             }
         }
 
-        if (record->header.time_valid && base_epoch > 0 && record->header.epoch_ts >= base_epoch) {
+        bool save_history = (record->header.time_valid && base_epoch > 0 && record->header.epoch_ts >= base_epoch);
+        if (save_history) {
             uint32_t delta = record->header.epoch_ts - base_epoch;
             sample.timestamp_delta_sec = (delta > 65535) ? 65535 : delta;
             sample.flags = HISTORY_FLAG_TIME_VALID;
-        } else {
-            sample.timestamp_delta_sec = (uint16_t)(record->header.uptime_sec & 0xFFFF);
-            sample.flags = 0;
         }
         sample.ap_count = record->header.ap_count;
         sample.client_count = record->header.total_stations > 255 ? 255 : record->header.total_stations;
@@ -486,9 +493,13 @@ static void background_scan_task(void *arg) {
 
         ESP_LOGI(TAG, "Free heap after storage save: %lu bytes", (unsigned long)esp_get_free_heap_size());
         
-        err = scan_storage_append_history_sample(&sample);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to save history sample: %s", esp_err_to_name(err));
+        if (save_history) {
+            err = scan_storage_append_history_sample(&sample);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to save history sample: %s", esp_err_to_name(err));
+            }
+        } else {
+            ESP_LOGD(TAG, "skipping history sample: time not synced");
         }
         
         // flush tracked devices to nvs after each scan

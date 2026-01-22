@@ -13,6 +13,7 @@ bool wifi_scan_start_async(void);
 const char* wifi_scan_get_results();
 bool wifi_scan_is_complete();
 bool wifi_scan_is_in_progress();
+bool wifi_scan_station_scan_running();
 uint32_t wifi_scan_get_results_timestamp();
 bool wifi_scan_was_truncated();
 bool wifi_scan_has_new_results();

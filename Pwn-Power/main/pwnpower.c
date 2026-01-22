@@ -33,6 +33,15 @@ static int s_retry_num = 0;
 static bool s_time_synced = false;
 static bool s_sntp_started = false;
 
+static void pwnpower_time_sync_cb(struct timeval *tv) {
+    s_time_synced = true;
+    time_t now = 0;
+    time(&now);
+    struct tm tm_info;
+    localtime_r(&now, &tm_info);
+    ESP_LOGI(TAG, "Time synchronized: %04d-%02d-%02d %02d:%02d:%02d", tm_info.tm_year + 1900, tm_info.tm_mon + 1, tm_info.tm_mday, tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec);
+}
+
 // AP reconnect system state
 static uint32_t s_last_disconnect_time = 0;
 static uint32_t s_next_retry_time = 0;
@@ -41,12 +50,17 @@ static const int RETRY_INTERVAL_COUNT = 5;
 static int s_current_retry_interval = 0;
 
 static void pwnpower_sntp_sync_time(void) {
-    if (esp_sntp_enabled()) return;
-    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    esp_sntp_setservername(0, "pool.ntp.org");
-    esp_sntp_init();
-    s_sntp_started = true;
-    ESP_LOGI(TAG, "SNTP started");
+    if (!esp_sntp_enabled()) {
+        esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+        esp_sntp_setservername(0, "pool.ntp.org");
+        esp_sntp_set_time_sync_notification_cb(pwnpower_time_sync_cb);
+        esp_sntp_init();
+        s_sntp_started = true;
+        ESP_LOGI(TAG, "SNTP started");
+    } else {
+        esp_sntp_restart();
+        ESP_LOGI(TAG, "SNTP restart requested");
+    }
 }
 
 bool pwnpower_time_is_synced(void) {
@@ -68,6 +82,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         }
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         webserver_set_sta_connected(false);
+        s_time_synced = false;
         
         // Record disconnect time for periodic retry system
         s_last_disconnect_time = (uint32_t)(esp_timer_get_time() / 1000000ULL);
@@ -104,6 +119,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
+        
         // Reset periodic retry state on successful connection
         s_current_retry_interval = 0;
         s_next_retry_time = 0;

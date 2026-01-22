@@ -1588,6 +1588,11 @@ const char* scan_storage_get_unified_intelligence_json(void) {
 static uint32_t last_history_epoch = 0;
 static uint32_t last_history_uptime = 0;
 
+static bool history_sample_equals(const history_sample_t *a, const history_sample_t *b) {
+    if (!a || !b) return false;
+    return memcmp(a, b, sizeof(history_sample_t)) == 0;
+}
+
 uint32_t scan_storage_get_history_base_epoch(void) {
     return storage_index.history_base_epoch;
 }
@@ -1614,6 +1619,24 @@ esp_err_t scan_storage_append_history_sample(const history_sample_t *sample) {
         return ESP_OK;
     }
     
+    // Deduplicate against last persisted sample to avoid double writes
+    if (history_ring.count > 0) {
+        history_sample_t last_sample;
+        uint32_t last_idx;
+        if (history_ring.count < history_ring.max_items) {
+            last_idx = history_ring.count - 1;
+        } else {
+            last_idx = (history_ring.write_idx + history_ring.max_items - 1) % history_ring.max_items;
+        }
+        uint32_t offset = history_ring.base_offset + (last_idx * history_ring.item_size);
+        if (flash_manager_read(&flash_mgr, offset, &last_sample, sizeof(last_sample)) == ESP_OK) {
+            if (history_sample_equals(sample, &last_sample)) {
+                ESP_LOGD(TAG, "skipping duplicate history sample identical to last index=%lu", (unsigned long)last_idx);
+                return ESP_OK;
+            }
+        }
+    }
+
     ESP_LOGI(TAG, "writing history sample: delta=%u aps=%u clients=%u flags=0x%02x",
              sample->timestamp_delta_sec, sample->ap_count, sample->client_count, sample->flags);
     
@@ -1633,98 +1656,67 @@ esp_err_t scan_storage_append_history_sample(const history_sample_t *sample) {
 }
 
 
-static uint32_t sanitize_history_samples(history_sample_t *samples, uint32_t count) {
-    ESP_LOGI(TAG, "sanitize_history_samples: input count=%u", count);
+static uint32_t sanitize_history_samples(history_sample_t *samples, uint32_t count, uint32_t base_epoch) {
+    ESP_LOGD(TAG, "sanitize_history_samples: input count=%u", count);
     if (count == 0) return 0;
 
     uint32_t valid_count = 0;
-    uint32_t last_epoch = 0;
-    uint32_t last_uptime = 0;
-    bool last_time_valid = false;
-    bool have_prev = false;
-    uint32_t base_epoch = storage_index.history_base_epoch;
+    const uint32_t epoch_cutoff = 1700000000; // ~2023-11-14
+    
+    time_t now = time(NULL);
+    uint32_t epoch_now = (now > 0 && now != (time_t)-1) ? (uint32_t)now : 0;
+    uint32_t future_cutoff = epoch_now > 0 ? epoch_now + 300 : 0; // 5 min tolerance
 
     for (uint32_t i = 0; i < count; i++) {
         history_sample_t *src = &samples[i];
 
-        if (src->ap_count >= 200 || src->client_count >= 250) {
-            ESP_LOGD(TAG, "filter sample %u: garbage data (ap=%u, clients=%u)", i, src->ap_count, src->client_count);
-            continue;
-        }
-        if (src->timestamp_delta_sec == 0 && !HISTORY_IS_TIME_VALID(src->flags)) {
-            ESP_LOGD(TAG, "filter sample %u: zero timestamp delta", i);
+        if (!HISTORY_IS_TIME_VALID(src->flags)) {
+            ESP_LOGD(TAG, "filter sample %u: no valid timestamp", i);
             continue;
         }
         if (src->timestamp_delta_sec == 0xFFFF) {
             ESP_LOGD(TAG, "filter sample %u: FF timestamp delta", i);
             continue;
         }
+        bool time_valid = true;
 
-        bool channel_corrupted = false;
-        for (int ch = 0; ch < 13; ch++) {
-            if (src->channel_counts[ch] == 255) {
-                channel_corrupted = true;
-                break;
-            }
+        if (src->ap_count >= 200 || src->client_count >= 250) {
+            ESP_LOGD(TAG, "filter sample %u: garbage data (ap=%u, clients=%u)", i, src->ap_count, src->client_count);
+            continue;
         }
-        if (channel_corrupted) {
+
+        if (memchr(src->channel_counts, 0xFF, sizeof(src->channel_counts)) != NULL) {
             ESP_LOGD(TAG, "filter sample %u: corrupted channel_counts", i);
             continue;
         }
 
         uint32_t epoch_ts = 0;
-        bool time_valid = HISTORY_IS_TIME_VALID(src->flags);
         if (time_valid && base_epoch > 0) {
             epoch_ts = base_epoch + src->timestamp_delta_sec;
         }
-        if (time_valid && epoch_ts > 0 && epoch_ts < 1700000000) {
+        if (time_valid && epoch_ts > 0 && epoch_ts < epoch_cutoff) {
             ESP_LOGD(TAG, "filter sample %u: stale epoch %lu", i, (unsigned long)epoch_ts);
             src->flags &= ~HISTORY_FLAG_TIME_VALID;
             time_valid = false;
         }
-
-        // Only dedup if timestamps match AND data is identical
-        // This prevents false positives when samples legitimately have same timestamp
-        bool is_dup = false;
-        if (have_prev) {
-            bool timestamps_match = false;
-            if (time_valid && last_time_valid && epoch_ts == last_epoch) {
-                timestamps_match = true;
-            } else if (!time_valid && !last_time_valid && src->timestamp_delta_sec == last_uptime) {
-                timestamps_match = true;
-            }
-
-            // Only treat as duplicate if timestamps match AND ap/client counts match
-            if (timestamps_match && valid_count > 0) {
-                history_sample_t *prev = &samples[valid_count - 1];
-                if (prev->ap_count == src->ap_count && prev->client_count == src->client_count) {
-                    is_dup = true;
-                }
-            }
-        }
-        if (is_dup) {
-            ESP_LOGD(TAG, "dedup sample %u (epoch=%lu, aps=%u, clients=%u)",
-                     i, (unsigned long)epoch_ts, src->ap_count, src->client_count);
-            continue;
+        if (time_valid && future_cutoff > 0 && epoch_ts > future_cutoff) {
+            ESP_LOGD(TAG, "filter sample %u: future epoch %lu > %lu", i, (unsigned long)epoch_ts, (unsigned long)future_cutoff);
+            src->flags &= ~HISTORY_FLAG_TIME_VALID;
+            time_valid = false;
         }
 
         if (valid_count != i) {
             memcpy(&samples[valid_count], src, sizeof(history_sample_t));
-            src = &samples[valid_count];
         }
 
-        last_epoch = epoch_ts;
-        last_uptime = src->timestamp_delta_sec;
-        last_time_valid = time_valid;
-        have_prev = true;
         valid_count++;
     }
 
-    ESP_LOGI(TAG, "sanitize_history_samples: final count=%u", valid_count);
+    ESP_LOGD(TAG, "sanitize_history_samples: final count=%u", valid_count);
     return valid_count;
 }
 
-esp_err_t scan_storage_get_history_samples_window(uint32_t start_idx, uint32_t max_count, history_sample_t *samples, uint32_t *actual_count) {
+esp_err_t scan_storage_get_history_samples_window(uint32_t start_idx, uint32_t max_count, history_sample_t *samples, uint32_t *actual_count, uint32_t base_epoch) {
     if (!samples || !actual_count) return ESP_ERR_INVALID_ARG;
     
     uint32_t total = history_ring.count;
@@ -1741,15 +1733,15 @@ esp_err_t scan_storage_get_history_samples_window(uint32_t start_idx, uint32_t m
     esp_err_t err = flash_manager_ring_read(&flash_mgr, &history_ring, start_idx, count, samples, actual_count);
     if (err != ESP_OK) return err;
     
-    *actual_count = sanitize_history_samples(samples, *actual_count);
+    *actual_count = sanitize_history_samples(samples, *actual_count, base_epoch);
     return ESP_OK;
 }
 
-esp_err_t scan_storage_get_history_samples(uint32_t max_count, history_sample_t *samples, uint32_t *actual_count) {
+esp_err_t scan_storage_get_history_samples(uint32_t max_count, history_sample_t *samples, uint32_t *actual_count, uint32_t base_epoch) {
     if (!samples || !actual_count) return ESP_ERR_INVALID_ARG;
     uint32_t total = history_ring.count;
     uint32_t start_idx = (total > max_count) ? (total - max_count) : 0;
-    return scan_storage_get_history_samples_window(start_idx, max_count, samples, actual_count);
+    return scan_storage_get_history_samples_window(start_idx, max_count, samples, actual_count, base_epoch);
 }
 
 uint32_t scan_storage_get_history_count(void) {

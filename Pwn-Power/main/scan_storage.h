@@ -237,8 +237,8 @@ esp_err_t scan_storage_send_unified_intelligence_chunked(httpd_req_t *req);
 
 // history sample ring buffer
 esp_err_t scan_storage_append_history_sample(const history_sample_t *sample);
-esp_err_t scan_storage_get_history_samples(uint32_t max_count, history_sample_t *samples, uint32_t *actual_count);
-esp_err_t scan_storage_get_history_samples_window(uint32_t start_idx, uint32_t max_count, history_sample_t *samples, uint32_t *actual_count);
+esp_err_t scan_storage_get_history_samples(uint32_t max_count, history_sample_t *samples, uint32_t *actual_count, uint32_t base_epoch);
+esp_err_t scan_storage_get_history_samples_window(uint32_t start_idx, uint32_t max_count, history_sample_t *samples, uint32_t *actual_count, uint32_t base_epoch);
 uint32_t scan_storage_get_history_count(void);
 
 // device event ring buffer
