@@ -367,7 +367,7 @@ static void background_scan_task(void *arg) {
         
         uint32_t now = get_uptime_sec();
         uint32_t last_req = webserver_get_last_request_time();
-        if (last_req > 0 && (now - last_req) < CLIENT_ACTIVITY_DEFER_SEC) {
+        if (!was_triggered && last_req > 0 && (now - last_req) < CLIENT_ACTIVITY_DEFER_SEC) {
             ESP_LOGI(TAG, "Deferring scan - recent client activity (%lus ago)", (unsigned long)(now - last_req));
             continue;
         }

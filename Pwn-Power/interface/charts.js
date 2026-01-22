@@ -164,6 +164,78 @@ function updateGraphOverlayState(graphKey, active) {
     overlay.classList.toggle('active', active);
 }
 
+function drawNoDataOverlay(ctx, rect) {
+    const centerX = rect.width / 2;
+    const centerY = rect.height / 2;
+    const isMobile = rect.width < 400;
+
+    // Draw subtle grid pattern in background
+    ctx.strokeStyle = '#252525';
+    ctx.lineWidth = 1;
+    const gridSpacing = 40;
+    for (let x = 0; x < rect.width; x += gridSpacing) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, rect.height);
+        ctx.stroke();
+    }
+    for (let y = 0; y < rect.height; y += gridSpacing) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(rect.width, y);
+        ctx.stroke();
+    }
+
+    // Draw centered card overlay
+    const cardWidth = Math.min(280, rect.width - 40);
+    const cardHeight = isMobile ? 90 : 110;
+    const cardX = centerX - cardWidth / 2;
+    const cardY = centerY - cardHeight / 2;
+    const cardRadius = 12;
+
+    // Card background with gradient
+    const cardGrad = ctx.createLinearGradient(cardX, cardY, cardX, cardY + cardHeight);
+    cardGrad.addColorStop(0, 'rgba(40, 40, 45, 0.95)');
+    cardGrad.addColorStop(1, 'rgba(30, 30, 35, 0.95)');
+    ctx.fillStyle = cardGrad;
+    ctx.beginPath();
+    ctx.roundRect(cardX, cardY, cardWidth, cardHeight, cardRadius);
+    ctx.fill();
+
+    // Card border
+    ctx.strokeStyle = 'rgba(80, 80, 90, 0.5)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // Draw chart icon
+    const iconSize = isMobile ? 24 : 32;
+    const iconX = centerX - iconSize / 2;
+    const iconY = cardY + (isMobile ? 18 : 22);
+
+    ctx.strokeStyle = '#666';
+    ctx.lineWidth = 2;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    // Draw mini bar chart icon
+    const barWidth = iconSize / 5;
+    const bars = [0.4, 0.7, 0.5, 0.9];
+    bars.forEach((h, i) => {
+        const bx = iconX + i * (barWidth + 2);
+        const bh = iconSize * h;
+        const by = iconY + iconSize - bh;
+        ctx.fillStyle = i === 3 ? '#4ade80' : '#555';
+        ctx.fillRect(bx, by, barWidth, bh);
+    });
+
+    // "No data yet" text
+    ctx.fillStyle = '#aaa';
+    ctx.font = `${isMobile ? 14 : 16}px system-ui, sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('No data yet', centerX, cardY + cardHeight - (isMobile ? 22 : 28));
+}
+
 // Chart drawing functions
 function drawMultiLineChart(canvasId, samples, config) {
     const canvas = $(canvasId);
@@ -199,10 +271,7 @@ function drawMultiLineChart(canvasId, samples, config) {
     const seriesData = config.extractSeries(samples);
 
     if (seriesData.length === 0 || seriesData.every(s => s.data.length === 0)) {
-        ctx.fillStyle = '#888';
-        ctx.font = '20px sans-serif';
-        ctx.textAlign = 'center';
-        ctx.fillText('No data available', rect.width / 2, rect.height / 2);
+        drawNoDataOverlay(ctx, rect);
         return;
     }
 
@@ -450,10 +519,7 @@ function drawInteractiveChart(canvasId, samples, config, highlightIdx = -1) {
 
     // handle empty data
     if (dataPoints.length === 0) {
-        ctx.fillStyle = '#888';
-        ctx.font = '20px sans-serif';
-        ctx.textAlign = 'center';
-        ctx.fillText('No data available', rect.width / 2, rect.height / 2);
+        drawNoDataOverlay(ctx, rect);
         return;
     }
 
@@ -699,6 +765,21 @@ function hashSsid(ssid) {
 async function drawSSIDClientsChart(canvasId, samples) {
     if (!samples || samples.length === 0) {
         console.log('[ssid-chart] no samples');
+        const canvas = $(canvasId);
+        if (canvas) {
+            const ctx = canvas.getContext('2d');
+            const rect = canvas.getBoundingClientRect();
+            const dpr = window.devicePixelRatio || 1;
+            canvas.width = rect.width * dpr;
+            canvas.height = rect.height * dpr;
+            ctx.scale(dpr, dpr);
+            const bgGrad = ctx.createLinearGradient(0, 0, 0, rect.height);
+            bgGrad.addColorStop(0, '#1f1f1f');
+            bgGrad.addColorStop(1, '#141414');
+            ctx.fillStyle = bgGrad;
+            ctx.fillRect(0, 0, rect.width, rect.height);
+            drawNoDataOverlay(ctx, rect);
+        }
         return;
     }
 
@@ -720,7 +801,24 @@ async function drawSSIDClientsChart(canvasId, samples) {
 
     console.log(`[ssid-chart] ${samples.length} samples, ${samplesWithClients} with ssid_clients, ${ssidAggregates.size} unique SSIDs`);
 
-    if (ssidAggregates.size === 0) return;
+    if (ssidAggregates.size === 0) {
+        const canvas = $(canvasId);
+        if (canvas) {
+            const ctx = canvas.getContext('2d');
+            const rect = canvas.getBoundingClientRect();
+            const dpr = window.devicePixelRatio || 1;
+            canvas.width = rect.width * dpr;
+            canvas.height = rect.height * dpr;
+            ctx.scale(dpr, dpr);
+            const bgGrad = ctx.createLinearGradient(0, 0, 0, rect.height);
+            bgGrad.addColorStop(0, '#1f1f1f');
+            bgGrad.addColorStop(1, '#141414');
+            ctx.fillStyle = bgGrad;
+            ctx.fillRect(0, 0, rect.width, rect.height);
+            drawNoDataOverlay(ctx, rect);
+        }
+        return;
+    }
 
     // Try to get SSID names from scan report (may fail during bg scan)
     const hashToSsid = new Map();
@@ -840,6 +938,24 @@ function drawSSIDClientsChartImpl(canvasId, networks) {
     ctx.fillText('Top Networks by Client Count', rect.width / 2, isMobile ? 15 : 20);
 }
 
+function drawNoDataOnCanvas(canvasId) {
+    const canvas = $(canvasId);
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    ctx.scale(dpr, dpr);
+    const bgGrad = ctx.createLinearGradient(0, 0, 0, rect.height);
+    bgGrad.addColorStop(0, '#1f1f1f');
+    bgGrad.addColorStop(1, '#141414');
+    ctx.fillStyle = bgGrad;
+    ctx.fillRect(0, 0, rect.width, rect.height);
+    drawNoDataOverlay(ctx, rect);
+}
+
 function renderCharts(samples, timeRange = null) {
     const needsMoreData = !samples || samples.length < HISTORY_READY_THRESHOLD;
 
@@ -848,7 +964,12 @@ function renderCharts(samples, timeRange = null) {
     updateGraphOverlayState('channel', needsMoreData);
     updateGraphOverlayState('ssid-clients', needsMoreData);
 
-    if (!samples || samples.length === 0) return;
+    if (!samples || samples.length === 0) {
+        drawNoDataOnCanvas('#activity-chart');
+        drawNoDataOnCanvas('#channel-chart-time');
+        drawNoDataOnCanvas('#ssid-clients-chart');
+        return;
+    }
 
     // Filter samples to only those with valid timestamps (exclude uptime-only samples)
     // This prevents epoch_ts=0 samples from breaking the timeline (would appear in 1970)
@@ -860,6 +981,9 @@ function renderCharts(samples, timeRange = null) {
         updateGraphOverlayState('activity', true);
         updateGraphOverlayState('channel', true);
         updateGraphOverlayState('ssid-clients', true);
+        drawNoDataOnCanvas('#activity-chart');
+        drawNoDataOnCanvas('#channel-chart-time');
+        drawNoDataOnCanvas('#ssid-clients-chart');
         return;
     }
 
@@ -999,6 +1123,9 @@ async function loadHistoryCharts(days) {
     
     if (!samples || samples.length === 0) {
         showToast('No history data available yet');
+        drawNoDataOnCanvas('#activity-chart');
+        drawNoDataOnCanvas('#channel-chart-time');
+        drawNoDataOnCanvas('#ssid-clients-chart');
         return;
     }
 
