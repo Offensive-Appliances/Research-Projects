@@ -38,9 +38,9 @@ jobs:
           path: |
             ~/esp-idf
             ~/.espressif
-          key: esp-idf-v5.5.1-${{ runner.os }}-${{ matrix.target.idf_target }}
+          key: esp-idf-v5.5.1-${{ runner.os }}-${{ matrix.target.idf_target }}-${{ hashFiles('Pwn-Power/**') }}
           restore-keys: |
-            esp-idf-v5.5.1-${{ runner.os }}-
+            esp-idf-v5.5.1-${{ runner.os }}-${{ matrix.target.idf_target }}-
 
       - name: Install ESP-IDF Dependencies
         if: steps.cache-idf.outputs.cache-hit != 'true'
@@ -53,6 +53,7 @@ jobs:
         if: steps.cache-idf.outputs.cache-hit != 'true'
         working-directory: .
         run: |
+          rm -rf ~/esp-idf
           git clone -b v5.5.1 --depth 1 --recursive https://github.com/espressif/esp-idf.git ~/esp-idf
           ~/esp-idf/install.sh ${{ matrix.target.idf_target }}
 
