@@ -61,6 +61,15 @@ idf.py build
 idf.py flash
 ```
 
+#### Flashing Firmware
+PwnPower uses OTA partition layouts. Use these offsets when flashing:
+
+- Application: firmware.bin at **0x20000**
+- Bootloader: bootloader.bin at **0x0** 
+- Partition Table: partitions.bin at **0x8000**
+- Flash Size: 4MB (ESP32-C3) or 8MB (ESP32-C5)
+
+
 **Note:** ESP32-C5 supports 5GHz WiFi bands in addition to 2.4GHz, but has a smaller handshake capture buffer (16KB vs 32KB on C3).
 
 If you experience issues, try `idf.py fullclean` first.

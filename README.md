@@ -27,6 +27,14 @@ PwnPower runs as a WiFi access point you connect to directly. Once connected, th
 
 When connected to your home network, access PwnPower from any device via https://pwnpower.local. Documentation available at https://docs.hnl.cc/pwnpower/
 
+#### Flashing Firmware
+PwnPower uses OTA partition layouts. Use these offsets when flashing:
+
+- Application: firmware.bin at **0x20000**
+- Bootloader: bootloader.bin at **0x0** 
+- Partition Table: partitions.bin at **0x8000**
+- Flash Size: 4MB (ESP32-C3) or 8MB (ESP32-C5)
+
 **Requirements:** ESP-IDF v5.5+, ESP32-C3 or ESP32-C5
 
 ---
