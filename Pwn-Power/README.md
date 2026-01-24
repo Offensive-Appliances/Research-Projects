@@ -1,6 +1,6 @@
 # PwnPower
 
-ESP32-C3 WiFi security audit tool with scanning, deauth attacks, handshake capture, and passive monitoring.
+ESP32-C3/C5 WiFi security audit tool with scanning, deauth attacks, handshake capture, and passive monitoring.
 All controlled via a modern web interface.
 
 ## Features
@@ -39,16 +39,29 @@ All controlled via a modern web interface.
 ### Web Interface
 - Modern responsive web UI with collapsible sections
 
-## Requirements 
+## Requirements
 - ESP-IDF v5.5 or newer
-- ESP32-C3
+- ESP32-C3 or ESP32-C5
 
 ## Build and Flash
+
+### For ESP32-C3:
 ```bash
-idf.py set-target esp32c3
+copy configs\sdkconfig.esp32c3 sdkconfig
+copy configs\sdkconfig.esp32c3 sdkconfig.defaults
 idf.py build
 idf.py flash
 ```
+
+### For ESP32-C5:
+```bash
+copy configs\sdkconfig.esp32c5 sdkconfig
+copy configs\sdkconfig.esp32c5 sdkconfig.defaults
+idf.py build
+idf.py flash
+```
+
+**Note:** ESP32-C5 supports 5GHz WiFi bands in addition to 2.4GHz, but has a smaller handshake capture buffer (16KB vs 32KB on C3).
 
 If you experience issues, try `idf.py fullclean` first.
 

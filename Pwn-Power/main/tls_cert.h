@@ -3,8 +3,8 @@
 #include <stddef.h>
 
 typedef struct {
-    char cert_pem[2048];
-    char key_pem[2600];
+    char cert_pem[1200];
+    char key_pem[600];
 } tls_cert_bundle_t;
 
 /**

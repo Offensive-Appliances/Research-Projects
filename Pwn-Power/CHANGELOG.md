@@ -22,6 +22,7 @@
 - Enabled HTTPS with on-device self-signed cert
 - Added mDNS support for pwnpower.local on PwnPower AP
 - Added a first time boot setup wizard
+- Added support for the ESP32-C5
 
 ### Changed
 - Merged WiFi Recon and Attack sections into a single section

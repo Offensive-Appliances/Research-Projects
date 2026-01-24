@@ -5,6 +5,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "sdkconfig.h"
 #include <string.h>
 #include "deauth.h"
 #include "device_lifecycle.h"
@@ -16,7 +17,11 @@ static wifi_promiscuous_filter_t s_prev_filter;
 static bool s_prev_filter_valid = false;
 static wifi_promiscuous_cb_t s_prev_cb = NULL;
 
+#if CONFIG_IDF_TARGET_ESP32C5
+#define HS_PCAP_MAX_BYTES (16*1024)
+#else
 #define HS_PCAP_MAX_BYTES (32*1024)
+#endif
 static uint8_t s_pcap_buf[HS_PCAP_MAX_BYTES];
 static size_t s_pcap_len = 0;
 static char s_pcap_name[32] = "handshake.pcap";
@@ -289,10 +294,7 @@ esp_err_t start_handshake_capture(uint8_t bssid[6], int channel, int duration_se
         s_current_capture.is_auto = false;
         s_current_capture.valid = true;
         
-        // Generate handshake event for successful capture
-        if (s_eapol_count > 0) {
-            device_lifecycle_generate_handshake_event(bssid, NULL, s_eapol_count);
-        }
+        device_lifecycle_generate_handshake_event(bssid, NULL, s_eapol_count);
     }
     
     return ESP_OK;
@@ -388,10 +390,7 @@ esp_err_t start_handshake_capture_preserve(uint8_t bssid[6], int channel, int du
         s_current_capture.is_auto = false;
         s_current_capture.valid = true;
         
-        // Generate handshake event for successful capture (only for new EAPOL frames)
-        if (new_eapol_count > 0) {
-            device_lifecycle_generate_handshake_event(bssid, NULL, new_eapol_count);
-        }
+        device_lifecycle_generate_handshake_event(bssid, NULL, new_eapol_count);
     }
     
     return ESP_OK;

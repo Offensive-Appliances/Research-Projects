@@ -22,7 +22,6 @@ extern bool pwnpower_time_is_synced(void);
 extern uint32_t scan_storage_get_history_base_epoch(void);
 extern void scan_storage_set_history_base_epoch(uint32_t epoch);
 
-// External functions from wifi_scan.c for deauth detection
 extern uint32_t wifi_scan_get_deauth_count(void);
 extern void wifi_scan_increment_deauth_count(void);
 extern uint32_t webserver_get_last_request_time(void);
@@ -59,9 +58,7 @@ static uint32_t hash_ssid(const uint8_t *ssid, size_t len) {
     return hash;
 }
 
-// Smart channel weighting for background scans
 uint32_t get_background_channel_dwell_time(uint8_t channel) {
-    // Call the smart dwell time function from wifi_scan module
     return get_channel_dwell_time(channel, true);
 }
 

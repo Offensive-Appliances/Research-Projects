@@ -86,24 +86,108 @@ typedef struct {
 static wps_ap_t s_wps_aps[MAX_WPS_APS];
 static int s_wps_ap_count = 0;
 
-// Define 2.4 GHz and 5 GHz channels
-const uint8_t dual_band_channels[] = {
-    // 2.4 GHz channels: 1-13 (commonly used)
+// Dynamic channel selection based on configured Wi-Fi country
+typedef struct {
+    const char code[3];
+    const uint8_t *channels;
+    size_t count;
+} country_channels_t;
+
+static const uint8_t channels_world[] = {
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
-/*     // 5GHz channels below - comment out for C6 testing
-    // UNII-1 (36-48)
-    36, 40, 44, 48,
-    // UNII-2 (52-64)
-    52, 56, 60, 64,
-    // UNII-2 Extended (100-144)
+    36, 40, 44, 48, 52, 56, 60, 64,
     100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144,
-    // UNII-3 (149-165)
-    149, 153, 157, 161, 165 */
+    149, 153, 157, 161, 165
 };
 
-const size_t dual_band_channels_size = sizeof(dual_band_channels)/sizeof(dual_band_channels[0]);
+static const uint8_t channels_us[] = {
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+    36, 40, 44, 48, 52, 56, 60, 64,
+    100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144,
+    149, 153, 157, 161
+};
 
-// Helper function to update scan results JSON with proper memory management
+static const uint8_t channels_cn[] = {
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+    36, 40, 44, 48, 52, 56, 60, 64,
+    149, 153, 157, 161, 165
+};
+
+static const uint8_t channels_eu[] = {
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+    36, 40, 44, 48, 52, 56, 60, 64,
+    100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140
+};
+
+static const uint8_t channels_jp[] = {
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+    34, 38, 42, 46,
+    52, 56, 60, 64,
+    100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140
+};
+
+static const country_channels_t country_map[] = {
+    {"US", channels_us, sizeof(channels_us) / sizeof(channels_us[0])},
+    {"CN", channels_cn, sizeof(channels_cn) / sizeof(channels_cn[0])},
+    {"EU", channels_eu, sizeof(channels_eu) / sizeof(channels_eu[0])},
+    {"JP", channels_jp, sizeof(channels_jp) / sizeof(channels_jp[0])},
+};
+
+static uint8_t dynamic_channels[64];
+static size_t dynamic_channels_count = 0;
+
+static bool target_is_dual_band(void) {
+#if CONFIG_IDF_TARGET_ESP32C5
+    return true;
+#else
+    return false;
+#endif
+}
+
+static void init_country_channels(void) {
+    if (dynamic_channels_count) {
+        return;
+    }
+
+    wifi_country_t country = {0};
+    if (esp_wifi_get_country(&country) != ESP_OK) {
+        country.cc[0] = 'W';
+        country.cc[1] = 'O';
+        country.cc[2] = 'R';
+    }
+
+    const uint8_t *selected = channels_world;
+    size_t selected_count = sizeof(channels_world) / sizeof(channels_world[0]);
+
+    for (size_t i = 0; i < sizeof(country_map) / sizeof(country_map[0]); i++) {
+        if (country.cc[0] == country_map[i].code[0] && country.cc[1] == country_map[i].code[1]) {
+            selected = country_map[i].channels;
+            selected_count = country_map[i].count;
+            break;
+        }
+    }
+
+    bool dual_band = target_is_dual_band();
+    for (size_t i = 0; i < selected_count && dynamic_channels_count < sizeof(dynamic_channels); i++) {
+        uint8_t ch = selected[i];
+        if (!dual_band && ch > 14) {
+            continue;
+        }
+        dynamic_channels[dynamic_channels_count++] = ch;
+    }
+}
+
+const uint8_t* get_scan_channels(void) {
+    init_country_channels();
+    return dynamic_channels;
+}
+
+const size_t get_scan_channels_size(void) {
+    init_country_channels();
+    return dynamic_channels_count;
+}
+
+
 static esp_err_t update_scan_results_json(cJSON *root) {
     if (!root) return ESP_ERR_INVALID_ARG;
     
@@ -125,7 +209,6 @@ static esp_err_t update_scan_results_json(cJSON *root) {
     return ESP_OK;
 }
 
-// Cleanup function for memory management
 void wifi_scan_cleanup(void) {
     if (scan_results_json) {
         free(scan_results_json);
@@ -143,7 +226,6 @@ void wifi_scan_init_memory(void) {
     ESP_LOGI(TAG, "WiFi scan memory initialized");
 }
 
-// Helper function to get the security type from the encryption mode
 const char* get_security_type(uint8_t encryption) {
     switch (encryption) {
         case WIFI_AUTH_OPEN:
@@ -174,7 +256,6 @@ const char* get_band(uint8_t channel) {
     return "Unknown Band";
 }
 
-// WPS detection helper - checks lookup table populated by beacon parsing
 static bool detect_wps(const uint8_t *bssid) {
     for (int i = 0; i < s_wps_ap_count; i++) {
         if (memcmp(s_wps_aps[i].bssid, bssid, 6) == 0) {
@@ -197,7 +278,6 @@ static void update_wps_status(const uint8_t *bssid, bool wps_enabled) {
             return;
         }
     }
-    // Add new entry if space available
     if (s_wps_ap_count < MAX_WPS_APS) {
         memcpy(s_wps_aps[s_wps_ap_count].bssid, bssid, 6);
         s_wps_aps[s_wps_ap_count].wps_enabled = wps_enabled;
@@ -235,11 +315,15 @@ static bool parse_wps_ie(const uint8_t *frame_body, int body_len) {
     return false;
 }
 
-// Smart channel weighting functions
 uint32_t get_channel_dwell_time(uint8_t channel, bool is_background_scan) {
-    // Default dwell times
     uint32_t base_ap_dwell = is_background_scan ? 80 : 120;
     uint32_t base_station_dwell = is_background_scan ? 200 : 500;
+
+#if CONFIG_IDF_TARGET_ESP32C5
+    // 25% more dwell time for extra channels
+    base_ap_dwell = (base_ap_dwell * 5) / 4;
+    base_station_dwell = (base_station_dwell * 5) / 4;
+#endif
     
     // Only apply weighting after we have enough data
     if (channel_scan_counts[channel] >= MIN_SCANS_FOR_LEARNING) {
@@ -337,17 +421,20 @@ void wifi_scan() {
     // Run maintenance to adapt to changing conditions
     maintain_channel_learning();
     
+    const uint8_t* channels = get_scan_channels();
+    size_t channels_size = get_scan_channels_size();
+    
     // Calculate estimate using adaptive timing
     uint32_t total_estimate_ms = 0;
-    for (size_t i = 0; i < sizeof(dual_band_channels) / sizeof(dual_band_channels[0]); i++) {
-        uint8_t channel = dual_band_channels[i];
+    for (size_t i = 0; i < channels_size; i++) {
+        uint8_t channel = channels[i];
         uint32_t ap_dwell = get_channel_dwell_time(channel, false);
         uint32_t station_dwell = (uint32_t)(ap_dwell * 4.17); // Maintain 500/120 ratio
         total_estimate_ms += ap_dwell + station_dwell;
     }
     
     ESP_LOGI(TAG, "Starting smart scan - estimated %.1f seconds (%d channels)", 
-            total_estimate_ms / 1000.0f, dual_band_channels_size);
+            total_estimate_ms / 1000.0f, channels_size);
 
     cJSON *root = cJSON_CreateObject();
     cJSON *rows = cJSON_AddArrayToObject(root, "rows");
@@ -359,8 +446,8 @@ void wifi_scan() {
         .show_hidden = true  
     };
 
-    for (size_t i = 0; i < sizeof(dual_band_channels) / sizeof(dual_band_channels[0]); i++) {
-        uint8_t channel = dual_band_channels[i];
+    for (size_t i = 0; i < channels_size; i++) {
+        uint8_t channel = channels[i];
         
         // Get smart dwell time for this channel
         uint32_t ap_dwell = get_channel_dwell_time(channel, false);
@@ -509,10 +596,8 @@ void wifi_scan() {
                     uint8_t mac[6];
                     if (sscanf(mac_item->valuestring, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
                               &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6) {
-                        // Find the corresponding AP entry to get SSID
                         cJSON *ap_mac_item = cJSON_GetObjectItem(station_ap_entry, "bssid");
                         if (ap_mac_item) {
-                            // Find AP SSID from the main scan results
                             cJSON *scan_ap_entry = NULL;
                             cJSON_ArrayForEach(scan_ap_entry, rows) {
                                 cJSON *scan_mac_item = cJSON_GetObjectItem(scan_ap_entry, "MAC");
@@ -645,7 +730,6 @@ void wifi_scan() {
 
     ESP_LOGI(TAG, "Wi-Fi Scan Completed. Results cached.");
     
-    // Clean up temporary memory to prevent fragmentation
     wifi_scan_cleanup_station_json();
     
     // Log heap status after cleanup
@@ -762,7 +846,6 @@ void wifi_scan_update_ui_cache_from_record(const scan_record_t *record) {
 
     scan_was_truncated = false;
     
-    // Use dynamic allocation for JSON (same as main scan)
     esp_err_t err = update_scan_results_json(root);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to update scan results JSON from background scan");
@@ -846,7 +929,6 @@ bool wifi_scan_has_new_results() {
     return has_new;
 }
 
-// Probe request fingerprinting functions
 static void parse_probe_request_fingerprint(const uint8_t *frame_body, int frame_len, station_info_t *station);
 static void extract_device_capabilities(const uint8_t *ie_data, uint8_t ie_len, char *fingerprint, size_t fp_len);
 static const char* get_vendor_from_oui(const uint8_t *mac);
@@ -873,7 +955,6 @@ static void stations_sniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
     uint8_t frame_type = (fc0 >> 2) & 0x03;
     uint8_t frame_subtype = (fc0 >> 4) & 0x0F;
     
-    // Debug: Log management frame types (reduced frequency)
     if (frame_type == 0) {
         s_probe_request_count++;
         if (frame_subtype == 0x04 && s_probe_request_count % 50 == 0) {
@@ -1174,10 +1255,6 @@ void wifi_scan_stations() {
     
     xSemaphoreTake(stations_mutex, portMAX_DELAY);
     stations_count = 0; // reset for new scan
-    xSemaphoreGive(stations_mutex);
-    
-    // Reset probe request counter for debugging
-    s_probe_request_count = 0;
     ESP_LOGI(TAG, "PROBE_DEBUG: Starting station scan, reset probe counter to 0");
 
     if(known_ap_count == 0) {
@@ -1207,13 +1284,14 @@ void wifi_scan_stations() {
 
     uint32_t scan_time_ms = 4000;
     uint32_t dwell_time_ms = 200;
-    int ch_count = known_channel_count > 0 ? known_channel_count : (int)dual_band_channels_size;
+    int ch_count = known_channel_count > 0 ? known_channel_count : (int)get_scan_channels_size();
+    const uint8_t* channels = get_scan_channels();
     uint32_t iterations = scan_time_ms / (dwell_time_ms * (uint32_t)ch_count);
     if (iterations == 0) iterations = 1;
     if (iterations > 8) iterations = 8;
     for (uint32_t iter = 0; iter < iterations; iter++) {
         for (int i = 0; i < ch_count; i++) {
-            uint8_t ch = (known_channel_count > 0) ? known_ap_channels[i] : dual_band_channels[i];
+            uint8_t ch = (known_channel_count > 0) ? known_ap_channels[i] : channels[i];
             esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
             vTaskDelay(pdMS_TO_TICKS(dwell_time_ms));
         }
@@ -1318,7 +1396,6 @@ const char* wifi_scan_get_station_results() {
     return station_json_buffer;
 }
 
-// Cleanup function for station JSON buffer
 void wifi_scan_cleanup_station_json(void) {
     if (station_json_buffer) {
         free(station_json_buffer);
@@ -1463,10 +1540,7 @@ int wifi_scan_probe_hidden_aps(void) {
     return revealed_count;
 }
 
-// Probe Request Fingerprinting Implementation
-
 static const char* get_vendor_from_oui(const uint8_t *mac) {
-    // Use existing OUI lookup functionality
     static char vendor_buffer[64];
     if (ouis_lookup_vendor(mac, vendor_buffer, sizeof(vendor_buffer))) {
         return vendor_buffer;
@@ -1544,7 +1618,6 @@ static void parse_probe_request_fingerprint(const uint8_t *frame_body, int frame
         ESP_LOGD(TAG, "PROBE_FINGERPRINT: SSID length: %d", ssid_len);
     }
     
-    // Parse remaining IEs for fingerprinting
     while (ie_offset + 1 < frame_len) {
         uint8_t ie_id = frame_body[ie_offset];
         uint8_t ie_len = frame_body[ie_offset + 1];
@@ -1563,7 +1636,6 @@ static void parse_probe_request_fingerprint(const uint8_t *frame_body, int frame
             fp_pos += snprintf(station->device_fingerprint + fp_pos, sizeof(station->device_fingerprint) - fp_pos, "%s ", ie_fingerprint);
         }
         
-        // Vendor-specific IEs (0xDD) often contain device-specific information
         if (ie_id == 0xDD && ie_len >= 3) {
             uint8_t vendor_oui[3];
             memcpy(vendor_oui, &frame_body[ie_offset + 2], 3);

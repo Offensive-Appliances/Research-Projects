@@ -18,8 +18,8 @@ uint32_t wifi_scan_get_results_timestamp();
 bool wifi_scan_was_truncated();
 bool wifi_scan_has_new_results();
 void wifi_scan_update_ui_cache_from_record(const scan_record_t *record);
-extern const uint8_t dual_band_channels[];
-extern const size_t dual_band_channels_size;
+extern const uint8_t* get_scan_channels(void);
+extern const size_t get_scan_channels_size(void);
 
 typedef struct {
     uint8_t station_mac[6];

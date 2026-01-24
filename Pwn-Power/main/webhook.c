@@ -5,7 +5,9 @@
 #include "nvs.h"
 #include "esp_log.h"
 #include "esp_http_client.h"
+#ifdef CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
 #include "esp_crt_bundle.h"
+#endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "cJSON.h"
@@ -32,7 +34,6 @@ static esp_http_client_handle_t webhook_client = NULL;
 static char webhook_client_url[WEBHOOK_URL_MAX_LEN] = {0};
 static const uint32_t max_events_per_cycle = 5;
 
-// Track retry attempts for the current failing event
 static uint32_t current_event_cursor = 0xFFFFFFFF;
 static uint8_t retry_count = 0;
 
@@ -105,7 +106,9 @@ static esp_http_client_handle_t get_webhook_client(void) {
         .url = current_config.url,
         .method = HTTP_METHOD_POST,
         .timeout_ms = 15000,
+#ifdef CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
         .crt_bundle_attach = esp_crt_bundle_attach,
+#endif
         .keep_alive_enable = false,  // Disable keep-alive to avoid connection reuse issues
         .is_async = false,
     };
@@ -423,7 +426,6 @@ static esp_err_t send_event(const device_event_t *event) {
 
     ESP_LOGD(TAG, "HTTP response: status=%d, content_length=%d, err=%d", status_code, content_length, err);
 
-    // Read response body if available
     char resp[256] = {0};
     if (content_length > 0 && content_length < sizeof(resp)) {
         int rlen = esp_http_client_read(client, resp, sizeof(resp) - 1);
@@ -561,7 +563,6 @@ static void webhook_dispatcher_task(void *arg) {
                 retry_count = 0;
             }
 
-            // attempt send
             err = send_event(&event);
             if (err == ESP_OK) {
                 // Success - advance cursor and reset retry tracking
@@ -575,12 +576,10 @@ static void webhook_dispatcher_task(void *arg) {
                 persist_cursor_state();
                 sent_this_cycle++;
             } else {
-                // Failed - increment retry counter for logging
                 retry_count++;
                 ESP_LOGW(TAG, "Event at cursor %lu failed (attempt %d), will retry",
                          (unsigned long)send_cursor, retry_count);
 
-                // Reset HTTP client on persistent failures
                 if (retry_count >= MAX_RETRY_ATTEMPTS) {
                     reset_webhook_client();
                     retry_count = 0; // Reset for next cycle

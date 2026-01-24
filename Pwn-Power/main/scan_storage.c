@@ -50,11 +50,8 @@ static char extra_home_ssids[3][33] = {{0}};  // up to 3 additional home SSIDs
 static uint32_t device_updates_since_save = 0;
 #define DEVICE_SAVE_INTERVAL 20
 
-// Pre-allocated write buffer for device saves (avoids fragmentation)
 static uint8_t device_write_buffer[sizeof(uint32_t) + (sizeof(device_presence_t) * MAX_TRACKED_DEVICES)];
 
-// Shared scan record buffer for temporary operations (avoids ~9KB repeated allocations)
-// Non-static so it can be accessed from other files via extern declaration
 scan_record_t shared_scan_buffer;
 
 // Pending background scan record for queuing updates during manual scans
@@ -314,7 +311,6 @@ esp_err_t scan_storage_init(void) {
 static void device_cleanup_task(void *arg) {
     ESP_LOGI(TAG, "Device cleanup task started");
     while (1) {
-        // Wait 1 hour between cleanup cycles
         vTaskDelay(pdMS_TO_TICKS(3600000));
 
         time_t epoch_now = time(NULL);
@@ -364,7 +360,6 @@ static void prune_stale_data(scan_record_t *record, time_t current_time) {
     // Remove stale APs
     for (uint8_t i = 0; i < record->header.ap_count; ) {
         if ((current_time - record->aps[i].last_seen) > STALE_AP_THRESHOLD_SEC) {
-            // AP is stale, shift remaining APs down
             if (i < record->header.ap_count - 1) {
                 memmove(&record->aps[i], &record->aps[i + 1],
                         (record->header.ap_count - i - 1) * sizeof(stored_ap_t));
@@ -375,7 +370,6 @@ static void prune_stale_data(scan_record_t *record, time_t current_time) {
             // Remove stale stations within this AP
             for (uint8_t s = 0; s < record->aps[i].station_count; ) {
                 if ((current_time - record->aps[i].stations[s].last_seen) > STALE_STATION_THRESHOLD_SEC) {
-                    // Station is stale, shift remaining stations down
                     if (s < record->aps[i].station_count - 1) {
                         memmove(&record->aps[i].stations[s], &record->aps[i].stations[s + 1],
                                 (record->aps[i].station_count - s - 1) * sizeof(stored_station_t));
@@ -872,7 +866,6 @@ static bool evict_lowest_priority_device(void) {
         return false;
     }
 
-    // Log eviction for debugging
     ESP_LOGI(TAG, "evicting device %02X:%02X:%02X:%02X:%02X:%02X (priority=%lu, sightings=%u, home=%d) to make room",
              tracked_devices[lowest_idx].mac[0], tracked_devices[lowest_idx].mac[1],
              tracked_devices[lowest_idx].mac[2], tracked_devices[lowest_idx].mac[3],
@@ -930,7 +923,6 @@ esp_err_t scan_storage_update_device_presence(const uint8_t *mac, int8_t rssi, c
     char vendor[64] = "Unknown";
     ouis_lookup_vendor(mac, vendor, sizeof(vendor));
 
-    // update lifecycle tracking (generates events as needed)
     device_lifecycle_update(mac, rssi, ap_ssid, vendor);
 
     bool device_modified = false;
@@ -1290,8 +1282,6 @@ esp_err_t scan_storage_set_device_home(const uint8_t *mac, bool is_home) {
 }
 
 esp_err_t scan_storage_detect_rogue_aps(void) {
-    // CRITICAL: Cannot use shared_scan_buffer here because this function is called
-    // from populate_scan_record() which is actively using shared_scan_buffer
     scan_record_t *rec = malloc(sizeof(scan_record_t));
     if (!rec) {
         ESP_LOGE(TAG, "Failed to allocate buffer for rogue AP detection");
@@ -1752,7 +1742,6 @@ uint32_t scan_storage_get_history_count(void) {
 esp_err_t scan_storage_append_device_event(const device_event_t *event) {
     if (!event) return ESP_ERR_INVALID_ARG;
     
-    // use flash manager ring buffer helper
     esp_err_t err = flash_manager_ring_write(&flash_mgr, &events_ring, event);
     if (err != ESP_OK) {
         return err;
@@ -1769,7 +1758,6 @@ esp_err_t scan_storage_append_device_event(const device_event_t *event) {
 esp_err_t scan_storage_get_device_events(uint32_t start_idx, uint32_t max_count, device_event_t *events, uint32_t *actual_count) {
     if (!events || !actual_count) return ESP_ERR_INVALID_ARG;
     
-    // use flash manager ring buffer helper
     return flash_manager_ring_read(&flash_mgr, &events_ring, start_idx, max_count, events, actual_count);
 }
 

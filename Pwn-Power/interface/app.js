@@ -635,24 +635,45 @@ function renderChannelChart() {
     
     const channels = {};
     const dataSource = Array.from(accumulatedNetworks.values());
+
     dataSource.forEach(ap => {
-        const ch = ap.Channel;
-        channels[ch] = (channels[ch] || 0) + 1;
+        const ch = Number(ap.Channel);
+        if (!Number.isFinite(ch) || ch <= 0) return;
+
+        const entry = channels[ch] || { aps: 0, clients: 0 };
+        entry.aps += 1;
+        if (Array.isArray(ap.stations)) {
+            entry.clients += ap.stations.length;
+        }
+        channels[ch] = entry;
     });
-    
-    const maxCount = Math.max(...Object.values(channels), 1);
+
+    const totalFor = (entry) => (entry?.aps || 0) + (entry?.clients || 0);
+    const maxCount = Math.max(1, ...Object.values(channels).map(totalFor));
     container.innerHTML = '';
-    
-    for (let ch = 1; ch <= 13; ch++) {
-        const count = channels[ch] || 0;
-        const height = (count / maxCount) * 100;
+
+    const buildBar = (ch, is5GHz = false) => {
+        const entry = channels[ch] || { aps: 0, clients: 0 };
+        const total = totalFor(entry);
+        const height = (total / maxCount) * 100;
         const bar = document.createElement('div');
-        bar.className = 'chart-bar';
+        bar.className = `chart-bar${is5GHz ? ' five-ghz' : ''}`;
         bar.style.height = `${Math.max(height, 5)}%`;
         bar.innerHTML = `<span class="chart-bar-label">${ch}</span>`;
-        bar.title = `Channel ${ch}: ${count} APs`;
+        const clientText = entry.clients ? `, ${entry.clients} clients` : '';
+        bar.title = `Channel ${ch}: ${entry.aps} APs${clientText}`;
         container.appendChild(bar);
+    };
+
+    for (let ch = 1; ch <= 13; ch++) {
+        buildBar(ch, false);
     }
+
+    Object.keys(channels)
+        .map(Number)
+        .filter(ch => ch > 13 && totalFor(channels[ch]) > 0)
+        .sort((a, b) => a - b)
+        .forEach(ch => buildBar(ch, true));
 }
 
 function updateStats(scanTimestamp, wifiStatus) {

@@ -145,15 +145,15 @@ static bool generate_cert(tls_cert_bundle_t *bundle) {
         goto cleanup;
     }
 
-    ret = mbedtls_pk_setup(&key, mbedtls_pk_info_from_type(MBEDTLS_PK_RSA));
+    ret = mbedtls_pk_setup(&key, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY));
     if (ret != 0) {
         ESP_LOGE(TAG, "pk_setup failed: -0x%04x", -ret);
         goto cleanup;
     }
 
-    ret = mbedtls_rsa_gen_key(mbedtls_pk_rsa(key), mbedtls_ctr_drbg_random, &drbg, 2048, 65537);
+    ret = mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, mbedtls_pk_ec(key), mbedtls_ctr_drbg_random, &drbg);
     if (ret != 0) {
-        ESP_LOGE(TAG, "rsa_gen_key failed: -0x%04x", -ret);
+        ESP_LOGE(TAG, "ecp_gen_key failed: -0x%04x", -ret);
         goto cleanup;
     }
 
@@ -221,7 +221,7 @@ static bool generate_cert(tls_cert_bundle_t *bundle) {
         goto cleanup;
     }
 
-    ESP_LOGI(TAG, "Generated new self-signed RSA-2048 cert");
+    ESP_LOGI(TAG, "Generated new self-signed ECDSA P-256 cert");
     ok = true;
 
 cleanup:

@@ -24,6 +24,7 @@
 #include "esp_timer.h"
 #include "monitor_uptime.h"
 #include <time.h>
+#include "lwip/ip4_addr.h"
 
 #define TAG "PwnPower"
 #define MAX_STA_CONN 4
@@ -137,6 +138,12 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                 esp_wifi_set_mode(WIFI_MODE_STA);
             }
         }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_AP_STAIPASSIGNED) {
+        ip_event_ap_staipassigned_t *event = (ip_event_ap_staipassigned_t *)event_data;
+        ESP_LOGI(TAG, "DHCP assigned IP to station: " IPSTR, IP2STR(&event->ip));
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED) {
+        wifi_event_ap_staconnected_t *event = (wifi_event_ap_staconnected_t *)event_data;
+        ESP_LOGI(TAG, "Station connected: %02x:%02x:%02x:%02x:%02x:%02x, AID=%d", event->mac[0], event->mac[1], event->mac[2], event->mac[3], event->mac[4], event->mac[5], event->aid);
     }
 }
 
@@ -145,12 +152,23 @@ void wifi_init_softap() {
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
     esp_netif_t *ap_netif = esp_netif_create_default_wifi_ap();
+    esp_netif_ip_info_t ip_info = {0};
+    IP4_ADDR(&ip_info.ip, 192, 168, 4, 1);
+    IP4_ADDR(&ip_info.gw, 192, 168, 4, 1);
+    IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0);
+    ESP_ERROR_CHECK(esp_netif_dhcps_stop(ap_netif));
+    ESP_ERROR_CHECK(esp_netif_set_ip_info(ap_netif, &ip_info));
+    esp_netif_dns_info_t dns_main = {0};
+    dns_main.ip.u_addr.ip4 = ip_info.ip;
+    dns_main.ip.type = IPADDR_TYPE_V4;
+    ESP_ERROR_CHECK(esp_netif_set_dns_info(ap_netif, ESP_NETIF_DNS_MAIN, &dns_main));
+    ESP_ERROR_CHECK(esp_netif_dhcps_start(ap_netif));
     esp_netif_set_hostname(ap_netif, "pwnpower");
     mdns_service_init("pwnpower");
 
-    esp_netif_ip_info_t ip_info;
     ESP_ERROR_CHECK(esp_netif_get_ip_info(ap_netif, &ip_info));
     ESP_LOGI(TAG, "AP IP Address: " IPSTR, IP2STR(&ip_info.ip));
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     
@@ -164,6 +182,7 @@ void wifi_init_softap() {
     
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_AP_STAIPASSIGNED, &wifi_event_handler, NULL));
     
     ap_config_init();
     sta_config_init();

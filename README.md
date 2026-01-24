@@ -5,16 +5,29 @@ Research projects conducted by the Offensive Appliances team exploring hardware 
 ## Projects
 
 ### [PwnPower](./Pwn-Power)
-ESP32-C3 WiFi security audit tool with scanning, deauth attacks, handshake capture, and passive monitoring. Features a modern web interface for network penetration testing and reconnaissance.
+A compact WiFi security auditing tool built on ESP32-C3 and ESP32-C5.
+Connect to the PwnPower access point and access the web interface at https://pwnpower.local.
 
-**Key Features:**
-- WiFi network scanning with vendor identification
-- Deauthentication attacks and handshake capture
-- Passive monitoring and device tracking
-- Web-based control interface
-- OTA firmware updates
+#### Quick Start
+1. Power on the device
+2. Connect to WiFi: PwnPower (password: password)
+3. Open browser: https://pwnpower.local
+4. Complete the one-time setup wizard
 
-**Requirements:** ESP-IDF v5.5+, ESP32-C3
+#### Core Features
+- **Network Scanning** - Discover nearby WiFi networks and connected clients
+- **Security Testing** - Deauthentication attacks and WPA handshake capture
+- **Device Tracking** - Monitor device presence with automatic trust scoring
+- **Webhook Alerts** - Discord/Slack notifications for device events
+- **Background Operation** - Continuous autonomous scanning and tracking
+- **Smart Plug Control** - GPIO-based relay control for hardware integration
+
+#### How It Works
+PwnPower runs as a WiFi access point you connect to directly. Once connected, the web interface gives you full control over scanning, attacks, and monitoring. The device operates autonomously in the background—scanning networks, tracking devices, and sending alerts—even when you're not using the interface.
+
+When connected to your home network, access PwnPower from any device via https://pwnpower.local. Documentation available at https://docs.hnl.cc/pwnpower/
+
+**Requirements:** ESP-IDF v5.5+, ESP32-C3 or ESP32-C5
 
 ---
 

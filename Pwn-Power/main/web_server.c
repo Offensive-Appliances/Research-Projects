@@ -56,7 +56,6 @@ extern bool pwnpower_time_is_synced(void);
 static int s_smartplug_level = 0;
 static bool s_smartplug_inited = false;
 
-// Add missing HTTP status code if not defined
 #ifndef HTTPD_503_SERVICE_UNAVAILABLE
 #define HTTPD_503_SERVICE_UNAVAILABLE 503
 #endif
@@ -80,7 +79,6 @@ static esp_err_t wifi_status_handler(httpd_req_t *req);
 static bool wizard_is_completed(void);
 static bool auth_is_authorized(httpd_req_t *req);
 
-// simple STA connection helpers used by the web UI
 static volatile bool g_sta_connected = false;
 static bool g_ip_handler_registered = false;
 static bool g_wifi_handler_registered = false;
@@ -766,7 +764,6 @@ static esp_err_t startattack_handler(httpd_req_t *req) {
 
     cJSON_Delete(root);
 
-    // Log MAC conversion attempt
     ESP_LOGD(TAG, "Converting MAC: %s", mac_str);
     uint8_t target_bssid[6];
     int mac_conversion = sscanf(mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
@@ -1588,7 +1585,6 @@ static esp_err_t scan_report_handler(httpd_req_t *req) {
         (unsigned long)stats.known_devices_present);
     if (httpd_resp_send_chunk(req, chunk, len) != ESP_OK) return ESP_FAIL;
     
-    // Send intelligence data if available
     const char *intel_json = scan_storage_get_intelligence_json();
     if (intel_json && strlen(intel_json) > 2) {
         len = snprintf(chunk, sizeof(chunk), "\"intelligence\":");
@@ -2450,8 +2446,13 @@ static httpd_handle_t start_http_redirect_server(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 4;
+    config.max_uri_handlers = 2;
+    config.max_open_sockets = 1;
+    config.backlog_conn = 1;
     config.uri_match_fn = httpd_uri_match_wildcard;
+#ifdef CONFIG_IDF_TARGET_ESP32C5
+    config.stack_size = 3072;
+#endif
 
     httpd_uri_t redirect_uri = {
         .uri = "/*",
@@ -2501,8 +2502,15 @@ static httpd_handle_t start_https_server(void) {
     conf.prvtkey_pem = (const uint8_t *)s_tls_bundle.key_pem;
     conf.prvtkey_len = strlen(s_tls_bundle.key_pem) + 1;
     conf.httpd.max_uri_handlers = 48;
+#ifdef CONFIG_IDF_TARGET_ESP32C5
+    conf.httpd.max_open_sockets = 2;
+    conf.httpd.backlog_conn = 1;
+    conf.httpd.stack_size = 5120;
+#else
     conf.httpd.max_open_sockets = 3;
     conf.httpd.backlog_conn = 2;
+    conf.httpd.stack_size = 6144;
+#endif
     conf.httpd.lru_purge_enable = true;
     conf.httpd.send_wait_timeout = 5;
     conf.httpd.recv_wait_timeout = 5;
@@ -2510,7 +2518,6 @@ static httpd_handle_t start_https_server(void) {
     conf.httpd.keep_alive_idle = 5;
     conf.httpd.keep_alive_interval = 2;
     conf.httpd.keep_alive_count = 3;
-    conf.httpd.stack_size = 6144;
     conf.httpd.open_fn = https_open_fn; // check heap health before accepting connections
 
     httpd_handle_t server = NULL;
