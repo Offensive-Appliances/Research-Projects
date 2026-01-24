@@ -30,6 +30,9 @@ on:
         type: string
         default: ""
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build for ${{ matrix.target.name }}
