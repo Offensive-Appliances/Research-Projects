@@ -76,13 +76,14 @@ jobs:
           cp build/partition_table/partition-table.bin release/partitions.bin
           cp build/pwnpower.bin release/firmware.bin
           
+          # Both targets use OTA layout - flash to ota_0 partition at 0x20000
           python3 -m esptool --chip ${{ matrix.target.idf_target }} merge_bin \
             --output release/pwnpower-merged.bin \
             --flash_mode dio \
             --flash_size ${{ matrix.target.idf_target == 'esp32c5' && '8MB' || '4MB' }} \
             0x0 release/bootloader.bin \
             0x8000 release/partitions.bin \
-            0x10000 release/firmware.bin
+            0x20000 release/firmware.bin
           
           cd release && zip -j ../${{ matrix.target.zip_name }} *
 
