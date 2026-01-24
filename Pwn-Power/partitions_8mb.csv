@@ -1,0 +1,13 @@
+# PwnPower Custom Partition Table - 8MB Flash with OTA + Scan Storage
+# Name,      Type, SubType,  Offset,    Size,     Flags
+# Notes (hex -> decimal bytes):
+# - Flash size 0x800000 = 8388608 bytes
+# - ota_0: offset 0x20000 = 131072 bytes, size 0x300000 = 3145728 bytes, end 0x320000 = 3276800 bytes
+# - ota_1: offset 0x320000 = 3276800 bytes, size 0x300000 = 3145728 bytes, end 0x620000 = 6422528 bytes
+# - scandata: offset 0x620000 = 6422528 bytes, size 0x1E0000 = 1966080 bytes, end 0x800000 = 8388608 bytes
+nvs,         data, nvs,      0x9000,    0xC000,
+otadata,     data, ota,      0x15000,   0x2000,
+phy_init,    data, phy,      0x17000,   0x1000,
+ota_0,       app,  ota_0,    0x20000,   0x300000,
+ota_1,       app,  ota_1,    0x320000,   0x300000,
+scandata,    data, 0x99,     0x620000,  0x1E0000,

@@ -28,7 +28,8 @@ esp_err_t mdns_service_init(const char *hostname) {
         ESP_LOGW(TAG, "mDNS instance name set failed: %s", esp_err_to_name(err));
     }
 
-    err = mdns_service_add("PwnPower Web", "_http", "_tcp", 80, NULL, 0);
+    // Advertise HTTPS on port 443; HTTP now only redirects
+    err = mdns_service_add("PwnPower Web", "_https", "_tcp", 443, NULL, 0);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "mDNS service add failed: %s", esp_err_to_name(err));
     }

@@ -3,19 +3,156 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="theme-color" content="#0d1117">
     <title>PwnPower</title>
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-    <header>
-        <h1>PwnPower</h1>
-        <div class="subtitle">Offensive Appliances Research</div>
-    </header>
-    
-    <main>
-        <section id="recon" class="section">
-            <div class="section-title" onclick="toggleSection('recon')">
-                <h2>WiFi Recon</h2>
+    <div id="login-screen" class="login-screen" style="display:none;">
+        <div class="login-card">
+            <h2>Unauthorized</h2>
+            <p class="muted">Enter password.</p>
+            <div class="input-group">
+                <label for="login-password">Password</label>
+                <input type="password" id="login-password" autocomplete="current-password" placeholder="••••••••" />
+            </div>
+            <button class="btn btn-primary" id="login-submit">Submit</button>
+            <div id="login-error" class="error-text" style="display:none;">Invalid password. Try again.</div>
+        </div>
+    </div>
+
+    <div id="wizard-screen" class="wizard-screen" style="display:none;">
+        <div class="wizard-container">
+            <div class="wizard-header">
+                <h2>Welcome to PwnPower</h2>
+                <div class="wizard-progress">
+                    <div class="wizard-step active" data-step="1">1</div>
+                    <div class="wizard-step" data-step="2">2</div>
+                    <div class="wizard-step" data-step="3">3</div>
+                    <div class="wizard-step" data-step="4">4</div>
+                    <div class="wizard-step" data-step="5">5</div>
+                </div>
+            </div>
+
+            <div class="wizard-page active" id="wizard-page-1">
+                <h3>Operating Mode</h3>
+                <p class="muted">Choose how PwnPower should operate</p>
+                <div class="wizard-options">
+                    <label class="wizard-option">
+                        <input type="radio" name="mode" value="standalone" checked>
+                        <div class="option-content">
+                            <strong>Standalone Mode</strong>
+                            <span class="muted">No internet required. Time won't be synced but all features work.</span>
+                        </div>
+                    </label>
+                    <label class="wizard-option">
+                        <input type="radio" name="mode" value="connected">
+                        <div class="option-content">
+                            <strong>Connected Mode</strong>
+                            <span class="muted">Connect to your home WiFi for time sync, mDNS access (pwnpower.local), and webhook alerts.</span>
+                        </div>
+                    </label>
+                </div>
+            </div>
+
+            <div class="wizard-page" id="wizard-page-2">
+                <h3>Home Network</h3>
+                <p class="muted">Connect to your home WiFi network</p>
+                <div id="wizard-network-form">
+                    <div class="input-group">
+                        <label>Network SSID</label>
+                        <input type="text" id="wizard-net-ssid" placeholder="Your WiFi name">
+                    </div>
+                    <div class="input-group">
+                        <label>Password</label>
+                        <input type="password" id="wizard-net-pass" placeholder="WiFi password">
+                    </div>
+                    <label class="wizard-checkbox">
+                        <input type="checkbox" id="wizard-keep-ap" checked>
+                        <span>Keep internal AP active when connected</span>
+                    </label>
+                    <label class="wizard-checkbox">
+                        <input type="checkbox" id="wizard-auto-connect" checked>
+                        <span>Auto-connect on boot</span>
+                    </label>
+                </div>
+                <div class="muted" style="margin-top:12px;font-size:11px;">You can skip this step and configure later.</div>
+            </div>
+
+            <div class="wizard-page" id="wizard-page-3">
+                <h3>Internal Access Point</h3>
+                <p class="muted">Configure the device's WiFi network</p>
+                <div class="input-group">
+                    <label>AP Name (SSID)</label>
+                    <input type="text" id="wizard-ap-ssid" placeholder="PwnPower" maxlength="32">
+                </div>
+                <div class="input-group">
+                    <label>AP Password (8+ chars or empty for open)</label>
+                    <input type="password" id="wizard-ap-pass" placeholder="Leave empty for open network">
+                </div>
+                <div class="muted" style="margin-top:12px;font-size:11px;">Default: Open network named "PwnPower". Change for better security.</div>
+            </div>
+
+            <div class="wizard-page" id="wizard-page-4">
+                <h3>Login Security</h3>
+                <p class="muted">Configure interface access password</p>
+                <div class="input-group">
+                    <label>New Password (8-64 chars, or empty to disable)</label>
+                    <input type="password" id="wizard-auth-password" placeholder="Leave empty to disable login">
+                </div>
+                <div class="muted" style="margin-top:12px;font-size:11px;">
+                    Default: Password disabled (open access). Set a password for better security.
+                </div>
+                <div class="muted" style="margin-top:8px;font-size:11px;">
+                    You can change this later in the Network Connection section.
+                </div>
+            </div>
+
+            <div class="wizard-page" id="wizard-page-5">
+                <h3>Scanning & Alerts</h3>
+                <p class="muted">Configure background scanning and webhook notifications</p>
+                <div style="display:flex;flex-direction:column;gap:12px;">
+                    <label class="wizard-checkbox">
+                        <input type="checkbox" id="wizard-bg-scan" checked>
+                        <span>Enable background scanning</span>
+                    </label>
+                    <div class="input-group" style="margin-left:24px;">
+                        <label>Scan interval (minutes)</label>
+                        <input type="number" id="wizard-scan-interval" min="1" max="60" value="5" style="width:80px;">
+                    </div>
+                    <div class="wizard-divider"></div>
+                    <label class="wizard-checkbox">
+                        <input type="checkbox" id="wizard-webhook-enabled">
+                        <span>Enable Discord/Webhook alerts</span>
+                    </label>
+                    <div class="input-group" id="wizard-webhook-url-group" style="margin-left:24px;display:none;">
+                        <label>Webhook URL</label>
+                        <input type="url" id="wizard-webhook-url" placeholder="https://discord.com/api/webhooks/...">
+                    </div>
+                </div>
+            </div>
+
+            <div class="wizard-nav">
+                <button class="btn" id="wizard-prev" style="visibility:hidden;">Back</button>
+                <button class="btn btn-primary" id="wizard-next">Next</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="app-shell" style="display:none;">
+        <header>
+            <h1>PwnPower</h1>
+            <div class="subtitle">Offensive Appliances Research</div>
+            <button id="privacy-toggle" class="privacy-btn" onclick="togglePrivacyMode()" title="Toggle Privacy Mode for demos">
+                <span id="privacy-icon">◉</span>
+            </button>
+        </header>
+        <div id="scan-busy-banner" class="warning-banner" style="display:none;">Scan in progress…</div>
+        
+        <main>
+        <section id="wifi" class="section">
+            <div class="section-title" onclick="toggleSection('wifi')">
+                <h2>WiFi Recon & Attacks</h2>
                 <span class="arrow">▼</span>
             </div>
             <div class="section-content">
@@ -28,32 +165,7 @@
                 <div class="chart-container" id="channel-chart"></div>
                 <div class="muted" style="text-align:center;margin-bottom:16px;">Channel Distribution</div>
                 
-                <div class="table-wrap">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>SSID</th>
-                                <th>MAC</th>
-                                <th>Vendor</th>
-                                <th>Sec</th>
-                                <th>Ch</th>
-                                <th>RSSI</th>
-                                <th>Seen</th>
-                            </tr>
-                        </thead>
-                        <tbody id="recon-table"></tbody>
-                    </table>
-                </div>
-            </div>
-        </section>
-
-        <section id="attacks" class="section">
-            <div class="section-title" onclick="toggleSection('attacks')">
-                <h2>WiFi Attacks</h2>
-                <span class="arrow">▼</span>
-            </div>
-            <div class="section-content">
-                <div class="warning-banner">Select a target network below</div>
+                <div class="warning-banner">Select a target network below for attacks</div>
                 
                 <div class="table-wrap">
                     <table>
@@ -63,24 +175,30 @@
                                 <th>MAC</th>
                                 <th>Vendor</th>
                                 <th>Sec</th>
+                                <th>WPS</th>
                                 <th>Ch</th>
                                 <th>RSSI</th>
                                 <th>Seen</th>
                             </tr>
                         </thead>
-                        <tbody id="attack-table"></tbody>
+                        <tbody id="wifi-table"></tbody>
                     </table>
                 </div>
                 
                 <div id="attack-options" style="display:none;">
                     <div class="network-info">
-                        <h4>Target: <span id="selected-target">--</span></h4>
+                        <h4>Target: <span id="selected-target" class="pii-ssid">--</span></h4>
                         <div class="muted">Click clients to target specific devices</div>
                     </div>
                     <div class="btn-group">
                         <button class="btn btn-primary" onclick="startDeauth()">Deauth</button>
                         <button class="btn" onclick="startHandshake()">Capture Handshake</button>
                     </div>
+                </div>
+
+                <div class="card" style="margin-top:16px;">
+                    <h4>Packet Captures</h4>
+                    <div id="handshake-list"></div>
                 </div>
             </div>
         </section>
@@ -106,118 +224,297 @@
             </div>
         </section>
 
-        <section id="captures" class="section">
-            <div class="section-title" onclick="toggleSection('captures')">
-                <h2>Packet Captures</h2>
+        <section id="history" class="section">
+            <div class="section-title" onclick="toggleSection('history')">
+                <h2>Network History</h2>
                 <span class="arrow">▼</span>
             </div>
             <div class="section-content">
-                <div id="handshake-list"></div>
+                <div class="card history-card">
+                    <h4>Activity Over Time</h4>
+                    <div class="muted history-description">Network activity charts (last 7 days)</div>
+
+                    <div class="history-charts">
+                        <div class="graph-wrapper">
+                            <canvas id="activity-chart" class="history-canvas"></canvas>
+                            <div class="graph-caption">
+                                <strong>Network Activity</strong>
+                                <span class="graph-subtitle">AP + client activity trends</span>
+                            </div>
+                            <div class="graph-overlay" data-graph="activity">Collecting data... check back soon.</div>
+                        </div>
+                        <div class="graph-wrapper">
+                            <canvas id="channel-chart-time" class="history-canvas"></canvas>
+                            <div class="graph-caption">
+                                <strong>Channel Congestion</strong>
+                                <span class="graph-subtitle">AP counts per channel over time</span>
+                            </div>
+                            <div class="graph-overlay" data-graph="channel">Collecting data... check back soon.</div>
+                        </div>
+                        <div class="graph-wrapper">
+                            <canvas id="ssid-clients-chart" class="history-canvas"></canvas>
+                            <div class="graph-caption">
+                                <strong>Clients per Network</strong>
+                                <span class="graph-subtitle">Connected devices by SSID over time</span>
+                            </div>
+                            <div class="graph-overlay" data-graph="ssid-clients">Collecting data... check back soon.</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="btn-group" style="margin-top:16px;">
+                    <button class="btn" onclick="loadHistoryCharts(30)">Last 30 Days</button>
+                    <button class="btn" onclick="loadHistoryCharts(7)">Last 7 Days</button>
+                    <button class="btn" onclick="loadHistoryCharts(3)">Last 3 Days</button>
+                    <button class="btn" onclick="loadHistoryCharts(1)">Last 24 Hours</button>
+                    <button class="btn" onclick="loadHistoryCharts(0.25)">Last 6 Hours</button>
+                    <button class="btn" onclick="loadHistoryCharts('from-start')">From Start</button>
+                </div>
             </div>
         </section>
 
-        <section id="intelligence" class="section">
-            <div class="section-title" onclick="toggleSection('intelligence')">
+        <section id="device-intelligence" class="section">
+            <div class="section-title" onclick="toggleSection('device-intelligence')">
                 <h2>Network Intelligence</h2>
                 <span class="arrow">▼</span>
             </div>
             <div class="section-content">
-                <div class="card-grid">
+                <div class="card-grid" style="margin-bottom:16px;">
                     <div class="card">
-                        <h4>Who's Home?</h4>
-                        <div class="muted" style="margin-bottom:8px;">Devices seen in the last 5 minutes</div>
+                        <h4>Presence Status</h4>
+                        <div class="muted" style="margin-bottom:8px;">Devices in the last 5 minutes</div>
                         <div style="display:flex;flex-direction:column;gap:6px;">
                             <div style="display:flex;justify-content:space-between;">
-                                <span>Here now</span>
-                                <strong id="intel-present" style="color:#4ade80;">0</strong>
+                                <span>Here Now</span>
+                                <strong id="intel-present">0</strong>
                             </div>
                             <div style="display:flex;justify-content:space-between;">
                                 <span>Away</span>
-                                <strong id="intel-away" style="color:#f87171;">0</strong>
+                                <strong id="intel-away">0</strong>
                             </div>
                             <div style="display:flex;justify-content:space-between;">
-                                <span>New today</span>
-                                <strong id="intel-new" style="color:#60a5fa;">0</strong>
+                                <span>New Today</span>
+                                <strong id="intel-new">0</strong>
                             </div>
                             <div style="display:flex;justify-content:space-between;">
-                                <span>Total tracked</span>
+                                <span>Total Tracked</span>
                                 <strong id="intel-total">0</strong>
                             </div>
                         </div>
                     </div>
                     <div class="card">
-                        <h4>Security Alerts</h4>
-                        <div class="muted" style="margin-bottom:8px;">Potential threats detected</div>
+                        <h4>Network Stats</h4>
+                        <div class="muted" style="margin-bottom:8px;">Overall network activity</div>
                         <div style="display:flex;flex-direction:column;gap:6px;">
                             <div style="display:flex;justify-content:space-between;">
-                                <span>Deauth attacks</span>
-                                <strong id="intel-deauth">0</strong>
+                                <span>APs Found</span>
+                                <strong id="intel-aps">0</strong>
                             </div>
                             <div style="display:flex;justify-content:space-between;">
-                                <span>Fake APs (evil twin)</span>
-                                <strong id="intel-rogue">0</strong>
+                                <span>Clients</span>
+                                <strong id="intel-clients">0</strong>
                             </div>
                             <div style="display:flex;justify-content:space-between;">
-                                <span>Open networks nearby</span>
-                                <strong id="intel-open">0</strong>
+                                <span>Active Channels</span>
+                                <strong id="intel-channels">0</strong>
                             </div>
                             <div style="display:flex;justify-content:space-between;">
-                                <span>Hidden networks</span>
-                                <strong id="intel-hidden">0</strong>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="card">
-                        <h4>Your Network</h4>
-                        <div class="muted" style="margin-bottom:8px;">Auto-detected home network</div>
-                        <div style="display:flex;flex-direction:column;gap:6px;">
-                            <div style="display:flex;justify-content:space-between;">
-                                <span>Home WiFi</span>
-                                <strong id="intel-home">--</strong>
-                            </div>
-                            <div style="display:flex;justify-content:space-between;">
-                                <span>Best signal</span>
-                                <span><strong id="intel-strongest">--</strong> (<span id="intel-rssi">--</span> dBm)</span>
-                            </div>
-                            <div style="display:flex;justify-content:space-between;">
-                                <span>Monitor uptime</span>
+                                <span>Monitor Uptime</span>
                                 <strong id="intel-uptime">--</strong>
                             </div>
-                            <div style="display:flex;justify-content:space-between;">
-                                <span>Total scans</span>
-                                <strong id="intel-scans">0</strong>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card" style="margin-bottom:16px;" id="bottleneck-panel">
+                    <h4>Network Bottlenecks</h4>
+                    <div class="muted" style="margin-bottom:12px;">Real-time performance bottleneck detection</div>
+                    
+                    <!-- Overall Score Display -->
+                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+                        <div style="display:flex;align-items:center;gap:12px;">
+                            <div class="bottleneck-score-circle" id="bottleneck-overall-score" data-score="0">
+                                <div class="score-value">--</div>
+                                <div class="score-label">Risk</div>
+                            </div>
+                            <div>
+                                <div class="bottleneck-severity" id="bottleneck-severity">Analyzing...</div>
+                                <div class="muted" style="font-size:11px;" id="bottleneck-summary">Loading analysis</div>
+                            </div>
+                        </div>
+                        <button class="btn btn-sm" onclick="toggleBottleneckDetails()">Details</button>
+                    </div>
+                    
+                    <!-- Bottleneck Breakdown -->
+                    <div class="bottleneck-breakdown" id="bottleneck-breakdown" style="display:none;">
+                        <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-bottom:16px;">
+                            <div class="bottleneck-metric" data-type="channel">
+                                <div class="metric-header">
+                                    <span class="metric-name">Channel</span>
+                                    <span class="metric-score" id="channel-score">--</span>
+                                </div>
+                                <div class="metric-bar">
+                                    <div class="metric-fill" id="channel-fill"></div>
+                                </div>
+                                <div class="metric-detail" id="channel-detail">--</div>
+                            </div>
+                            
+                            <div class="bottleneck-metric" data-type="capacity">
+                                <div class="metric-header">
+                                    <span class="metric-name">Capacity</span>
+                                    <span class="metric-score" id="capacity-score">--</span>
+                                </div>
+                                <div class="metric-bar">
+                                    <div class="metric-fill" id="capacity-fill"></div>
+                                </div>
+                                <div class="metric-detail" id="capacity-detail">--</div>
+                            </div>
+                            
+                            <div class="bottleneck-metric" data-type="signal">
+                                <div class="metric-header">
+                                    <span class="metric-name">Signal</span>
+                                    <span class="metric-score" id="signal-score">--</span>
+                                </div>
+                                <div class="metric-bar">
+                                    <div class="metric-fill" id="signal-fill"></div>
+                                </div>
+                                <div class="metric-detail" id="signal-detail">--</div>
+                            </div>
+                            
+                            <div class="bottleneck-metric" data-type="timing">
+                                <div class="metric-header">
+                                    <span class="metric-name">Timing</span>
+                                    <span class="metric-score" id="timing-score">--</span>
+                                </div>
+                                <div class="metric-bar">
+                                    <div class="metric-fill" id="timing-fill"></div>
+                                </div>
+                                <div class="metric-detail" id="timing-detail">--</div>
+                            </div>
+                        </div>
+                        
+                        <!-- Recommendations -->
+                        <div class="bottleneck-recommendations" id="bottleneck-recommendations">
+                            <h5 style="margin:0 0 8px 0;font-size:13px;">Recommendations</h5>
+                            <div id="recommendations-list" style="display:flex;flex-direction:column;gap:6px;">
+                                <div class="muted" style="font-size:11px;">No recommendations available</div>
                             </div>
                         </div>
                     </div>
                 </div>
                 
-                <div class="card" style="margin-top:16px;">
-                    <h4>Network Summary</h4>
+                <div class="card" style="margin-bottom:16px;">
+                    <h4>Security Overview</h4>
                     <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:16px;text-align:center;margin-top:8px;">
                         <div>
-                            <div style="font-size:24px;font-weight:bold;color:#4ade80;" id="intel-aps">0</div>
-                            <div class="muted">APs Found</div>
+                            <div style="font-size:24px;font-weight:bold;" id="intel-deauth">0</div>
+                            <div class="muted">Deauths Seen</div>
                         </div>
                         <div>
-                            <div style="font-size:24px;font-weight:bold;color:#60a5fa;" id="intel-clients">0</div>
-                            <div class="muted">Clients</div>
+                            <div style="font-size:24px;font-weight:bold;" id="intel-rogue">0</div>
+                            <div class="muted">Rogue APs</div>
                         </div>
                         <div>
-                            <div style="font-size:24px;font-weight:bold;color:#fbbf24;" id="intel-channels">0</div>
-                            <div class="muted">Active Channels</div>
+                            <div style="font-size:24px;font-weight:bold;" id="intel-open">0</div>
+                            <div class="muted">Open Networks</div>
                         </div>
                         <div>
-                            <div style="font-size:24px;font-weight:bold;color:#f87171;" id="intel-threats">0</div>
-                            <div class="muted">Threats</div>
+                            <div style="font-size:24px;font-weight:bold;" id="intel-hidden">0</div>
+                            <div class="muted">Hidden Networks</div>
                         </div>
                     </div>
                 </div>
                 
-                <div class="btn-group" style="margin-top:16px;">
-                    <button class="btn" onclick="loadIntelligence()">Refresh</button>
-                    <button class="btn" onclick="loadDevicePresence()">Show All Devices</button>
+                <div class="device-controls">
+                    <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap;">
+                        <button class="btn btn-filter" data-filter="all" onclick="filterDevices('all')">All</button>
+                        <button class="btn btn-filter" data-filter="present" onclick="filterDevices('present')">Present</button>
+                        <button class="btn btn-filter" data-filter="away" onclick="filterDevices('away')">Away</button>
+                        <button class="btn btn-filter" data-filter="new" onclick="filterDevices('new')">New</button>
+                        <select id="ap-filter" class="btn pii-ssid" onchange="filterByAP(this.value)" style="padding:8px 12px;">
+                            <option value="all">All APs</option>
+                        </select>
+                        <div style="margin-left:auto;">
+                            <select id="device-sort" class="btn" onchange="sortDevices(this.value)" style="padding:8px 12px;">
+                                <option value="last_seen">Sort by Last Seen</option>
+                                <option value="trust">Sort by Trust</option>
+                                <option value="presence">Sort by Presence</option>
+                                <option value="sightings">Sort by Sightings</option>
+                            </select>
+                        </div>
+                    </div>
                 </div>
-                <div id="device-list" style="margin-top:16px;"></div>
+                
+                <div id="device-list"></div>
+
+                <div id="show-more-container" style="text-align:center;margin-top:16px;display:none;">
+                    <button id="show-more-btn" class="btn" onclick="showMoreDevices()">Show More</button>
+                    <button id="show-less-btn" class="btn" onclick="showLessDevices()" style="display:none;">Show Less</button>
+                </div>
+
+                <div class="btn-group" style="margin-top:16px;">
+                    <button class="btn btn-primary" onclick="refreshNetworkIntelligence()">Refresh</button>
+                </div>
+            </div>
+        </section>
+
+        <section id="webhook" class="section">
+            <div class="section-title" onclick="toggleSection('webhook')">
+                <h2>Webhook Alerts</h2>
+                <span class="arrow">▼</span>
+            </div>
+            <div class="section-content">
+                <div class="card">
+                    <h4>Webhook Configuration</h4>
+                    <div class="muted" style="margin-bottom:12px;">Send device lifecycle events to a webhook URL</div>
+                    <form id="webhook-form">
+                        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:8px;">
+                            <input type="checkbox" id="webhook-enabled">
+                            <span>Enable webhook alerts</span>
+                        </label>
+                        <input type="url" id="webhook-url" class="pii-url" placeholder="https://example.com/webhook" style="margin-bottom:12px;">
+                        
+                        <div style="margin-bottom:12px;">
+                            <div class="muted" style="margin-bottom:6px;font-weight:500;">Alert Filters:</div>
+                            <div style="display:flex;flex-direction:column;gap:8px;padding:8px;background:rgba(255,255,255,0.02);border-radius:6px;border:1px solid rgba(255,255,255,0.05);">
+                                <label style="display:flex;align-items:center;gap:10px;cursor:pointer;padding:6px;border-radius:4px;transition:background 0.2s;">
+                                    <input type="checkbox" id="webhook-home-departure" style="width:16px;height:16px;">
+                                    <span style="font-size:13px;">Home device left</span>
+                                </label>
+                                <label style="display:flex;align-items:center;gap:10px;cursor:pointer;padding:6px;border-radius:4px;transition:background 0.2s;">
+                                    <input type="checkbox" id="webhook-home-arrival" style="width:16px;height:16px;">
+                                    <span style="font-size:13px;">Home device arrived</span>
+                                </label>
+                                <label style="display:flex;align-items:center;gap:10px;cursor:pointer;padding:6px;border-radius:4px;transition:background 0.2s;">
+                                    <input type="checkbox" id="webhook-new-device" style="width:16px;height:16px;">
+                                    <span style="font-size:13px;">New unknown device</span>
+                                </label>
+                                <label style="display:flex;align-items:center;gap:10px;cursor:pointer;padding:6px;border-radius:4px;transition:background 0.2s;">
+                                    <input type="checkbox" id="webhook-deauth" style="width:16px;height:16px;">
+                                    <span style="font-size:13px;">Deauth frames detected</span>
+                                </label>
+                                <label style="display:flex;align-items:center;gap:10px;cursor:pointer;padding:6px;border-radius:4px;transition:background 0.2s;">
+                                    <input type="checkbox" id="webhook-handshake" style="width:16px;height:16px;">
+                                    <span style="font-size:13px;">Handshake captured</span>
+                                </label>
+                                <label style="display:flex;align-items:center;gap:10px;cursor:pointer;padding:6px;border-radius:4px;transition:background 0.2s;">
+                                    <input type="checkbox" id="webhook-tracked-only" style="width:16px;height:16px;">
+                                    <span style="font-size:13px;">Tracked devices</span>
+                                </label>
+                                <label style="display:flex;align-items:center;gap:10px;cursor:pointer;padding:6px;border-radius:4px;transition:background 0.2s;">
+                                    <input type="checkbox" id="webhook-all-events" style="width:16px;height:16px;">
+                                    <span style="font-size:13px;">All events</span>
+                                </label>
+                            </div>
+                            <div class="muted" style="margin-top:8px;font-size:11px;">Tip: Click a device in Network Intelligence and enable "Track" to receive alerts for it.</div>
+                        </div>
+                        
+                        <div class="btn-group">
+                            <button type="submit" class="btn btn-primary">Save Settings</button>
+                            <button type="button" class="btn" onclick="testWebhook(event)">Send Test</button>
+                        </div>
+                    </form>
+                    <div id="webhook-status" class="muted" style="margin-top:12px;"></div>
+                </div>
             </div>
         </section>
 
@@ -235,7 +532,6 @@
                                 <span id="bg-scan-dot" class="status-dot"></span>
                                 <span id="bg-scan-text">Idle</span>
                             </div>
-                            <span class="muted">Records: <span id="bg-scan-count">0</span></span>
                         </div>
                         <div class="btn-group">
                             <button class="btn" onclick="triggerBgScan()">Scan Now</button>
@@ -282,7 +578,7 @@
                         <h4>Connect to Home Network</h4>
                         <div class="muted">Connect to WiFi for mDNS access (pwnpower.local)</div>
                         <form id="network-form">
-                            <input type="text" id="net-ssid" placeholder="Network SSID">
+                            <input type="text" id="net-ssid" class="pii-ssid" placeholder="Network SSID">
                             <input type="password" id="net-pass" placeholder="Password">
                             <div class="btn-group">
                                 <button type="submit" class="btn btn-primary">Connect</button>
@@ -306,10 +602,36 @@
                         </div>
                     </div>
                     <div class="card">
+                        <h4>Login Security</h4>
+                        <div class="muted" id="auth-status-text">Loading auth status…</div>
+                        <form id="auth-form" style="display:flex;flex-direction:column;gap:8px;">
+                            <input type="password" id="auth-current" placeholder="Current password (leave blank if disabled)" autocomplete="current-password">
+                            <input type="password" id="auth-new" placeholder="New password (8-64 chars, or empty to disable)" autocomplete="new-password">
+                            <div class="btn-group">
+                                <button type="submit" class="btn btn-primary">Update Login</button>
+                                <button type="button" class="btn" onclick="disableLogin()">Disable Login</button>
+                            </div>
+                        </form>
+                        <div id="auth-message" class="muted" style="margin-top:8px;"></div>
+                    </div>
+                    <div class="card">
+                        <h4>Home Networks</h4>
+                        <div class="muted" style="margin-bottom:12px;">Devices seen on these networks are automatically marked as "Home"</div>
+                        <div style="margin-bottom:8px;">
+                            <span class="muted">Connected:</span> <strong id="home-ssid-connected">-</strong>
+                        </div>
+                        <div id="extra-home-ssids" style="margin-bottom:8px;"></div>
+                        <div style="display:flex;gap:8px;">
+                            <input type="text" id="new-home-ssid" class="pii-ssid" placeholder="Add SSID..." style="flex:1;">
+                            <button class="btn btn-sm" onclick="addHomeSSID()" style="max-width:120px;">Add</button>
+                        </div>
+                        <div class="muted" style="margin-top:8px;font-size:11px;">Up to 3 additional SSIDs can be added.</div>
+                    </div>
+                    <div class="card">
                         <h4>AP Settings</h4>
                         <div class="muted">Current: <span id="current-ssid">--</span> (<span id="current-security">--</span>)</div>
                         <form id="ap-config-form">
-                            <input type="text" id="ap-ssid" placeholder="New SSID" maxlength="32">
+                            <input type="text" id="ap-ssid" class="pii-ssid" placeholder="New SSID" maxlength="32">
                             <input type="password" id="ap-pass" placeholder="Password (8+ chars or empty)">
                             <button type="submit" class="btn">Save & Apply</button>
                         </form>
@@ -355,10 +677,3 @@
                         <div class="muted">Educational purposes only</div>
                     </div>
                 </div>
-            </div>
-        </section>
-    </main>
-    
-    <script src="app.js"></script>
-</body>
-</html>

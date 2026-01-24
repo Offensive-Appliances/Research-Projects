@@ -1,6 +1,6 @@
 # PwnPower
 
-ESP32-C3 WiFi security audit tool with scanning, deauth attacks, handshake capture, and passive monitoring.
+ESP32-C3/C5 WiFi security audit tool with scanning, deauth attacks, handshake capture, and passive monitoring.
 All controlled via a modern web interface.
 
 ## Features
@@ -9,8 +9,9 @@ All controlled via a modern web interface.
 - WiFi network scanning with vendor identification
 - Station/client detection via promiscuous mode
 - Hidden SSID detection and revelation
-- Deauth frame detection and channel analysis
+- Deauth frame detection during manual and background scanning
 - Device tracking with timestamps
+- **Probe request fingerprinting** for advanced device identification
 
 ### Attacks & Capture
 - Targeted deauthentication attacks
@@ -22,25 +23,45 @@ All controlled via a modern web interface.
 - Configurable AP with WPA2/WPA3 support
 - Station mode with auto-reconnect
 - mDNS support (`pwnpower.local`)
-- NTP time sync
+- **Automatic NTP time sync** when connected to internet
 
-### Other
+### Analytics & Monitoring
 - Background scanning with flash storage
-- CSV report generation
+- CSV report generation and download
+- Network intelligence with device presence tracking and security overview
+- Network history with activity charts and analytics (7-day trends)
+- Webhook alerts for device lifecycle events (arrival/departure/new devices)
+
+### Hardware Control
 - Smart plug GPIO control
 - OTA firmware updates
-- Modern responsive web UI
 
-## Requirements 
+### Web Interface
+- Modern responsive web UI with collapsible sections
+
+## Requirements
 - ESP-IDF v5.5 or newer
-- ESP32-C3
+- ESP32-C3 or ESP32-C5
 
 ## Build and Flash
+
+### For ESP32-C3:
 ```bash
-idf.py set-target esp32c3
+copy configs\sdkconfig.esp32c3 sdkconfig
+copy configs\sdkconfig.esp32c3 sdkconfig.defaults
 idf.py build
 idf.py flash
 ```
+
+### For ESP32-C5:
+```bash
+copy configs\sdkconfig.esp32c5 sdkconfig
+copy configs\sdkconfig.esp32c5 sdkconfig.defaults
+idf.py build
+idf.py flash
+```
+
+**Note:** ESP32-C5 supports 5GHz WiFi bands in addition to 2.4GHz, but has a smaller handshake capture buffer (16KB vs 32KB on C3).
 
 If you experience issues, try `idf.py fullclean` first.
 

@@ -13,11 +13,17 @@ on:
 
 jobs:
   build:
-    name: Build ESP32-C3
+    name: Build for ${{ matrix.target.name }}
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: Pwn-Power
+
+    strategy:
+      matrix:
+        target:
+          - { name: "esp32c3", idf_target: "esp32c3", sdkconfig_file: "configs/sdkconfig.esp32c3", zip_name: "pwnpower-esp32c3.zip" }
+          - { name: "esp32c5", idf_target: "esp32c5", sdkconfig_file: "configs/sdkconfig.esp32c5", zip_name: "pwnpower-esp32c5.zip" }
 
     steps:
       - uses: actions/checkout@v4
@@ -32,9 +38,9 @@ jobs:
           path: |
             ~/esp-idf
             ~/.espressif
-          key: esp-idf-v5.5.1-${{ runner.os }}-c3
+          key: esp-idf-v5.5.1-${{ runner.os }}-${{ matrix.target.idf_target }}-${{ hashFiles('Pwn-Power/**') }}
           restore-keys: |
-            esp-idf-v5.5.1-${{ runner.os }}-
+            esp-idf-v5.5.1-${{ runner.os }}-${{ matrix.target.idf_target }}-
 
       - name: Install ESP-IDF Dependencies
         if: steps.cache-idf.outputs.cache-hit != 'true'
@@ -47,13 +53,19 @@ jobs:
         if: steps.cache-idf.outputs.cache-hit != 'true'
         working-directory: .
         run: |
+          rm -rf ~/esp-idf
           git clone -b v5.5.1 --depth 1 --recursive https://github.com/espressif/esp-idf.git ~/esp-idf
-          ~/esp-idf/install.sh esp32c3
+          ~/esp-idf/install.sh ${{ matrix.target.idf_target }}
+
+      - name: Apply Custom SDK Config
+        run: |
+          cp "${{ matrix.target.sdkconfig_file }}" sdkconfig
+          cp "${{ matrix.target.sdkconfig_file }}" sdkconfig.defaults
 
       - name: Build Project
         run: |
           . ~/esp-idf/export.sh
-          export IDF_TARGET=esp32c3
+          export IDF_TARGET=${{ matrix.target.idf_target }}
           idf.py build
 
       - name: Package Binaries
@@ -64,18 +76,18 @@ jobs:
           cp build/partition_table/partition-table.bin release/partitions.bin
           cp build/pwnpower.bin release/firmware.bin
           
-          python3 -m esptool --chip esp32c3 merge_bin \
+          python3 -m esptool --chip ${{ matrix.target.idf_target }} merge_bin \
             --output release/pwnpower-merged.bin \
             --flash_mode dio \
-            --flash_size 4MB \
+            --flash_size ${{ matrix.target.idf_target == 'esp32c5' && '8MB' || '4MB' }} \
             0x0 release/bootloader.bin \
             0x8000 release/partitions.bin \
             0x10000 release/firmware.bin
           
-          cd release && zip -j ../pwnpower-esp32c3.zip *
+          cd release && zip -j ../${{ matrix.target.zip_name }} *
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: pwnpower-esp32c3
-          path: Pwn-Power/pwnpower-esp32c3.zip
+          name: ${{ matrix.target.zip_name }}
+          path: Pwn-Power/${{ matrix.target.zip_name }}

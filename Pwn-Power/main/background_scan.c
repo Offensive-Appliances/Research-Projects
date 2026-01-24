@@ -3,15 +3,32 @@
 #include "freertos/semphr.h"
 #include "background_scan.h"
 #include "scan_storage.h"
+#include "device_lifecycle.h"
 #include "wifi_scan.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "monitor_uptime.h"
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
+
+// External variables for channel tracking
+extern uint32_t channel_scan_counts[14];
+extern uint32_t channel_discovery_counts[14];
+extern void update_channel_activity(uint8_t channel, uint32_t devices_found, int8_t *rssi_values, uint32_t rssi_count);
+
+extern bool pwnpower_time_is_synced(void);
+extern uint32_t scan_storage_get_history_base_epoch(void);
+extern void scan_storage_set_history_base_epoch(uint32_t epoch);
+
+extern uint32_t wifi_scan_get_deauth_count(void);
+extern void wifi_scan_increment_deauth_count(void);
+extern uint32_t webserver_get_last_request_time(void);
 
 #define TAG "BgScan"
-#define BG_SCAN_TASK_STACK 8192
+#define CLIENT_ACTIVITY_DEFER_SEC 8
+#define BG_SCAN_TASK_STACK 6144  // Reduced from 8192 to save memory
 #define BG_SCAN_TASK_PRIO 5
 
 static bg_scan_state_t scan_state = BG_SCAN_IDLE;
@@ -33,6 +50,18 @@ static uint32_t get_uptime_sec(void) {
     return (uint32_t)(esp_timer_get_time() / 1000000ULL);
 }
 
+static uint32_t hash_ssid(const uint8_t *ssid, size_t len) {
+    uint32_t hash = 5381;
+    for (size_t i = 0; i < len && ssid[i] != 0; i++) {
+        hash = ((hash << 5) + hash) + ssid[i];
+    }
+    return hash;
+}
+
+uint32_t get_background_channel_dwell_time(uint8_t channel) {
+    return get_channel_dwell_time(channel, true);
+}
+
 typedef struct {
     uint8_t bssid[6];
     uint8_t mac[6];
@@ -51,8 +80,19 @@ static void promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     
     uint8_t *frame = pkt->payload;
     uint8_t frame_ctrl = frame[0];
-    uint8_t to_ds = (frame[1] >> 0) & 1;
-    uint8_t from_ds = (frame[1] >> 1) & 1;
+    uint8_t fc1 = frame[1];
+    uint8_t frame_type = (frame_ctrl >> 2) & 0x03;
+    uint8_t frame_subtype = (frame_ctrl >> 4) & 0x0F;
+    
+    // Check for deauthentication frames (same logic as stations_sniffer)
+    if (frame_type == 0 && (frame_subtype == 0x0C || frame_subtype == 0x0A)) {
+        wifi_scan_increment_deauth_count();
+        ESP_LOGI(TAG, "Deauth frame detected during background scan, total: %lu", (unsigned long)wifi_scan_get_deauth_count());
+        return; // Don't process as regular station data
+    }
+    
+    uint8_t to_ds = (fc1 >> 0) & 1;
+    uint8_t from_ds = (fc1 >> 1) & 1;
     
     uint8_t *bssid = NULL;
     uint8_t *sta_mac = NULL;
@@ -97,26 +137,57 @@ static void populate_scan_record(scan_record_t *record) {
         .channel = 0,
         .show_hidden = true,
         .scan_type = WIFI_SCAN_TYPE_ACTIVE,
-        .scan_time.active.min = 100,
-        .scan_time.active.max = 300
+        .scan_time.active.min = 120,
+        .scan_time.active.max = 400
     };
 
     uint8_t ap_idx = 0;
     
     for (uint8_t ch = 1; ch <= 13 && ap_idx < MAX_APS_PER_SCAN; ch++) {
+        // Get smart dwell time for this channel
+        uint32_t dwell_time = get_background_channel_dwell_time(ch);
+        
+        // Track that we're scanning this channel
+        channel_scan_counts[ch]++;
+        
         scan_cfg.channel = ch;
+        scan_cfg.scan_time.active.min = dwell_time / 2;
+        scan_cfg.scan_time.active.max = dwell_time;
         
         if (esp_wifi_scan_start(&scan_cfg, true) != ESP_OK) continue;
         
         uint16_t ap_count = 0;
         esp_wifi_scan_get_ap_num(&ap_count);
         
-        if (ap_count == 0) continue;
+        if (ap_count == 0) {
+            // Update channel activity with zero results
+            update_channel_activity(ch, 0, NULL, 0);
+            continue;
+        }
         
         wifi_ap_record_t *ap_list = malloc(sizeof(wifi_ap_record_t) * ap_count);
-        if (!ap_list) continue;
+        if (!ap_list) {
+            // Update channel activity with count but no RSSI data
+            update_channel_activity(ch, ap_count, NULL, 0);
+            continue;
+        }
         
         if (esp_wifi_scan_get_ap_records(&ap_count, ap_list) == ESP_OK) {
+            // Collect RSSI values for filtering
+            int8_t *rssi_values = malloc(sizeof(int8_t) * ap_count);
+            if (rssi_values) {
+                for (uint16_t i = 0; i < ap_count; i++) {
+                    rssi_values[i] = ap_list[i].rssi;
+                }
+            }
+            
+            // Update channel activity with RSSI filtering
+            update_channel_activity(ch, ap_count, rssi_values, ap_count);
+            
+            if (rssi_values) {
+                free(rssi_values);
+            }
+            
             for (uint16_t i = 0; i < ap_count && ap_idx < MAX_APS_PER_SCAN; i++) {
                 bool exists = false;
                 for (uint8_t j = 0; j < ap_idx; j++) {
@@ -183,12 +254,15 @@ static void populate_scan_record(scan_record_t *record) {
     
     if (original_mode == WIFI_MODE_APSTA || original_mode == WIFI_MODE_AP) {
         ESP_LOGI(TAG, "Temporarily switching to STA mode for channel hopping");
+        ESP_LOGI(TAG, "Deauthenticating all AP clients...");
         esp_wifi_deauth_sta(0);
         vTaskDelay(pdMS_TO_TICKS(200));
     }
-    
+
+    ESP_LOGI(TAG, "Setting WiFi mode to STA (AP will be destroyed temporarily)");
     esp_wifi_set_mode(WIFI_MODE_STA);
     vTaskDelay(pdMS_TO_TICKS(300));
+    ESP_LOGI(TAG, "Now in STA-only mode for promiscuous scanning");
     
     wifi_promiscuous_filter_t filt = {
         .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA
@@ -199,18 +273,19 @@ static void populate_scan_record(scan_record_t *record) {
     
     for (uint8_t ch = 1; ch <= 13; ch++) {
         esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
-        vTaskDelay(pdMS_TO_TICKS(200));
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
     
     esp_wifi_set_promiscuous(false);
     esp_wifi_set_promiscuous_rx_cb(NULL);
     
     if (original_mode != WIFI_MODE_STA) {
-        ESP_LOGI(TAG, "Restoring original WiFi mode");
+        ESP_LOGI(TAG, "Restoring original WiFi mode (AP will restart)");
         esp_wifi_set_mode(original_mode);
         vTaskDelay(pdMS_TO_TICKS(500));
+        ESP_LOGI(TAG, "WiFi mode restored, AP should be available again");
     }
-    
+
     if (was_sta_connected) {
         ESP_LOGI(TAG, "Reconnecting STA");
         esp_wifi_connect();
@@ -239,17 +314,37 @@ static void populate_scan_record(scan_record_t *record) {
         }
     }
     
-    // Run analytics after each scan
+    // check for device departures
+    device_lifecycle_check_departures();
+    
+    // run analytics after each scan
     scan_storage_detect_rogue_aps();
 
     record->header.scan_duration_sec = get_uptime_sec() - start_time;
+    
+    // add epoch timestamp if time is synced
+    if (pwnpower_time_is_synced()) {
+        time_t now;
+        time(&now);
+        record->header.epoch_ts = (uint32_t)now;
+        record->header.time_valid = 1;
+    } else {
+        record->header.epoch_ts = 0;
+        record->header.time_valid = 0;
+    }
 }
 
 static void background_scan_task(void *arg) {
     ESP_LOGI(TAG, "Background scan task started");
-    
+    ESP_LOGI(TAG, "Initial free heap: %lu bytes", (unsigned long)esp_get_free_heap_size());
+
     while (task_running) {
         scan_state = BG_SCAN_WAITING;
+
+        // Periodic heap monitoring while waiting
+        ESP_LOGI(TAG, "Free heap (waiting): %lu bytes, Min ever: %lu bytes",
+                 (unsigned long)esp_get_free_heap_size(),
+                 (unsigned long)esp_get_minimum_free_heap_size());
         
         uint32_t remaining_ms = config.interval_sec * 1000;
         const uint32_t check_interval_ms = 1000;
@@ -267,28 +362,162 @@ static void background_scan_task(void *arg) {
         
         if (!config.auto_scan && !was_triggered) continue;
         
-        scan_state = BG_SCAN_RUNNING;
-        ESP_LOGI(TAG, "Starting background scan");
-        
-        scan_record_t *record = malloc(sizeof(scan_record_t));
-        if (!record) {
-            ESP_LOGE(TAG, "Failed to allocate scan record");
+        uint32_t now = get_uptime_sec();
+        uint32_t last_req = webserver_get_last_request_time();
+        if (!was_triggered && last_req > 0 && (now - last_req) < CLIENT_ACTIVITY_DEFER_SEC) {
+            ESP_LOGI(TAG, "Deferring scan - recent client activity (%lus ago)", (unsigned long)(now - last_req));
             continue;
         }
         
+        scan_state = BG_SCAN_RUNNING;
+        ESP_LOGI(TAG, "=== BACKGROUND SCAN START ===");
+        ESP_LOGI(TAG, "Free heap before scan: %lu bytes", (unsigned long)esp_get_free_heap_size());
+
+        // Use shared buffer instead of malloc
+        scan_record_t *record = &shared_scan_buffer;
+
         populate_scan_record(record);
         
+        history_sample_t sample;
+        memset(&sample, 0, sizeof(sample));
+        
+        uint32_t base_epoch = scan_storage_get_history_base_epoch();
+
+        // Reset base epoch if time just synced or if delta would overflow
+        if (record->header.time_valid && record->header.epoch_ts > 0) {
+            if (base_epoch == 0) {
+                // First time sync - set initial base
+                base_epoch = record->header.epoch_ts;
+                scan_storage_set_history_base_epoch(base_epoch);
+                ESP_LOGI(TAG, "history base epoch initialized: %lu", (unsigned long)base_epoch);
+            } else {
+                uint32_t delta = record->header.epoch_ts - base_epoch;
+                // Reset base epoch if delta exceeds 16-bit limit (65535 sec = ~18 hours)
+                // Use threshold of 60000 seconds (~16.6 hours) to prevent overflow
+                if (delta > 60000) {
+                    base_epoch = record->header.epoch_ts;
+                    scan_storage_set_history_base_epoch(base_epoch);
+                    ESP_LOGW(TAG, "history base epoch reset due to overflow: %lu (delta was %lu)",
+                             (unsigned long)base_epoch, (unsigned long)delta);
+                }
+            }
+        }
+
+        bool save_history = (record->header.time_valid && base_epoch > 0 && record->header.epoch_ts >= base_epoch);
+        if (save_history) {
+            uint32_t delta = record->header.epoch_ts - base_epoch;
+            sample.timestamp_delta_sec = (delta > 65535) ? 65535 : delta;
+            sample.flags = HISTORY_FLAG_TIME_VALID;
+        }
+        sample.ap_count = record->header.ap_count;
+        sample.client_count = record->header.total_stations > 255 ? 255 : record->header.total_stations;
+        if (sample.client_count >= 250) {
+            ESP_LOGW(TAG, "history sample client_count=%u looks corrupt; treating as 0", sample.client_count);
+            sample.client_count = 0;
+        }
+        
+        for (uint8_t i = 0; i < record->header.ap_count; i++) {
+            uint8_t ch = record->aps[i].channel;
+            if (ch >= 1 && ch <= 13) {
+                sample.channel_counts[ch - 1]++;
+            }
+        }
+        
+        typedef struct {
+            uint32_t hash;
+            uint8_t count;
+        } ssid_temp_t;
+        ssid_temp_t ssid_temps[MAX_APS_PER_SCAN];
+        uint8_t temp_count = 0;
+        
+        for (uint8_t i = 0; i < record->header.ap_count && temp_count < MAX_APS_PER_SCAN; i++) {
+            if (record->aps[i].station_count > 0) {
+                // Clamp individual AP client counts to prevent overflow
+                uint8_t client_count = record->aps[i].station_count > 50 ? 50 : record->aps[i].station_count;
+                ssid_temps[temp_count].hash = hash_ssid(record->aps[i].ssid, 33);
+                ssid_temps[temp_count].count = client_count;
+                temp_count++;
+            }
+        }
+        
+        // Deduplicate SSIDs by hash and sum client counts
+        for (uint8_t i = 0; i < temp_count; i++) {
+            for (uint8_t j = i + 1; j < temp_count; j++) {
+                if (ssid_temps[i].hash == ssid_temps[j].hash) {
+                    // Sum client counts for duplicate SSIDs
+                    ssid_temps[i].count += ssid_temps[j].count;
+                    // Clamp to reasonable maximum to prevent overflow
+                    if (ssid_temps[i].count > 50) {
+                        ssid_temps[i].count = 50;
+                    }
+                    // Remove duplicate entry
+                    ssid_temps[j] = ssid_temps[--temp_count];
+                    j--;
+                }
+            }
+        }
+        
+        // Sort by total client count (descending)
+        for (uint8_t i = 0; i < temp_count - 1; i++) {
+            for (uint8_t j = i + 1; j < temp_count; j++) {
+                if (ssid_temps[j].count > ssid_temps[i].count) {
+                    ssid_temp_t tmp = ssid_temps[i];
+                    ssid_temps[i] = ssid_temps[j];
+                    ssid_temps[j] = tmp;
+                }
+            }
+        }
+        
+        uint8_t ssid_count = temp_count > MAX_SSID_CLIENTS_PER_SAMPLE ? MAX_SSID_CLIENTS_PER_SAMPLE : temp_count;
+        HISTORY_SET_SSID_COUNT(sample.flags, ssid_count);
+        for (uint8_t i = 0; i < ssid_count; i++) {
+            sample.ssid_clients[i].ssid_hash = ssid_temps[i].hash;
+            sample.ssid_clients[i].client_count = ssid_temps[i].count;
+        }
+        
+        ESP_LOGI(TAG, "Free heap before storage save: %lu bytes", (unsigned long)esp_get_free_heap_size());
+
         esp_err_t err = scan_storage_save(record);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Failed to save scan: %s", esp_err_to_name(err));
         } else {
-            ESP_LOGI(TAG, "Scan complete: %u APs, %u stations", 
+            ESP_LOGI(TAG, "Background scan saved successfully (%u APs, %u stations)", 
                      record->header.ap_count, record->header.total_stations);
+            
+            // Only update UI cache if save was successful
+            wifi_scan_update_ui_cache_from_record(record);
+        }
+
+        ESP_LOGI(TAG, "Free heap after storage save: %lu bytes", (unsigned long)esp_get_free_heap_size());
+        
+        if (save_history) {
+            err = scan_storage_append_history_sample(&sample);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to save history sample: %s", esp_err_to_name(err));
+            }
+        } else {
+            ESP_LOGD(TAG, "skipping history sample: time not synced");
         }
         
-        free(record);
+        // flush tracked devices to nvs after each scan
+        scan_storage_flush_devices();
         
+        // Sync deauth detection results to intelligence system
+        scan_storage_update_security_events(wifi_scan_get_deauth_count());
+        
+        // Send batched deauth webhook alert if frames were detected
+        if (wifi_scan_get_deauth_count() > 0) {
+            device_lifecycle_generate_batched_deauth_alert(wifi_scan_get_deauth_count(), record->header.scan_duration_sec);
+            // Reset count after sending alert to prevent duplicate notifications
+            wifi_scan_reset_deauth_count();
+        }
+
         last_scan_time = get_uptime_sec();
+
+        ESP_LOGI(TAG, "Free heap at scan end: %lu bytes, Min ever: %lu bytes",
+                 (unsigned long)esp_get_free_heap_size(),
+                 (unsigned long)esp_get_minimum_free_heap_size());
+        ESP_LOGI(TAG, "=== BACKGROUND SCAN END ===");
     }
     
     scan_state = BG_SCAN_IDLE;

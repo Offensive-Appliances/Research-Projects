@@ -30,4 +30,7 @@ bg_scan_state_t background_scan_get_state(void);
 uint32_t background_scan_get_last_time(void);
 const bg_scan_config_t* background_scan_get_config(void);
 
+// Smart channel weighting support
+uint32_t get_background_channel_dwell_time(uint8_t channel);
+
 #endif

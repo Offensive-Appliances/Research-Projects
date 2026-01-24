@@ -1,33 +1,43 @@
 idf_component_register(
-    SRCS 
-        "pwnpower.c" 
-        "web_server.c" 
-        "wifi_scan.c" 
-        "web_content.c"
+    SRCS
+        "pwnpower.c"
+        "web_server.c"
+        "wifi_scan.c"
         "deauth.c"
         "handshake.c"
         "ota.c"
         "scan_storage.c"
+        "flash_manager.c"
         "background_scan.c"
         "ap_config.c"
         "mdns_service.c"
         "sta_config.c"
         "idle_scanner.c"
+        "device_db.c"
+        "device_lifecycle.c"
+        "webhook.c"
         "ouis.c"
-    INCLUDE_DIRS 
+        "monitor_uptime.c"
+        "json_utils.c"
+        "tls_cert.c"
+    INCLUDE_DIRS
         "."
     EMBED_FILES
+        "web_content.gz.h"
+        "login_content.gz.h"
         "ouis.json"
-    REQUIRES 
-        mdns 
-        esp_wifi 
-        esp_http_server 
+    REQUIRES
+        mdns
+        esp_wifi
+        esp_http_server
+        esp_https_server
         esp_http_client
-        nvs_flash 
-        app_update 
+        nvs_flash
+        app_update
         spi_flash
         esp_partition
         json
         esp_timer
         esp_driver_gpio
+        mbedtls
 )

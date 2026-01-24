@@ -12,7 +12,7 @@
 #include <string.h>
 
 #define TAG "IdleScanner"
-#define IDLE_TASK_STACK 8192
+#define IDLE_TASK_STACK 4096  // Reduced from 8192 to save memory
 #define CHECK_INTERVAL_MS 5000
 
 static TaskHandle_t idle_task_handle = NULL;
@@ -143,26 +143,13 @@ static bool find_vulnerable_network(uint8_t *bssid, int *channel) {
 }
 
 static void perform_deep_scan(void) {
-    ESP_LOGI(TAG, "Starting deep scan...");
-    scan_state = IDLE_SCAN_DEEP_SCAN;
+    // Deep scan updates the timestamp
+    // the background scanner updates the ui cache automatically
+    // idle scanner focuses on handshake capture only
     
-    wifi_scan();
-    
-    while (!wifi_scan_is_complete() && task_running) {
-        if (!idle_scanner_is_device_idle()) {
-            ESP_LOGI(TAG, "User active during scan");
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
-    
-    wifi_scan_stations();
-    
-    background_scan_trigger();
-    
+    ESP_LOGI(TAG, "Idle scan checkpoint - background scanner handles ui updates");
     last_deep_scan = get_uptime_sec();
     scan_state = IDLE_SCAN_WAITING;
-    ESP_LOGI(TAG, "Deep scan complete - UI tables updated");
 }
 
 static void attempt_auto_handshake(void) {
@@ -186,7 +173,7 @@ static void attempt_auto_handshake(void) {
     scan_state = IDLE_SCAN_HANDSHAKE;
     
     int eapol_count = 0;
-    start_handshake_capture(bssid, channel, config.handshake_duration_sec, NULL, 0, &eapol_count);
+    start_handshake_capture_preserve(bssid, channel, config.handshake_duration_sec, NULL, 0, &eapol_count, true);
     
     if (eapol_count > 0) {
         handshake_record_auto_capture(bssid, channel, eapol_count);
