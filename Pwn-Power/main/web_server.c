@@ -2501,20 +2501,20 @@ static httpd_handle_t start_https_server(void) {
     conf.servercert_len = strlen(s_tls_bundle.cert_pem) + 1;
     conf.prvtkey_pem = (const uint8_t *)s_tls_bundle.key_pem;
     conf.prvtkey_len = strlen(s_tls_bundle.key_pem) + 1;
-    conf.httpd.max_uri_handlers = 48;
+    conf.httpd.max_uri_handlers = 55;
 #ifdef CONFIG_IDF_TARGET_ESP32C5
     conf.httpd.max_open_sockets = 2;
     conf.httpd.backlog_conn = 1;
     conf.httpd.stack_size = 5120;
 #else
-    conf.httpd.max_open_sockets = 3;
-    conf.httpd.backlog_conn = 2;
+    conf.httpd.max_open_sockets = 2;
+    conf.httpd.backlog_conn = 1;
     conf.httpd.stack_size = 6144;
 #endif
     conf.httpd.lru_purge_enable = true;
     conf.httpd.send_wait_timeout = 5;
     conf.httpd.recv_wait_timeout = 5;
-    conf.httpd.keep_alive_enable = true;
+    conf.httpd.keep_alive_enable = false;
     conf.httpd.keep_alive_idle = 5;
     conf.httpd.keep_alive_interval = 2;
     conf.httpd.keep_alive_count = 3;

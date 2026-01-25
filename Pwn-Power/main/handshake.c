@@ -19,6 +19,8 @@ static wifi_promiscuous_cb_t s_prev_cb = NULL;
 
 #if CONFIG_IDF_TARGET_ESP32C5
 #define HS_PCAP_MAX_BYTES (16*1024)
+#elif CONFIG_IDF_TARGET_ESP32C3
+#define HS_PCAP_MAX_BYTES (16*1024)
 #else
 #define HS_PCAP_MAX_BYTES (32*1024)
 #endif
