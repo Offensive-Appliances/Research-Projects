@@ -22,7 +22,10 @@
 #include "scan_storage.h"
 #include "esp_sntp.h"
 #include "esp_timer.h"
+#include "esp_system.h"
+#include "esp_sleep.h"
 #include "monitor_uptime.h"
+#include "recovery.h"
 #include <time.h>
 #include "lwip/ip4_addr.h"
 
@@ -287,17 +290,17 @@ static void heap_monitor_task(void *arg) {
         if (free_heap < 20000) {
             ESP_LOGW(TAG, "WARNING: Low heap detected! Free: %lu bytes", (unsigned long)free_heap);
         }
-        
+
         // Periodic cleanup every 5 minutes (10 cycles)
         static int cleanup_counter = 0;
         if (++cleanup_counter >= 10) {
             cleanup_counter = 0;
             ESP_LOGI(TAG, "Performing periodic memory cleanup...");
-            
+
             // Clean up WiFi scan memory
             extern void wifi_scan_cleanup_station_json(void);
             wifi_scan_cleanup_station_json();
-            
+
             // Force garbage collection
             void *temp = malloc(1024);
             if (temp) {
@@ -318,7 +321,11 @@ void app_main() {
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
-    ESP_LOGI(TAG, "Heap after NVS init: %lu bytes", (unsigned long)esp_get_free_heap_size());
+
+    ESP_ERROR_CHECK(recovery_init());
+
+    // Track rapid power cycles using NVS counter to allow factory reset
+    recovery_handle_power_cycle_reset();
 
     // initialize monitor uptime tracking (early to capture boot time)
     monitor_uptime_init();

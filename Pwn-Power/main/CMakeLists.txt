@@ -20,6 +20,7 @@ idf_component_register(
         "monitor_uptime.c"
         "json_utils.c"
         "tls_cert.c"
+        "recovery.c"
     INCLUDE_DIRS
         "."
     EMBED_FILES
