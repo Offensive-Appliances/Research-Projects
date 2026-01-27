@@ -188,7 +188,8 @@ function initApp() {
         loadHistoryCharts(7),
         loadWebhookConfig(),
         loadBottleneckAnalysis(),
-        loadAuthStatus()
+        loadAuthStatus(),
+        loadPeerDevices()  // Load peer devices for device switcher
     ]).catch(() => {
         // errors already logged per fetchJSON; keep page load resilient
     });
@@ -207,6 +208,7 @@ function initApp() {
     addTrackedInterval(updateBgScanStatus, 5000);
     addTrackedInterval(refreshNetworkIntelligence, 15000); // Reduced from 60s to 15s for better responsiveness
     addTrackedInterval(loadBottleneckAnalysis, 30000); // Update bottleneck analysis every 30 seconds
+    addTrackedInterval(loadPeerDevices, 30000);  // Refresh peer devices every 30 seconds
     if (!agoTicker) agoTicker = addTrackedInterval(updateAgoTick, 1000);
 
     const apForm = $('#ap-config-form');
@@ -278,7 +280,7 @@ async function checkAuthAndStart() {
     if (status) {
         authPasswordEnabled = !!status.has_password;
     }
-    
+
     showAppShell();
     if (!appInitialized) {
         initApp();
@@ -404,7 +406,7 @@ function showToast(msg) {
 function showWarningPopup(msg) {
     const overlay = document.createElement('div');
     overlay.className = 'popup-overlay';
-    
+
     const popup = document.createElement('div');
     popup.className = 'popup';
     popup.innerHTML = `
@@ -414,7 +416,7 @@ function showWarningPopup(msg) {
             <button class="btn" onclick="this.closest('.popup-overlay').remove()">OK</button>
         </div>
     `;
-    
+
     overlay.appendChild(popup);
     document.body.appendChild(overlay);
 }
@@ -445,7 +447,7 @@ async function loadScanData(preventNewScan = false) {
     }
     if (data && data.rows) {
         scanData = data.rows;
-        
+
         data.rows.forEach(ap => {
             const existing = accumulatedNetworks.get(ap.MAC);
             if (existing) {
@@ -453,7 +455,7 @@ async function loadScanData(preventNewScan = false) {
                 existing.last_seen = ap.last_seen;
                 existing.Channel = ap.Channel;
                 existing.Security = ap.Security;
-                
+
                 if (!existing.stations) existing.stations = [];
                 const clientMap = new Map(existing.stations.map(s => [s.mac, s]));
                 if (ap.stations && ap.stations.length > 0) {
@@ -469,7 +471,7 @@ async function loadScanData(preventNewScan = false) {
                 });
             }
         });
-        
+
         renderNetworkTable('wifi-table', true, status);
         renderChannelChart();
         updateStats(data.timestamp, status);
@@ -495,10 +497,10 @@ function computeLastSeenRelative(status, lastSeenEpoch) {
     if (lastSeenEpoch > epochNow) return 'Unknown';
 
     const ageSec = Math.floor(epochNow - lastSeenEpoch);
-    
+
     // If the age is very large (years), likely timestamp issue
     if (ageSec > 31536000) return 'Unknown';
-    
+
     return formatUptime(ageSec);
 }
 
@@ -507,9 +509,9 @@ function renderNetworkTable(tableId, selectable, status) {
     if (!tbody) return;
     tbody.innerHTML = '';
     const nowMs = Date.now();
-    
+
     const dataToRender = Array.from(accumulatedNetworks.values());
-    
+
     dataToRender.forEach(ap => {
         const row = document.createElement('tr');
         row.dataset.mac = ap.MAC;
@@ -517,7 +519,7 @@ function renderNetworkTable(tableId, selectable, status) {
         const lastSeenText = computeLastSeenRelative(status, ap.last_seen);
         const clientCount = (ap.stations && ap.stations.length > 0) ? ap.stations.length : 0;
         const expandIcon = clientCount > 0 ? '<span class="expand-icon" style="vertical-align: middle; margin-right: 4px;"></span>' : '';
-        
+
         row.innerHTML = `
             <td>${expandIcon}<span style="vertical-align: middle; ${expandIcon ? 'margin-left: 4px;' : ''}">${pii(ap.SSID || '(Hidden)', 'ssid')}</span></td>
             <td><code>${pii(ap.MAC, 'mac')}</code></td>
@@ -528,7 +530,7 @@ function renderNetworkTable(tableId, selectable, status) {
             <td>${ap.RSSI || '--'}</td>
             <td class="muted">${lastSeenText}</td>
         `;
-        
+
         // Add expand/collapse for APs with clients
         if (clientCount > 0) {
             row.classList.add('has-clients');
@@ -542,19 +544,19 @@ function renderNetworkTable(tableId, selectable, status) {
                     cr.style.display = isExpanded ? '' : 'none';
                 });
             };
-            
+
             if (expandIcon) {
                 expandIcon.style.cursor = 'pointer';
                 expandIcon.onclick = toggleClients;
             }
         }
-        
+
         if (selectable) {
             row.onclick = () => selectAP(row, ap);
         }
-        
+
         tbody.appendChild(row);
-        
+
         if (ap.stations && ap.stations.length > 0) {
             ap.stations.forEach(sta => {
                 const clientRow = document.createElement('tr');
@@ -563,14 +565,14 @@ function renderNetworkTable(tableId, selectable, status) {
                 clientRow.dataset.staMac = sta.mac;
                 clientRow.style.display = 'none'; // Hidden by default
                 const staLastSeenText = computeLastSeenRelative(status, sta.last_seen);
-                
+
                 // Build grouped MACs display if available
                 let macDisplay = pii(sta.mac, 'mac');
                 if (sta.grouped_macs && sta.grouped_macs.length > 0) {
                     const groupedList = sta.grouped_macs.map(m => pii(m, 'mac')).join(', ');
                     macDisplay += ` <span class="muted" style="font-size:0.85em">(+${sta.grouped_count - 1} more: ${groupedList})</span>`;
                 }
-                
+
                 clientRow.innerHTML = `
                     <td>↳ Client</td>
                     <td><code>${macDisplay}</code></td>
@@ -596,7 +598,7 @@ function renderNetworkTable(tableId, selectable, status) {
 function selectAP(row, ap) {
     const wasSelected = row.classList.contains('selected');
     $$('#wifi-table tr.selected').forEach(r => r.classList.remove('selected'));
-    
+
     if (wasSelected) {
         selectedAP = null;
         selectedClients = {};
@@ -619,7 +621,7 @@ function selectClient(row, apMac, staMac) {
     } else {
         selectedClients[apMac].push(staMac);
     }
-    
+
     const hasSelectedClients = Object.values(selectedClients).some(arr => arr.length > 0);
     if (hasSelectedClients && !selectedAP) {
         $('#attack-options').style.display = 'block';
@@ -632,7 +634,7 @@ function selectClient(row, apMac, staMac) {
 function renderChannelChart() {
     const container = $('#channel-chart');
     if (!container) return;
-    
+
     const channels = {};
     const dataSource = Array.from(accumulatedNetworks.values());
 
@@ -823,7 +825,7 @@ async function triggerScan() {
 async function startDeauth() {
     if (isBlockedAction('Deauth attack')) return;
     if (!selectedAP) return showToast('Select a target first');
-    
+
     const targets = selectedClients[selectedAP.MAC] || [];
     const body = {
         mac: selectedAP.MAC,
@@ -831,7 +833,7 @@ async function startDeauth() {
         state: 'started',
         sta: targets
     };
-    
+
     showToast('Deauth started...');
     await fetchJSON('/attack', {
         method: 'POST',
@@ -843,7 +845,7 @@ async function startDeauth() {
 async function startHandshake() {
     if (isBlockedAction('Handshake capture')) return;
     if (!selectedAP) return showToast('Select a target first');
-    
+
     const targets = selectedClients[selectedAP.MAC] || [];
     const body = {
         mac: selectedAP.MAC,
@@ -851,7 +853,7 @@ async function startHandshake() {
         duration: 30,
         sta: targets
     };
-    
+
     showToast('Capturing handshake...');
     await fetchJSON('/handshake', {
         method: 'POST',
@@ -863,11 +865,11 @@ async function startHandshake() {
 async function updateBgScanStatus() {
     const data = await fetchJSON('/scan/status');
     if (!data) return;
-    
+
     const dot = $('#bg-scan-dot');
     const text = $('#bg-scan-text');
     const count = $('#bg-scan-count');
-    
+
     if (dot && text) {
         if (data.state === 'running') {
             dot.className = 'status-dot warning';
@@ -896,19 +898,19 @@ async function triggerBgScan() {
 async function loadScanSettings() {
     const data = await fetchJSON('/scan/settings');
     if (!data) return;
-    
+
     const bgEnabled = $('#bg-enabled');
     const bgInterval = $('#bg-interval');
     const autoHs = $('#auto-handshake');
     const idleThresh = $('#idle-threshold');
     const hsDur = $('#hs-duration');
-    
+
     if (bgEnabled) bgEnabled.checked = data.bg_enabled;
     if (bgInterval) bgInterval.value = Math.round(data.bg_interval / 60);
     if (autoHs) autoHs.checked = data.auto_handshake;
     if (idleThresh) idleThresh.value = data.idle_threshold;
     if (hsDur) hsDur.value = data.handshake_duration;
-    
+
     // Store scan interval globally for gap detection
     window.currentScanInterval = Math.round(data.bg_interval / 60);
 }
@@ -919,7 +921,7 @@ async function saveScanSettings() {
     const autoHs = $('#auto-handshake')?.checked ?? true;
     const idleThresh = parseInt($('#idle-threshold')?.value || 60);
     const hsDur = parseInt($('#hs-duration')?.value || 30);
-    
+
     await fetchJSON('/scan/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -932,7 +934,7 @@ async function saveScanSettings() {
         })
     });
     showToast('Settings saved');
-    
+
     // Update global scan interval for gap detection
     window.currentScanInterval = Math.round(bgInterval / 60);
 }
@@ -941,7 +943,7 @@ async function saveScanSettings() {
 async function loadApConfig() {
     const data = await fetchJSON('/ap/config');
     if (!data) return;
-    
+
     const ssidEl = $('#current-ssid');
     if (ssidEl) {
         ssidEl.innerHTML = pii(data.ssid || '--', 'ssid');
@@ -954,16 +956,16 @@ async function saveApConfig(e) {
     e.preventDefault();
     const ssid = $('#ap-ssid').value;
     const pass = $('#ap-pass').value;
-    
+
     if (!ssid) return showToast('Enter SSID');
     if (pass && pass.length < 8) return showToast('Password must be 8+ chars');
-    
+
     const res = await fetchJSON('/ap/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ssid, password: pass })
     });
-    
+
     if (res && res.status === 'ok') {
         showToast('Settings saved. Reconnect to new AP.');
         loadApConfig();
@@ -979,7 +981,7 @@ async function loadNetworkStatus() {
     const info = $('#net-info');
     const autoToggle = $('#auto-connect-toggle');
     const apToggle = $('#ap-while-connected-toggle');
-    
+
     if (data && data.status === 'connected') {
         if (dot) dot.className = 'status-dot online';
         if (text) text.textContent = 'Connected';
@@ -995,7 +997,7 @@ async function loadNetworkStatus() {
             }
         }
     }
-    
+
     if (autoToggle) autoToggle.checked = data ? data.auto_connect : true;
     if (apToggle) apToggle.checked = data ? data.ap_while_connected : true;
 }
@@ -1031,16 +1033,16 @@ async function connectToNetwork(e) {
     e.preventDefault();
     const ssid = $('#net-ssid').value;
     const pass = $('#net-pass').value;
-    
+
     if (!ssid) return showToast('Enter SSID');
-    
+
     showToast('Connecting...');
     const res = await fetchJSON('/wifi/connect', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ssid, password: pass })
     });
-    
+
     if (res) {
         if (res.status === 'ok') {
             showToast('Connected! Credentials saved for auto-reconnect on boot.');
@@ -1081,7 +1083,7 @@ function updateAgoTick() {
 async function loadHandshakes() {
     const container = $('#handshake-list');
     if (!container) return;
-    
+
     try {
         const [arrRaw, statusRes] = await Promise.all([
             fetchJSON('/captures'),
@@ -1095,7 +1097,7 @@ async function loadHandshakes() {
         }
 
         const uptime = statusRes?.uptime || 0;
-        
+
         const nowMs = Date.now();
         container.innerHTML = arr.map(h => {
             const ago = Math.max(0, uptime - h.timestamp);
@@ -1123,7 +1125,7 @@ async function controlGpio(value) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ pin: 4, value })
     });
-    
+
     if (res) {
         const dot = $('#gpio-dot');
         const text = $('#gpio-text');
@@ -1196,17 +1198,17 @@ async function loadDeviceIntelligence() {
             fetchJSON('/devices/list'),
             getScanReport()
         ]);
-        
+
         if (!intelligence || !presence || !deviceList) {
             showToast('failed to load device intelligence');
             return;
         }
-        
+
         deviceIntelligenceData.intelligence = intelligence;
         deviceIntelligenceData.report = report;
-        
+
         const deviceMap = new Map();
-        
+
         if (presence.devices) {
             presence.devices.forEach(d => {
                 deviceMap.set(d.mac, {
@@ -1224,7 +1226,7 @@ async function loadDeviceIntelligence() {
                 });
             });
         }
-        
+
         if (deviceList.devices) {
             deviceList.devices.forEach(d => {
                 const existing = deviceMap.get(d.mac);
@@ -1241,8 +1243,8 @@ async function loadDeviceIntelligence() {
                         sightings: d.sightings || 0,
                         present: d.present || false,
                         last_seen_ago: d.last_seen_ago || 0,
-                    last_seen_epoch: d.last_seen_epoch || 0,
-                    epoch_valid: d.epoch_valid || 0,
+                        last_seen_epoch: d.last_seen_epoch || 0,
+                        epoch_valid: d.epoch_valid || 0,
                         last_ap: d.last_ap || 'unknown',
                         trust_score: d.trust_score || 10,
                         tracked: d.tracked || false
@@ -1250,7 +1252,7 @@ async function loadDeviceIntelligence() {
                 }
             });
         }
-        
+
         deviceIntelligenceData.devices = Array.from(deviceMap.values());
 
         updateIntelligenceSummary();
@@ -1279,9 +1281,9 @@ function updateIntelligenceSummary() {
     const data = deviceIntelligenceData.intelligence;
     const report = deviceIntelligenceData.report;
     const devices = deviceIntelligenceData.devices;
-    
+
     const el = (id) => document.getElementById(id);
-    
+
     if (data && data.presence) {
         const p = data.presence;
         if (el('intel-present')) el('intel-present').textContent = p.devices_present || 0;
@@ -1289,7 +1291,7 @@ function updateIntelligenceSummary() {
         if (el('intel-new')) el('intel-new').textContent = p.new_today || 0;
         if (el('intel-total')) el('intel-total').textContent = (p.devices_present || 0) + (p.devices_away || 0);
     }
-    
+
     if (data && data.security) {
         const s = data.security;
         if (el('intel-deauth')) el('intel-deauth').textContent = s.deauth_events || 0;
@@ -1297,11 +1299,11 @@ function updateIntelligenceSummary() {
         if (el('intel-open')) el('intel-open').textContent = s.open_networks || 0;
         if (el('intel-hidden')) el('intel-hidden').textContent = s.hidden_networks || 0;
     }
-    
+
     if (data && data.uptime_hours !== undefined) {
         if (el('intel-uptime')) el('intel-uptime').textContent = data.uptime_hours.toFixed(1) + 'h';
     }
-    
+
     if (report) {
         if (report.summary) {
             if (el('intel-aps')) el('intel-aps').textContent = report.summary.unique_aps || 0;
@@ -1343,21 +1345,21 @@ function renderPresenceHeatmap(presenceHours) {
         const byteIndex = Math.floor(hour / 8);
         const bitIndex = hour % 8;
         const isPresent = (presenceHours[byteIndex] >> bitIndex) & 1;
-        
+
         // Calculate actual hour in local time (24-hour format)
         const localHour = (currentHour - 23 + hour + 24) % 24;
         const timeLabel = `${localHour.toString().padStart(2, '0')}:00`;
-        
+
         html += `<div class="hour ${isPresent ? 'active' : ''}" title="${timeLabel}"></div>`;
     }
 
     html += '</div>';
-    
+
     // Update hour labels to show actual local time range
     const startHour = (currentHour - 23 + 24) % 24;
     const hourLabels = [startHour, (startHour + 6) % 24, (startHour + 12) % 24, (startHour + 18) % 24, (startHour + 23) % 24];
     html += `<div class="heatmap-hours">${hourLabels.map(h => `<span>${h.toString().padStart(2, '0')}</span>`).join('')}</div>`;
-    
+
     return html;
 }
 
@@ -1448,7 +1450,7 @@ function renderDeviceList(immediate = false) {
     if (apFilter !== 'all') {
         devices = devices.filter(d => d.last_ap === apFilter);
     }
-    
+
     const sort = deviceIntelligenceData.currentSort;
     if (sort === 'trust') {
         devices.sort((a, b) => (b.trust_score || 0) - (a.trust_score || 0));
@@ -1464,7 +1466,7 @@ function renderDeviceList(immediate = false) {
     } else if (sort === 'sightings') {
         devices.sort((a, b) => (b.sightings || 0) - (a.sightings || 0));
     }
-    
+
     if (devices.length === 0) {
         container.innerHTML = '<div class="muted" style="text-align:center;padding:20px;">No devices match the current filter.</div>';
         const showMoreContainer = $('#show-more-container');
@@ -1481,7 +1483,7 @@ function renderDeviceList(immediate = false) {
     const showMoreContainer = $('#show-more-container');
     const showMoreBtn = $('#show-more-btn');
     const showLessBtn = $('#show-less-btn');
-    
+
     if (showMoreContainer) {
         showMoreContainer.style.display = (hasMore || displayCount > deviceIntelligenceData.devicesPerPage) ? 'block' : 'none';
     }
@@ -1506,7 +1508,7 @@ function renderDeviceList(immediate = false) {
             ? `Away (Last Seen: ${formatEpoch(d.last_seen_epoch)})`
             : (sightings >= 2 ? 'Away (Seen Previously)' : 'Away (New Device)');
         const statusText = d.present ? 'Here Now' : (lastSeenUnknown ? unknownLabel : `Away ${formatUptime(lastSeenAgoRaw)}`);
-        
+
         return `
             <div class="device-row" data-mac="${d.mac}" onclick="toggleDeviceDetails(this)">
                 <div class="device-header">
@@ -1636,7 +1638,7 @@ async function toggleDeviceTrack(e, mac, tracked) {
 
 async function toggleDeviceHome(e, mac, home_device, lastAp) {
     e.stopPropagation();
-    
+
     if (home_device && lastAp) {
         const res = await fetchJSON('/home-ssids/add', {
             method: 'POST',
@@ -1682,12 +1684,12 @@ async function toggleDeviceHome(e, mac, home_device, lastAp) {
 async function loadHomeSSIDs() {
     const data = await fetchJSON('/home-ssids');
     if (!data) return;
-    
+
     const connectedEl = $('#home-ssid-connected');
     if (connectedEl) {
         connectedEl.innerHTML = pii(data.connected || 'Not connected', 'ssid');
     }
-    
+
     const extraEl = $('#extra-home-ssids');
     if (extraEl && data.extra) {
         if (data.extra.length === 0) {
@@ -1710,13 +1712,13 @@ async function addHomeSSID() {
         showToast('Enter an SSID');
         return;
     }
-    
+
     const res = await fetchJSON('/home-ssids/add', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ssid })
     });
-    
+
     if (res && res.status === 'ok') {
         input.value = '';
         showToast('Home SSID added');
@@ -1732,7 +1734,7 @@ async function removeHomeSSID(ssid) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ssid })
     });
-    
+
     if (res && res.status === 'ok') {
         showToast('Home SSID removed');
         loadHomeSSIDs();
@@ -1744,7 +1746,7 @@ async function removeHomeSSID(ssid) {
 async function loadWebhookConfig() {
     const data = await fetchJSON('/webhook/config');
     if (!data) return;
-    
+
     const enabledCheckbox = $('#webhook-enabled');
     const urlInput = $('#webhook-url');
     const trackedOnlyCheckbox = $('#webhook-tracked-only');
@@ -1755,7 +1757,7 @@ async function loadWebhookConfig() {
     const handshakeCheckbox = $('#webhook-handshake');
     const allEventsCheckbox = $('#webhook-all-events');
     const status = $('#webhook-status');
-    
+
     if (enabledCheckbox) enabledCheckbox.checked = data.enabled;
     if (urlInput) urlInput.value = data.url || '';
     if (trackedOnlyCheckbox) trackedOnlyCheckbox.checked = data.tracked_only;
@@ -1765,7 +1767,7 @@ async function loadWebhookConfig() {
     if (deauthCheckbox) deauthCheckbox.checked = data.deauth_alert;
     if (handshakeCheckbox) handshakeCheckbox.checked = data.handshake_alert;
     if (allEventsCheckbox) allEventsCheckbox.checked = data.all_events;
-    
+
     if (status) {
         const pendingRaw = data.total_events - data.send_cursor;
         const pending = data.enabled ? Math.max(0, pendingRaw) : 0;
@@ -1775,7 +1777,7 @@ async function loadWebhookConfig() {
 
 async function saveWebhookConfig(e) {
     e.preventDefault();
-    
+
     const enabled = $('#webhook-enabled')?.checked ?? false;
     const url = $('#webhook-url')?.value || '';
     const tracked_only = $('#webhook-tracked-only')?.checked ?? false;
@@ -1785,13 +1787,13 @@ async function saveWebhookConfig(e) {
     const deauth_alert = $('#webhook-deauth')?.checked ?? false;
     const handshake_alert = $('#webhook-handshake')?.checked ?? false;
     const all_events = $('#webhook-all-events')?.checked ?? false;
-    
+
     const res = await fetchJSON('/webhook/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ enabled, url, tracked_only, home_departure_alert, home_arrival_alert, new_device_alert, deauth_alert, handshake_alert, all_events })
     });
-    
+
     if (res && res.status === 'ok') {
         showToast('Webhook settings saved');
         loadWebhookConfig();
@@ -1802,9 +1804,9 @@ async function saveWebhookConfig(e) {
 
 async function testWebhook(e) {
     e.preventDefault();
-    
+
     const res = await fetchJSON('/webhook/test', { method: 'POST' });
-    
+
     if (res && res.status === 'ok') {
         showToast('Test webhook sent successfully');
     } else {
@@ -1825,32 +1827,32 @@ class NetworkBottleneckDetector {
         const maxCapacity = 25;
         const totalAPs = channelCounts.reduce((a, b) => a + b, 0);
         const maxChannelCount = Math.max(...channelCounts);
-        
+
         // Calculate bottleneck score based on worst channel utilization
         const bottleneckScore = Math.min(100, (maxChannelCount / maxCapacity) * 100);
-        
+
         // Find which channels are congested
         const congestedChannels = channelCounts
             .map((count, idx) => ({ channel: idx + 1, count, congested: count > 15 }))
             .filter(ch => ch.congested);
-        
+
         return {
             score: Math.round(bottleneckScore),
             severity: this.getSeverity(bottleneckScore),
-            detail: maxChannelCount > 0 ? 
-                `${maxChannelCount} APs on most congested channel (Ch ${channelCounts.indexOf(maxChannelCount) + 1})` : 
+            detail: maxChannelCount > 0 ?
+                `${maxChannelCount} APs on most congested channel (Ch ${channelCounts.indexOf(maxChannelCount) + 1})` :
                 'No channels detected',
             overloadedAPs: channelCounts.filter(c => c > 20).length,
             congestedChannels: congestedChannels.length
         };
     }
-    
+
     calculateCapacityBottleneck(clientCounts, apCount) {
         const totalClients = clientCounts.reduce((a, b) => a + b, 0);
         const avgClientsPerAP = apCount > 0 ? totalClients / apCount : 0;
         const optimalRatio = 30;
         const bottleneckScore = apCount > 0 ? Math.min(100, (avgClientsPerAP / optimalRatio) * 100) : 0;
-        
+
         return {
             score: Math.round(bottleneckScore),
             devicesPerAP: Math.round(avgClientsPerAP),
@@ -1858,16 +1860,16 @@ class NetworkBottleneckDetector {
             detail: apCount > 0 ? `${Math.round(avgClientsPerAP)} devices per AP average` : 'No APs detected'
         };
     }
-    
+
     calculateSignalBottleneck(rssiValues) {
         if (!rssiValues || rssiValues.length === 0) {
             return { score: 0, weakSignalPercentage: 0, severity: 'low', detail: 'No signal data' };
         }
-        
+
         const weakSignals = rssiValues.filter(rssi => rssi < -70).length;
         const totalSignals = rssiValues.length;
         const weakSignalPercentage = (weakSignals / totalSignals) * 100;
-        
+
         return {
             score: Math.round(weakSignalPercentage),
             weakSignalPercentage: Math.round(weakSignalPercentage),
@@ -1875,60 +1877,60 @@ class NetworkBottleneckDetector {
             detail: `${weakSignals} devices with weak signal (< -70dBm)`
         };
     }
-    
+
     calculateTimingBottleneck(activityTimeline) {
         if (!activityTimeline || activityTimeline.length < 2) {
             return { score: 0, congestionPeriods: 0, severity: 'low', detail: 'Insufficient data' };
         }
-        
+
         const totalDevices = activityTimeline.map(s => (s.ap_count || 0) + (s.client_count || 0));
-        
+
         // Calculate average and standard deviation to detect significant spikes
         const avgActivity = totalDevices.reduce((a, b) => a + b, 0) / totalDevices.length;
         const variance = totalDevices.reduce((sum, val) => sum + Math.pow(val - avgActivity, 2), 0) / totalDevices.length;
         const stdDev = Math.sqrt(variance);
-        
+
         // Use statistical threshold (2 standard deviations above mean) for congestion
         const peakThreshold = avgActivity + (2 * stdDev);
-        
+
         // If there's very little variation, no timing bottleneck
         if (stdDev < 1) {
             return { score: 0, congestionPeriods: 0, severity: 'low', detail: 'Stable network activity' };
         }
-        
+
         const congestionPeriods = totalDevices.filter(count => count > peakThreshold).length;
         const bottleneckScore = (congestionPeriods / totalDevices.length) * 100;
-        
+
         return {
             score: Math.round(bottleneckScore),
             congestionPeriods: congestionPeriods,
             severity: this.getSeverity(bottleneckScore),
-            detail: congestionPeriods > 0 ? 
-                `${congestionPeriods} periods of high activity detected` : 
+            detail: congestionPeriods > 0 ?
+                `${congestionPeriods} periods of high activity detected` :
                 'Consistent network activity'
         };
     }
-    
+
     getSeverity(score) {
         if (score < 25) return 'low';
         if (score < 50) return 'medium';
         if (score < 75) return 'high';
         return 'critical';
     }
-    
+
     getOverallBottleneckScore(bottlenecks) {
         const weights = { channel: 0.3, capacity: 0.25, signal: 0.25, timing: 0.2 };
-        
-        const weightedScore = 
+
+        const weightedScore =
             bottlenecks.channel.score * weights.channel +
             bottlenecks.capacity.score * weights.capacity +
             bottlenecks.signal.score * weights.signal +
             bottlenecks.timing.score * weights.timing;
-            
+
         const overallScore = Math.round(weightedScore);
-        const primaryBottleneck = Object.entries(bottlenecks).reduce((a, [key, value]) => 
+        const primaryBottleneck = Object.entries(bottlenecks).reduce((a, [key, value]) =>
             value.score > a.value.score ? { key, value } : a, { key: 'none', value: { score: 0 } });
-        
+
         return {
             overallScore,
             severity: this.getSeverity(overallScore),
@@ -1937,16 +1939,16 @@ class NetworkBottleneckDetector {
             recommendations: this.generateRecommendations(bottlenecks, primaryBottleneck)
         };
     }
-    
+
     generateRecommendations(bottlenecks, primaryBottleneck) {
         const recommendations = [];
-        
+
         // Channel recommendations with specific channel info
         if (bottlenecks.channel.score > 70) {
-            const worstChannel = bottlenecks.channel.congestedChannels > 0 ? 
-                `prioritize moving APs from congested channels` : 
+            const worstChannel = bottlenecks.channel.congestedChannels > 0 ?
+                `prioritize moving APs from congested channels` :
                 `redistribute APs across channels`;
-            
+
             recommendations.push({
                 priority: 'high',
                 title: 'Optimize Channel Usage',
@@ -1954,21 +1956,21 @@ class NetworkBottleneckDetector {
                 impact: 'Could improve performance by 40-60%'
             });
         }
-        
+
         // Capacity recommendations with SSID-specific insights
         if (bottlenecks.capacity.score > 80) {
             let description = `Current load: ${bottlenecks.capacity.devicesPerAP} devices per AP`;
-            
+
             // Add SSID-specific details if available
             if (bottlenecks.capacity.ssidAnalysis) {
                 const worstSSID = bottlenecks.capacity.ssidAnalysis
                     .sort((a, b) => b.avgClientsPerAP - a.avgClientsPerAP)[0];
-                
+
                 if (worstSSID && worstSSID.avgClientsPerAP > bottlenecks.capacity.devicesPerAP * 1.5) {
                     description += `. "${worstSSID.ssid}" has ${Math.round(worstSSID.avgClientsPerAP)} devices per AP`;
                 }
             }
-            
+
             recommendations.push({
                 priority: 'critical',
                 title: 'Add Network Capacity',
@@ -1976,7 +1978,7 @@ class NetworkBottleneckDetector {
                 impact: 'Network may become unstable'
             });
         }
-        
+
         // Signal recommendations with specific insights
         if (bottlenecks.signal.score > 60) {
             recommendations.push({
@@ -1986,7 +1988,7 @@ class NetworkBottleneckDetector {
                 impact: 'Could improve reliability by 25%'
             });
         }
-        
+
         // Timing recommendations
         if (bottlenecks.timing.score > 75) {
             recommendations.push({
@@ -1996,7 +1998,7 @@ class NetworkBottleneckDetector {
                 impact: 'Could reduce peak congestion by 30%'
             });
         }
-        
+
         // Add general recommendation if no specific issues but overall score is elevated
         if (recommendations.length === 0 && bottlenecks.channel.score > 40) {
             recommendations.push({
@@ -2006,10 +2008,10 @@ class NetworkBottleneckDetector {
                 impact: 'Preventative maintenance recommended'
             });
         }
-        
+
         return recommendations.sort((a, b) => this.getPriorityWeight(b.priority) - this.getPriorityWeight(a.priority));
     }
-    
+
     getPriorityWeight(priority) {
         const weights = { critical: 4, high: 3, medium: 2, low: 1 };
         return weights[priority] || 0;
@@ -2058,8 +2060,8 @@ async function loadBottleneckAnalysis() {
 
             // Edge case: If oldest sample in response is older than our cache, backend data was reset
             const hasOlderData = historySamplesCache.samples.length > 0 &&
-                                 parsedSamples.length > 0 &&
-                                 parsedSamples[0].epoch_ts < historySamplesCache.samples[0].epoch_ts;
+                parsedSamples.length > 0 &&
+                parsedSamples[0].epoch_ts < historySamplesCache.samples[0].epoch_ts;
 
             if (historySamplesCache.lastTimestamp > 0 && !isFullResponse && !hasOlderData) {
                 // Incremental update: append new samples
@@ -2079,8 +2081,8 @@ async function loadBottleneckAnalysis() {
                 historySamplesCache.samples = parsedSamples;
                 if (BOTTLENECK_DEBUG) {
                     const reason = isFullResponse ? 'full response detected' :
-                                   hasOlderData ? 'older data detected (backend reset)' :
-                                   'initial load';
+                        hasOlderData ? 'older data detected (backend reset)' :
+                            'initial load';
                     console.log('[BOTTLENECK] Full refresh (' + reason + '):', historySamplesCache.samples.length, 'samples');
                 }
             }
@@ -2300,12 +2302,12 @@ function updateBottleneckMetric(type, data) {
 function updateRecommendations(recommendations) {
     const container = $('#recommendations-list');
     if (!container) return;
-    
+
     if (!recommendations || recommendations.length === 0) {
         container.innerHTML = '<div class="muted" style="font-size:11px;">No recommendations available</div>';
         return;
     }
-    
+
     container.innerHTML = recommendations.map(rec => `
         <div class="recommendation-item ${rec.priority}">
             <div>
@@ -2322,7 +2324,7 @@ function toggleBottleneckDetails() {
     const breakdown = $('#bottleneck-breakdown');
     const isVisible = breakdown.style.display !== 'none';
     breakdown.style.display = isVisible ? 'none' : 'block';
-    
+
     // Update button text
     event.target.textContent = isVisible ? 'Details' : 'Hide Details';
 }
@@ -2505,7 +2507,7 @@ async function finishWizard() {
         await fetchJSON('/wizard/complete', { method: 'POST' });
 
         hideWizard();
-        
+
         if (authPassword && authPassword.length >= 8) {
             showToast('Setup complete! You will need to login with your new password.');
             showLogin(false);
@@ -2535,4 +2537,120 @@ async function checkWizardAndStart() {
         return false;
     }
     return true;
+}
+
+// ============ Device Switcher ============
+
+let peerDevices = [];
+let peerStatus = null;
+
+async function loadPeerDevices() {
+    try {
+        const [peers, status] = await Promise.all([
+            fetchJSON('/peers'),
+            fetchJSON('/peers/status')
+        ]);
+
+        if (peers && peers.peers) {
+            peerDevices = peers.peers;
+            peerStatus = status;
+            updateDeviceSwitcher();
+        }
+    } catch (e) {
+        console.error('Failed to load peer devices:', e);
+    }
+}
+
+function updateDeviceSwitcher() {
+    const switcher = document.getElementById('device-switcher');
+    const currentName = document.getElementById('current-device-name');
+    const dropdown = document.getElementById('device-list-switcher');
+
+    if (!switcher || !dropdown) return;
+
+    // Only show switcher if there are multiple devices
+    if (peerDevices.length <= 1) {
+        switcher.style.display = 'none';
+        return;
+    }
+
+    switcher.style.display = 'block';
+
+    // Update current device name
+    if (peerStatus && currentName) {
+        const role = peerStatus.role === 'leader' ? '★ ' : '';
+        currentName.textContent = role + (peerStatus.hostname || 'This Device');
+    }
+
+    // Build dropdown items
+    dropdown.innerHTML = '';
+
+    peerDevices.forEach(peer => {
+        const item = document.createElement('div');
+        item.className = 'device-item' + (peer.is_self ? ' current' : '');
+
+        const isLeader = peer.role === 'leader';
+        const dotClass = isLeader ? 'leader' : 'follower';
+
+        // Build the hostname-based URL for navigation (prefer hostname.local over IP)
+        const hostnameUrl = peer.hostname ? `http://${peer.hostname}.local/` : null;
+        const ipUrl = peer.ip ? `http://${peer.ip}/` : null;
+        const peerUrl = hostnameUrl || ipUrl;
+
+        // Display hostname.local if available, otherwise show IP
+        const displayAddress = peer.hostname ? `${peer.hostname}.local` : (peer.ip || 'No address');
+
+        item.innerHTML = `
+            <span class="device-item-dot ${dotClass}"></span>
+            <div class="device-item-info">
+                <div class="device-item-name">${peer.hostname || 'Unknown'}</div>
+                <div class="device-item-meta">${displayAddress}</div>
+            </div>
+            ${isLeader ? '<span class="device-item-badge leader">Leader</span>' : '<span class="device-item-badge">Follower</span>'}
+            ${peer.is_self ? '<span class="device-item-badge">You</span>' : ''}
+        `;
+
+        // Click to navigate to other device (prefer mDNS hostname)
+        if (!peer.is_self && peerUrl) {
+            item.style.cursor = 'pointer';
+            item.onclick = () => {
+                if (confirm(`Navigate to ${peer.hostname || peer.ip}?\n\nYou'll be redirected to ${peerUrl}`)) {
+                    window.location.href = peerUrl;
+                }
+            };
+        }
+
+        dropdown.appendChild(item);
+    });
+}
+
+function toggleDeviceSwitcher() {
+    const switcher = document.getElementById('device-switcher');
+    const dropdown = document.getElementById('device-switcher-dropdown');
+
+    if (!switcher || !dropdown) return;
+
+    const isOpen = switcher.classList.toggle('open');
+    dropdown.style.display = isOpen ? 'block' : 'none';
+
+    // Close dropdown when clicking outside
+    if (isOpen) {
+        const closeHandler = (e) => {
+            if (!switcher.contains(e.target)) {
+                switcher.classList.remove('open');
+                dropdown.style.display = 'none';
+                document.removeEventListener('click', closeHandler);
+            }
+        };
+        // Delay adding listener to avoid immediate close
+        setTimeout(() => document.addEventListener('click', closeHandler), 10);
+    }
+}
+
+// Load peer devices on app init and periodically
+if (typeof addTrackedInterval === 'function') {
+    // Will be called after initApp sets up intervals
+} else {
+    // Fallback: load peers after a delay
+    setTimeout(loadPeerDevices, 2000);
 }

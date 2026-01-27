@@ -21,6 +21,7 @@ idf_component_register(
         "json_utils.c"
         "tls_cert.c"
         "recovery.c"
+        "peer_discovery.c"
     INCLUDE_DIRS
         "."
     EMBED_FILES

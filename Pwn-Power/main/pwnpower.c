@@ -28,6 +28,7 @@
 #include "recovery.h"
 #include <time.h>
 #include "lwip/ip4_addr.h"
+#include "peer_discovery.h"
 
 #define TAG "PwnPower"
 #define MAX_STA_CONN 4
@@ -128,7 +129,8 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         s_current_retry_interval = 0;
         s_next_retry_time = 0;
         webserver_set_sta_connected(true);
-        mdns_service_update_hostname("pwnpower");
+        // Update mDNS hostname based on peer discovery role
+        mdns_service_update_hostname(peer_discovery_get_hostname());
         pwnpower_sntp_sync_time();
 
         // Set home network to the connected SSID for device prioritization
@@ -147,6 +149,52 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED) {
         wifi_event_ap_staconnected_t *event = (wifi_event_ap_staconnected_t *)event_data;
         ESP_LOGI(TAG, "Station connected: %02x:%02x:%02x:%02x:%02x:%02x, AID=%d", event->mac[0], event->mac[1], event->mac[2], event->mac[3], event->mac[4], event->mac[5], event->aid);
+    }
+}
+
+// Peer discovery event callback - handle role changes and peer events
+static void peer_event_handler(peer_event_type_t event, const peer_info_t *peer) {
+    switch (event) {
+        case PEER_EVENT_ROLE_CHANGED:
+            ESP_LOGI(TAG, "Peer role changed to: %s", 
+                     peer_discovery_get_role() == PEER_ROLE_LEADER ? "leader" : "follower");
+            // Update mDNS hostname to reflect new role
+            mdns_service_update_hostname(peer_discovery_get_hostname());
+            
+            // Update AP SSID to reflect new role
+            {
+                const char *new_ssid = peer_discovery_get_ap_ssid();
+                wifi_config_t wifi_config = {0};
+                esp_wifi_get_config(WIFI_IF_AP, &wifi_config);
+                
+                // Only update if SSID actually changed
+                if (strcmp((char*)wifi_config.ap.ssid, new_ssid) != 0) {
+                    strncpy((char*)wifi_config.ap.ssid, new_ssid, sizeof(wifi_config.ap.ssid) - 1);
+                    wifi_config.ap.ssid_len = strlen(new_ssid);
+                    esp_wifi_set_config(WIFI_IF_AP, &wifi_config);
+                    ESP_LOGI(TAG, "AP SSID updated to: %s", new_ssid);
+                }
+            }
+            break;
+        case PEER_EVENT_DISCOVERED:
+            if (peer) {
+                ESP_LOGI(TAG, "New PwnPower peer discovered: %s (%02x:%02x:%02x:%02x:%02x:%02x)",
+                         peer->hostname, peer->mac[0], peer->mac[1], peer->mac[2],
+                         peer->mac[3], peer->mac[4], peer->mac[5]);
+            }
+            break;
+        case PEER_EVENT_LOST:
+            if (peer) {
+                ESP_LOGI(TAG, "PwnPower peer lost: %02x:%02x:%02x:%02x:%02x:%02x",
+                         peer->mac[0], peer->mac[1], peer->mac[2],
+                         peer->mac[3], peer->mac[4], peer->mac[5]);
+            }
+            break;
+        case PEER_EVENT_LEADER_CHANGED:
+            if (peer) {
+                ESP_LOGI(TAG, "New leader elected: %s", peer->hostname);
+            }
+            break;
     }
 }
 
@@ -352,6 +400,17 @@ void app_main() {
 
     mdns_service_init("pwnpower");
     ESP_LOGI(TAG, "Heap after mDNS: %lu bytes", (unsigned long)esp_get_free_heap_size());
+
+    // Initialize and start peer discovery for multi-device coordination
+    if (peer_discovery_init() == ESP_OK) {
+        // Register callback to update mDNS hostname when role changes
+        peer_discovery_register_callback(peer_event_handler);
+        peer_discovery_start();
+        ESP_LOGI(TAG, "Peer discovery started. Role: %s, Hostname: %s",
+                 peer_discovery_get_role() == PEER_ROLE_LEADER ? "leader" : "follower",
+                 peer_discovery_get_hostname());
+    }
+    ESP_LOGI(TAG, "Heap after peer discovery: %lu bytes", (unsigned long)esp_get_free_heap_size());
 
     // initialize device tracking
     device_db_init();

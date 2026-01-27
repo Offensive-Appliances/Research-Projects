@@ -24,6 +24,8 @@
 - Added a first time boot setup wizard
 - Added support for the ESP32-C5
 - Added a recovery system to clear NVS and Storage partition on 5 rapid power cycles
+- Added peer discovery to switch between multiple devices on a home network from one interface
+
 
 ### Changed
 - Merged WiFi Recon and Attack sections into a single section

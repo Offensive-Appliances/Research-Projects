@@ -33,6 +33,7 @@
 #include <stddef.h>
 #include <time.h>
 #include <string.h>
+#include "peer_discovery.h"
 
 extern const uint8_t _binary_web_content_gz_h_start[] asm("_binary_web_content_gz_h_start");
 extern const uint8_t _binary_web_content_gz_h_end[] asm("_binary_web_content_gz_h_end");
@@ -2359,6 +2360,111 @@ static esp_err_t home_ssids_remove_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// ------ Peer Discovery API Handlers ------
+
+static esp_err_t peers_list_handler(httpd_req_t *req) {
+    update_last_request_time();
+    
+    peer_info_t peers[PEER_MAX_DEVICES];
+    size_t count = 0;
+    peer_discovery_get_peers(peers, PEER_MAX_DEVICES, &count);
+    
+    cJSON *root = cJSON_CreateObject();
+    cJSON *peers_array = cJSON_AddArrayToObject(root, "peers");
+    
+    for (size_t i = 0; i < count; i++) {
+        cJSON *peer = cJSON_CreateObject();
+        
+        // MAC address as string
+        char mac_str[18];
+        snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+                 peers[i].mac[0], peers[i].mac[1], peers[i].mac[2],
+                 peers[i].mac[3], peers[i].mac[4], peers[i].mac[5]);
+        cJSON_AddStringToObject(peer, "mac", mac_str);
+        
+        // IP address as string
+        char ip_str[16];
+        uint32_t ip = peers[i].ip_addr;
+        snprintf(ip_str, sizeof(ip_str), "%lu.%lu.%lu.%lu",
+                 (unsigned long)(ip & 0xFF),
+                 (unsigned long)((ip >> 8) & 0xFF),
+                 (unsigned long)((ip >> 16) & 0xFF),
+                 (unsigned long)((ip >> 24) & 0xFF));
+        cJSON_AddStringToObject(peer, "ip", ip_str);
+        
+        cJSON_AddStringToObject(peer, "hostname", peers[i].hostname);
+        cJSON_AddStringToObject(peer, "role", peers[i].role == PEER_ROLE_LEADER ? "leader" : "follower");
+        cJSON_AddBoolToObject(peer, "ap_active", peers[i].ap_active);
+        cJSON_AddBoolToObject(peer, "is_self", peers[i].is_self);
+        cJSON_AddNumberToObject(peer, "last_seen", peers[i].last_seen);
+        
+        cJSON_AddItemToArray(peers_array, peer);
+    }
+    
+    cJSON_AddNumberToObject(root, "count", count);
+    
+    char *json_str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json_str);
+    free(json_str);
+    
+    return ESP_OK;
+}
+
+static esp_err_t peers_status_handler(httpd_req_t *req) {
+    update_last_request_time();
+    
+    peer_info_t self;
+    peer_discovery_get_self(&self);
+    
+    cJSON *root = cJSON_CreateObject();
+    
+    // Self info
+    char mac_str[18];
+    snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+             self.mac[0], self.mac[1], self.mac[2],
+             self.mac[3], self.mac[4], self.mac[5]);
+    cJSON_AddStringToObject(root, "mac", mac_str);
+    cJSON_AddStringToObject(root, "hostname", peer_discovery_get_hostname());
+    cJSON_AddStringToObject(root, "role", peer_discovery_get_role() == PEER_ROLE_LEADER ? "leader" : "follower");
+    cJSON_AddBoolToObject(root, "ap_active", self.ap_active);
+    
+    // AP coordination mode
+    peer_ap_mode_t mode = peer_discovery_get_ap_mode();
+    const char *mode_str = "auto";
+    if (mode == PEER_AP_MODE_ALWAYS_ON) mode_str = "always_on";
+    else if (mode == PEER_AP_MODE_LEADER_ONLY) mode_str = "leader_only";
+    cJSON_AddStringToObject(root, "ap_mode", mode_str);
+    
+    // Peer count
+    peer_info_t peers[PEER_MAX_DEVICES];
+    size_t count = 0;
+    peer_discovery_get_peers(peers, PEER_MAX_DEVICES, &count);
+    cJSON_AddNumberToObject(root, "peer_count", count);
+    
+    char *json_str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json_str);
+    free(json_str);
+    
+    return ESP_OK;
+}
+
+static esp_err_t peers_elect_handler(httpd_req_t *req) {
+    update_last_request_time();
+    
+    ESP_LOGI(TAG, "Manual peer election triggered via API");
+    peer_discovery_trigger_election();
+    
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"ok\",\"message\":\"election triggered\"}");
+    return ESP_OK;
+}
+
 // Register all application routes on the given server (HTTPS)
 static esp_err_t register_routes(httpd_handle_t server) {
     httpd_register_uri_handler(server, &uri_get);
@@ -2417,6 +2523,11 @@ static esp_err_t register_routes(httpd_handle_t server) {
     register_authed(server, "/home-ssids/add", HTTP_POST, home_ssids_add_handler);
     register_authed(server, "/home-ssids/remove", HTTP_POST, home_ssids_remove_handler);
     register_authed(server, "/home-ssids/refresh", HTTP_POST, home_ssids_refresh_handler);
+
+    // Peer discovery routes for multi-device coordination
+    register_authed(server, "/peers", HTTP_GET, peers_list_handler);
+    register_authed(server, "/peers/status", HTTP_GET, peers_status_handler);
+    register_authed(server, "/peers/elect", HTTP_POST, peers_elect_handler);
 
     ESP_LOGI(TAG, "All URI handlers registered successfully");
     ESP_LOGI(TAG, "Free heap after registration: %lu bytes", (unsigned long)esp_get_free_heap_size());
@@ -2501,7 +2612,7 @@ static httpd_handle_t start_https_server(void) {
     conf.servercert_len = strlen(s_tls_bundle.cert_pem) + 1;
     conf.prvtkey_pem = (const uint8_t *)s_tls_bundle.key_pem;
     conf.prvtkey_len = strlen(s_tls_bundle.key_pem) + 1;
-    conf.httpd.max_uri_handlers = 55;
+    conf.httpd.max_uri_handlers = 58;  // Increased for peer discovery routes
 #ifdef CONFIG_IDF_TARGET_ESP32C5
     conf.httpd.max_open_sockets = 2;
     conf.httpd.backlog_conn = 1;

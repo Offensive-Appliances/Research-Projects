@@ -1,10 +1,12 @@
 #include "mdns_service.h"
 #include "mdns.h"
 #include "esp_log.h"
+#include <string.h>
 
 #define TAG "mDNS"
 
 static bool mdns_initialized = false;
+static char current_hostname[33] = "pwnpower";
 
 esp_err_t mdns_service_init(const char *hostname) {
     if (mdns_initialized) {
@@ -22,6 +24,9 @@ esp_err_t mdns_service_init(const char *hostname) {
         ESP_LOGE(TAG, "mDNS hostname set failed: %s", esp_err_to_name(err));
         return err;
     }
+
+    strncpy(current_hostname, hostname, sizeof(current_hostname) - 1);
+    current_hostname[sizeof(current_hostname) - 1] = '\0';
 
     err = mdns_instance_name_set("PwnPower WiFi Scanner");
     if (err != ESP_OK) {
@@ -47,6 +52,18 @@ esp_err_t mdns_service_update_hostname(const char *hostname) {
     esp_err_t err = mdns_hostname_set(hostname);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "mDNS hostname update failed: %s", esp_err_to_name(err));
+    } else {
+        strncpy(current_hostname, hostname, sizeof(current_hostname) - 1);
+        current_hostname[sizeof(current_hostname) - 1] = '\0';
+        ESP_LOGI(TAG, "mDNS hostname updated to: %s.local", hostname);
     }
     return err;
+}
+
+const char* mdns_service_get_hostname(void) {
+    return current_hostname;
+}
+
+bool mdns_service_is_initialized(void) {
+    return mdns_initialized;
 }
