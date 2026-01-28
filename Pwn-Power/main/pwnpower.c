@@ -115,62 +115,44 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         webserver_set_sta_connected(false);
         s_time_synced = false;
-        
-        // Record disconnect time for periodic retry system
         s_last_disconnect_time = (uint32_t)(esp_timer_get_time() / 1000000ULL);
-        
+
+        // Skip reconnect if scan is managing the connection
         if (wifi_scan_is_station_scan_active()) {
-            ESP_LOGI(TAG, "Station scan in progress, skipping auto-reconnect");
+            ESP_LOGI(TAG, "Station scan active, skipping reconnect");
             return;
         }
-        
-        // NOTE: We no longer re-enable AP here immediately.
-        // Instead, we stay in STA mode during reconnect attempts to avoid channel conflicts.
-        // The AP will be re-enabled:
-        // 1. After successful STA connection (in IP_EVENT_STA_GOT_IP)
-        // 2. After all retry attempts exhausted (below)
-        // 3. By the periodic reconnect task
-        
+
         sta_config_t sta_cfg;
-        bool should_retry = (sta_config_get(&sta_cfg) == ESP_OK && sta_cfg.auto_connect);
-        if (should_retry && s_retry_num < MAX_RETRY) {
-            // Keep STA mode during reconnect attempts for cleaner channel handling
-            wifi_mode_t current_mode;
-            esp_wifi_get_mode(&current_mode);
-            if (current_mode == WIFI_MODE_APSTA) {
-                ESP_LOGI(TAG, "Temporarily switching to STA mode for reconnect");
-                esp_wifi_set_mode(WIFI_MODE_STA);
-                vTaskDelay(pdMS_TO_TICKS(100));
-            }
-            
-            vTaskDelay(pdMS_TO_TICKS(2000));  // Increased delay to allow driver to settle
-            esp_wifi_disconnect(); // Ensure clean state before retrying
-            vTaskDelay(pdMS_TO_TICKS(100)); 
-            esp_wifi_connect();
+        if (sta_config_get(&sta_cfg) != ESP_OK || !sta_cfg.auto_connect) {
+            return;  // Auto-connect disabled
+        }
+
+        if (s_retry_num < MAX_RETRY) {
+            // Immediate retry with backoff
             s_retry_num++;
-            ESP_LOGI(TAG, "Retry connecting to STA (%d/%d)", s_retry_num, MAX_RETRY);
-        } else if (s_retry_num >= MAX_RETRY) {
-            ESP_LOGW(TAG, "Failed to connect to STA after %d retries", MAX_RETRY);
-            
-            // Re-enable AP after all retries exhausted so device is accessible
-            // BUT only if we have enough heap - AP creation needs ~8KB
-            wifi_mode_t current_mode;
-            esp_wifi_get_mode(&current_mode);
-            uint32_t free_heap = esp_get_free_heap_size();
-            if (current_mode == WIFI_MODE_STA) {
-                if (free_heap > 15000) {  // Need at least 15KB free to safely enable AP
-                    ESP_LOGI(TAG, "Re-enabling AP after connection failure (heap: %lu)", (unsigned long)free_heap);
+            uint32_t delay_ms = 1000 * s_retry_num;  // 1s, 2s, 3s, 4s, 5s
+            ESP_LOGI(TAG, "STA disconnected, retry %d/%d in %lums", s_retry_num, MAX_RETRY, (unsigned long)delay_ms);
+            vTaskDelay(pdMS_TO_TICKS(delay_ms));
+            esp_wifi_connect();
+        } else {
+            // Exhausted immediate retries, schedule periodic retry
+            ESP_LOGW(TAG, "STA connection failed after %d retries", MAX_RETRY);
+
+            // Re-enable AP only if configured and we have heap
+            if (sta_cfg.ap_while_connected) {
+                wifi_mode_t mode;
+                esp_wifi_get_mode(&mode);
+                if (mode == WIFI_MODE_STA && esp_get_free_heap_size() > 15000) {
+                    ESP_LOGI(TAG, "Re-enabling AP for fallback access");
                     esp_wifi_set_mode(WIFI_MODE_APSTA);
-                } else {
-                    ESP_LOGW(TAG, "Skipping AP re-enable - low heap (%lu bytes), would crash", (unsigned long)free_heap);
-                    // Stay in STA mode to conserve memory, will try again on next periodic retry
                 }
             }
-            
-            // Schedule next retry with exponential backoff
+
+            // Schedule periodic retry
             uint32_t interval = RETRY_INTERVALS[s_current_retry_interval];
             s_next_retry_time = s_last_disconnect_time + interval;
-            ESP_LOGI(TAG, "Scheduling next retry in %lu seconds", (unsigned long)interval);
+            ESP_LOGI(TAG, "Next retry in %lus", (unsigned long)interval);
             if (s_current_retry_interval < RETRY_INTERVAL_COUNT - 1) {
                 s_current_retry_interval++;
             }
@@ -178,43 +160,38 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+
+        // Reset retry state
         s_retry_num = 0;
-        
-        // Reset periodic retry state on successful connection
         s_current_retry_interval = 0;
         s_next_retry_time = 0;
+
         webserver_set_sta_connected(true);
-        // Update mDNS hostname based on peer discovery role
         mdns_service_update_hostname(peer_discovery_get_hostname());
+        mdns_service_refresh();
         pwnpower_sntp_sync_time();
 
-        // Set home network to the connected SSID for device prioritization
         sta_config_t sta_cfg;
         if (sta_config_get(&sta_cfg) == ESP_OK && strlen(sta_cfg.ssid) > 0) {
             scan_storage_set_home_ssid(sta_cfg.ssid);
 
+            // Ensure correct mode based on config
+            wifi_mode_t mode;
+            esp_wifi_get_mode(&mode);
+
             if (!sta_cfg.ap_while_connected) {
-                // If user EXPLICITLY disabled AP-while-connected, respect that
-                ESP_LOGI(TAG, "Disabling AP (ap_while_connected=false)");
-                esp_wifi_set_mode(WIFI_MODE_STA);
+                // STA-only mode requested
+                if (mode != WIFI_MODE_STA) {
+                    esp_wifi_set_mode(WIFI_MODE_STA);
+                }
             } else {
-                // Default: Keep AP running
-                ESP_LOGI(TAG, "Keeping AP active (ap_while_connected=true)");
-                // No mode change needed, we are already in APSTA
-            }
-                // Re-enable AP if it was disabled during reconnect attempts
-                wifi_mode_t current_mode;
-                esp_wifi_get_mode(&current_mode);
-                if (current_mode == WIFI_MODE_STA) {
-                    uint32_t free_heap = esp_get_free_heap_size();
-                    if (free_heap > 15000) {  // Need at least 15KB free to safely enable AP
-                        ESP_LOGI(TAG, "Re-enabling AP after successful connection (heap: %lu)", (unsigned long)free_heap);
-                        esp_wifi_set_mode(WIFI_MODE_APSTA);
-                    } else {
-                        ESP_LOGW(TAG, "Skipping AP re-enable - low heap (%lu bytes)", (unsigned long)free_heap);
-                    }
+                // APSTA mode requested - re-enable AP if needed
+                if (mode == WIFI_MODE_STA && esp_get_free_heap_size() > 15000) {
+                    ESP_LOGI(TAG, "Re-enabling AP after connection");
+                    esp_wifi_set_mode(WIFI_MODE_APSTA);
                 }
             }
+        }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_AP_STAIPASSIGNED) {
         ip_event_ap_staipassigned_t *event = (ip_event_ap_staipassigned_t *)event_data;
         ESP_LOGI(TAG, "DHCP assigned IP to station: " IPSTR, IP2STR(&event->ip));
@@ -273,7 +250,8 @@ static void peer_event_handler(peer_event_type_t event, const peer_info_t *peer)
 void wifi_init_softap() {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+    esp_netif_set_hostname(sta_netif, "pwnpower");
     esp_netif_t *ap_netif = esp_netif_create_default_wifi_ap();
     esp_netif_ip_info_t ip_info = {0};
     IP4_ADDR(&ip_info.ip, 192, 168, 66, 1);

@@ -38,6 +38,7 @@
 - Changed SoftAP IP to 192.168.66.1 to prevent conflicts with STA connection
 - Changed history samples to use absolute time instead of relative time
 - Fixed issue where old samples would 'disappear' after a while
+- Changed scan reports to allow downloading raw json and an image containing chart info seperately
 
 ## v1.0
 

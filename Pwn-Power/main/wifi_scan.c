@@ -17,6 +17,8 @@
 #include "scan_storage.h"
 #include "json_utils.h"
 #include "device_lifecycle.h"
+#include "peer_discovery.h"
+
 
 // Forward declarations
 extern bool pwnpower_time_is_synced(void);
@@ -490,6 +492,9 @@ void wifi_scan() {
             cJSON_AddItemToArray(rows, cJSON_CreateObject());
             continue;
         }
+
+        // Process scan results for Peer Discovery (opportunistic)
+        peer_discovery_process_scan_results(ap_records, ap_count);
         
         // Collect RSSI values for filtering
         int8_t *rssi_values = malloc(sizeof(int8_t) * ap_count);
@@ -630,42 +635,35 @@ void wifi_scan() {
         }
     }
 
-    // merge station data into AP entries
-    ESP_LOGI(TAG, "Merging station data into AP entries...");
+    // Merge station data into AP entries
     int merge_count = 0;
     cJSON *ap_entry = NULL;
     cJSON_ArrayForEach(ap_entry, rows) {
         cJSON *mac_item = cJSON_GetObjectItem(ap_entry, "MAC");
         if(mac_item) {
-            // convert to uppercase for key matching
             char upper_mac[18];
             strncpy(upper_mac, mac_item->valuestring, sizeof(upper_mac));
             upper_mac[sizeof(upper_mac) - 1] = '\0';
             for(int i=0; upper_mac[i]; i++) upper_mac[i] = toupper(upper_mac[i]);
-            
-            ESP_LOGI(TAG, "Looking for stations for AP: %s", upper_mac);
+
             cJSON *station_data = cJSON_GetObjectItem(station_root, upper_mac);
             if(station_data) {
                 cJSON *stations = cJSON_DetachItemFromObject(station_data, "stations");
                 if (stations) {
-                    int station_count = cJSON_GetArraySize(stations);
-                    ESP_LOGI(TAG, "Found %d stations for AP %s", station_count, upper_mac);
                     cJSON_AddItemToObject(ap_entry, "stations", stations);
                     merge_count++;
-                } else {
-                    ESP_LOGW(TAG, "No stations array in station_data for %s", upper_mac);
                 }
             }
         }
     }
-    ESP_LOGI(TAG, "Merged stations for %d APs", merge_count);
+    if (merge_count > 0) {
+        ESP_LOGI(TAG, "Merged stations for %d APs", merge_count);
+    }
 
-    // Update WPS status for all APs now that station scan has detected WPS
-    ESP_LOGI(TAG, "Updating WPS status for APs...");
+    // Update WPS status with any new detections from promiscuous scan
     cJSON_ArrayForEach(ap_entry, rows) {
         cJSON *mac_item = cJSON_GetObjectItem(ap_entry, "MAC");
         if (mac_item && mac_item->valuestring) {
-            // Parse MAC address
             uint8_t bssid[6];
             if (sscanf(mac_item->valuestring, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
                       &bssid[0], &bssid[1], &bssid[2], &bssid[3], &bssid[4], &bssid[5]) == 6) {
@@ -1262,71 +1260,53 @@ static void probe_hidden_aps_internal(void);
 
 void wifi_scan_stations() {
     if(!stations_mutex) stations_mutex = xSemaphoreCreateMutex();
-    
+
     station_scan_active = true;
-    
-    // store original wifi mode and connection state
+
+    // Get current mode and connection state
     wifi_mode_t original_mode;
     esp_wifi_get_mode(&original_mode);
-    
+
     bool was_sta_connected = false;
     wifi_ap_record_t ap_info;
     if(original_mode == WIFI_MODE_STA || original_mode == WIFI_MODE_APSTA) {
         was_sta_connected = (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK);
     }
-    
-    // disconnect STA and disable AP to allow free channel switching
+
+    bool is_sta_only = (original_mode == WIFI_MODE_STA);
+
+    // Disconnect STA for channel hopping
     if(was_sta_connected) {
         ESP_LOGI(TAG, "Disconnecting STA for station scan");
         esp_wifi_disconnect();
-        vTaskDelay(pdMS_TO_TICKS(300));
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
-    
-    if(original_mode == WIFI_MODE_APSTA || original_mode == WIFI_MODE_AP) {
-        ESP_LOGI(TAG, "Temporarily disabling AP for station scan");
-        esp_wifi_deauth_sta(0);
+
+    // For APSTA mode, need to switch to STA-only for promiscuous scanning
+    if(!is_sta_only) {
+        ESP_LOGI(TAG, "Temporarily switching to STA mode for station scan");
+        esp_wifi_deauth_sta(0);  // Kick AP clients first
+        vTaskDelay(pdMS_TO_TICKS(100));
+        esp_wifi_set_mode(WIFI_MODE_STA);
         vTaskDelay(pdMS_TO_TICKS(200));
     }
-    
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    vTaskDelay(pdMS_TO_TICKS(300));
-    
+
+    // Reset station count for new scan
     xSemaphoreTake(stations_mutex, portMAX_DELAY);
-    stations_count = 0; // reset for new scan
-    ESP_LOGI(TAG, "PROBE_DEBUG: Starting station scan, reset probe counter to 0");
+    stations_count = 0;
+    xSemaphoreGive(stations_mutex);
 
-    if(known_ap_count == 0) {
-        wifi_scan_config_t scan_config = { .ssid = NULL, .bssid = NULL, .channel = 0, .show_hidden = true, .scan_type = WIFI_SCAN_TYPE_ACTIVE, .scan_time.active.min = 150, .scan_time.active.max = 300 };
-        if(esp_wifi_scan_start(&scan_config, true) == ESP_OK){
-            uint16_t ap_num = 0; esp_wifi_scan_get_ap_num(&ap_num);
-            if(ap_num > 0){
-                wifi_ap_record_t *ap_records = malloc(sizeof(wifi_ap_record_t)*ap_num);
-                if(ap_records){
-                    if(esp_wifi_scan_get_ap_records(&ap_num, ap_records) == ESP_OK){
-                        known_ap_count = 0; known_channel_count = 0;
-                        for(int i=0;i<ap_num;i++){
-                            bool exists=false; for(int k=0;k<known_ap_count;k++){ if(memcmp(known_ap_bssids[k], ap_records[i].bssid,6)==0){ exists=true; break; }}
-                            if(!exists && known_ap_count < (int)(sizeof(known_ap_bssids)/sizeof(known_ap_bssids[0]))){ memcpy(known_ap_bssids[known_ap_count], ap_records[i].bssid,6); known_ap_count++; }
-                            uint8_t ch = ap_records[i].primary; bool ch_exists=false; for(int k=0;k<known_channel_count;k++){ if(known_ap_channels[k]==ch){ ch_exists=true; break; } }
-                            if(!ch_exists && known_channel_count < (int)(sizeof(known_ap_channels))){ known_ap_channels[known_channel_count++] = ch; }
-                        }
-                    }
-                    free(ap_records);
-                }
-            }
-        }
-    }
+    ESP_LOGI(TAG, "Starting station scan (probes: 0)");
 
+    // Run promiscuous scan
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_promiscuous_rx_cb(stations_sniffer);
 
-    uint32_t scan_time_ms = 2500; // Reduced from 4000ms for responsiveness
-    uint32_t dwell_time_ms = 125; // Reduced from 200ms (standard beacon interval is 100ms)
     int ch_count = known_channel_count > 0 ? known_channel_count : (int)get_scan_channels_size();
     const uint8_t* channels = get_scan_channels();
-    uint32_t iterations = scan_time_ms / (dwell_time_ms * (uint32_t)ch_count);
-    if (iterations == 0) iterations = 1;
-    if (iterations > 4) iterations = 4; // Cap at 4 iterations (was 8)
+    uint32_t dwell_time_ms = 125;
+    uint32_t iterations = 2;  // ~2.5s total for typical channel counts
+
     for (uint32_t iter = 0; iter < iterations; iter++) {
         for (int i = 0; i < ch_count; i++) {
             uint8_t ch = (known_channel_count > 0) ? known_ap_channels[i] : channels[i];
@@ -1336,79 +1316,44 @@ void wifi_scan_stations() {
     }
 
     esp_wifi_set_promiscuous(false);
-    
-    ESP_LOGI(TAG, "PROBE_DEBUG: Station scan completed, total probe requests processed: %lu", (unsigned long)s_probe_request_count);
-    
+    ESP_LOGI(TAG, "Station scan done, probes: %lu", (unsigned long)s_probe_request_count);
+
+    // Probe hidden APs
     probe_hidden_aps_internal();
-    
-    // restore original mode and reconnect if needed
-    if(original_mode != WIFI_MODE_STA) {
-        ESP_LOGI(TAG, "Restoring original mode (APSTA)");
-        esp_wifi_set_mode(original_mode);
-        vTaskDelay(pdMS_TO_TICKS(500));
+
+    // Restore mode and reconnect
+    if(!is_sta_only) {
+        // APSTA mode: restore AP, then reconnect STA
+        ESP_LOGI(TAG, "Restoring APSTA mode");
+        esp_wifi_set_mode(WIFI_MODE_APSTA);
+        vTaskDelay(pdMS_TO_TICKS(500));  // AP needs time to initialize
     }
-    
-    // Keep station_scan_active=true during reconnection to prevent
-    // the disconnect handler from interfering with our reconnect attempt
+
+    // Clear scan flag before reconnect so disconnect handler can take over if needed
+    station_scan_active = false;
+
     if(was_sta_connected) {
-        ESP_LOGI(TAG, "Reconnecting STA after station scan");
-        
-        // Give WiFi stack time to fully restore mode
-        vTaskDelay(pdMS_TO_TICKS(300));
-        
-        // CRITICAL: Clear flag BEFORE connecting so that if connection fails/disconnects,
-        // the disconnect handler knows it can safely retry (instead of thinking scan is active)
-        // This fixes the issue where a failed reconnect was ignored due to "Station scan in progress"
-        station_scan_active = false;
-        
+        ESP_LOGI(TAG, "Reconnecting STA");
         esp_wifi_connect();
-        
-        // Wait for connection to fully stabilize (including DHCP)
-        // This prevents the disconnect handler from racing with us
-        // esp_wifi_sta_get_ap_info only checks WiFi association, not DHCP
-        // We wait up to 10 seconds for stability
+
+        // Wait for association (up to 5s)
         bool connected = false;
-        for (int wait = 0; wait < 100; wait++) {  // 10 seconds max
+        for (int wait = 0; wait < 50; wait++) {
             vTaskDelay(pdMS_TO_TICKS(100));
-            
             wifi_ap_record_t ap_check;
-            esp_err_t ap_err = esp_wifi_sta_get_ap_info(&ap_check);
-            if (ap_err == ESP_OK) {
-                if (!connected) {
-                    ESP_LOGI(TAG, "STA associated after station scan, waiting for DHCP...");
-                    connected = true;
-                }
-                // Continue waiting a bit more for DHCP/stability
-                // The IP event will reset retry counters
-                if (wait > 30) {  // After 3s of being associated, assume stable enough
-                    ESP_LOGI(TAG, "STA connection stabilized after station scan");
-                    break;
-                }
-            } else {
-                connected = false;  // Re-check if we need to reconnect
+            if (esp_wifi_sta_get_ap_info(&ap_check) == ESP_OK) {
+                connected = true;
+                ESP_LOGI(TAG, "STA associated, DHCP will complete via event handler");
+                break;
             }
         }
-        
+
         if (!connected) {
-            ESP_LOGW(TAG, "STA reconnection after station scan timed out - disconnect handler will retry");
-        } else {
-            // Explicitly force DHCP client restart to ensure IP assignment
-            // This fixes an issue where the device reconnects but fails to get an IP address
-            esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-            if (netif) {
-                ESP_LOGI(TAG, "Explicitly starting DHCP client after scan reconnect (netif=%p)", netif);
-                esp_netif_dhcpc_stop(netif); // Ensure clean state
-                esp_netif_dhcpc_start(netif);
-            } else {
-                ESP_LOGE(TAG, "Failed to get WIFI_STA_DEF netif handle - cannot restart DHCP");
-            }
+            ESP_LOGW(TAG, "STA reconnect timed out - disconnect handler will retry");
         }
-    } else {
-        // If we weren't connected, just clear the flag now
-        station_scan_active = false;
     }
-    
-    ESP_LOGI(TAG, "Station scan complete, cleared scan_active flag");
+
+    ESP_LOGI(TAG, "Station scan complete");
 }
 
 const char* wifi_scan_get_station_results() {

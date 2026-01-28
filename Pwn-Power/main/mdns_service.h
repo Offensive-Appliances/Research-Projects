@@ -34,4 +34,9 @@ const char* mdns_service_get_hostname(void);
  */
 bool mdns_service_is_initialized(void);
 
+/**
+ * @brief Force mDNS refresh/re-announce
+ */
+void mdns_service_refresh(void);
+
 #endif // MDNS_SERVICE_H

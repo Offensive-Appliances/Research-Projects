@@ -78,7 +78,7 @@ If you experience issues, try `idf.py fullclean` first.
 
 ### Direct AP Connection
 1. Connect to the `PwnPower` WiFi network (default password: `password`)
-2. Open `192.168.4.1` in your browser
+2. Open `192.168.66.1` in your browser
 
 ### Home Network Connection (mDNS)
 1. Connect to PwnPower AP and open the web UI

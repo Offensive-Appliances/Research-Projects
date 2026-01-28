@@ -576,9 +576,28 @@
                             </div>
                             <div class="btn-group">
                                 <button class="btn" onclick="triggerBgScan()">Scan Now</button>
-                                <button class="btn" onclick="downloadReport()">Download Report</button>
                             </div>
                         </div>
+
+                        <!-- Export: Visual Summary -->
+                        <div class="card export-card visual">
+                            <h4>Visual Summary</h4>
+                            <div class="muted">Combined charts & stats image</div>
+                            <button id="btn-export-visual" class="btn btn-primary btn-block">Download Image</button>
+                        </div>
+
+                        <!-- Export: Raw Data -->
+                        <div class="card export-card">
+                            <h4>Raw Datasets</h4>
+                            <div class="muted">Full JSON data exports</div>
+                            <div class="export-list">
+                                <button id="btn-export-scan" class="btn btn-sm btn-outline">Scan Data (.json)</button>
+                                <button id="btn-export-sys" class="btn btn-sm btn-outline">System Info (.json)</button>
+                                <button id="btn-export-intel" class="btn btn-sm btn-outline">Intelligence
+                                    (.json)</button>
+                            </div>
+                        </div>
+
                         <div class="card">
                             <h4>Scan Settings</h4>
                             <div style="display:flex;flex-direction:column;gap:10px;">
@@ -732,3 +751,12 @@
                             <div class="muted">Educational purposes only</div>
                         </div>
                     </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+
+</html>

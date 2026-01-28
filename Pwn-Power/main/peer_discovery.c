@@ -67,7 +67,9 @@ static char s_hostname[PEER_HOSTNAME_MAX_LEN] = "pwnpower";
 static char s_ap_ssid[PEER_HOSTNAME_MAX_LEN] = "PwnPower";  // AP SSID (different from mDNS hostname)
 static uint32_t s_boot_time = 0;
 static bool s_found_other_aps = false;  // True if we detected other PwnPower APs via WiFi scan
-static uint32_t s_last_ap_scan = 0;
+static uint32_t s_last_pwnpower_ap_seen = 0;
+#define PWNPOWER_AP_TIMEOUT_SEC 300 // 5 minutes without seeing AP -> revert to Leader
+
 
 // Forward declarations
 static void discovery_task(void *arg);
@@ -379,7 +381,6 @@ static void notify_event(peer_event_type_t event, const peer_info_t *peer) {
 static void discovery_task(void *arg) {
     uint32_t last_announce = 0;
     uint32_t last_cleanup = 0;
-    uint32_t last_ap_scan = 0;
     
     while (s_running) {
         uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
@@ -398,14 +399,20 @@ static void discovery_task(void *arg) {
             last_cleanup = now;
         }
         
-        // Periodic scan for other PwnPower APs (when not finding peers via UDP)
-        // This helps detect other PwnPower devices even when not on the same network
-        if (now - last_ap_scan >= PEER_AP_SCAN_INTERVAL_MS) {
-            // Only scan if we haven't found peers via UDP and no other scan is running
-            if (s_peer_count <= 1 && !wifi_scan_is_in_progress() && !wifi_scan_is_station_scan_active()) {
-                peer_discovery_scan_for_aps();
+        // Periodic scan for other PwnPower APs is now handled by system background scans
+        // We just check for timeout here
+        if (s_found_other_aps) {
+            if (now - s_last_pwnpower_ap_seen > PWNPOWER_AP_TIMEOUT_SEC) {
+                ESP_LOGI(TAG, "No PwnPower AP seen for %d seconds - reverting to Leader", PWNPOWER_AP_TIMEOUT_SEC);
+                s_found_other_aps = false;
+                if (s_peer_count <= 1) {
+                    s_current_role = PEER_ROLE_LEADER;
+                    s_self.role = PEER_ROLE_LEADER;
+                    update_hostname();
+                    update_ap_ssid();
+                    notify_event(PEER_EVENT_ROLE_CHANGED, &s_self);
+                }
             }
-            last_ap_scan = now;
         }
         
         // Check for incoming messages
@@ -655,83 +662,11 @@ static void update_ap_ssid(void) {
     ESP_LOGI(TAG, "AP SSID updated to: %s", s_ap_ssid);
 }
 
-void peer_discovery_scan_for_aps(void) {
-    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-    
-    // Rate limit scanning
-    if (now - s_last_ap_scan < PEER_AP_SCAN_INTERVAL_MS) {
-        return;
-    }
-    s_last_ap_scan = now;
-    
-    ESP_LOGI(TAG, "Scanning for other PwnPower APs...");
-    
-    // Configure and start WiFi scan
-    wifi_scan_config_t scan_config = {
-        .ssid = NULL,
-        .bssid = NULL,
-        .channel = 0,
-        .show_hidden = false,
-        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
-        .scan_time.active.min = 100,
-        .scan_time.active.max = 300,
-    };
-    
-    // Don't scan if another scan is already in progress
-    if (wifi_scan_is_in_progress() || wifi_scan_is_station_scan_active()) {
-        ESP_LOGD(TAG, "Skipping AP scan - another scan in progress");
-        return;
-    }
-    
-    // Check WiFi state before scanning
-    wifi_mode_t mode;
-    if (esp_wifi_get_mode(&mode) != ESP_OK) {
-        return;
-    }
-
-    // If we are in STA mode (or APSTA) and don't have an IP, we are likely connecting/disconnected.
-    // Scanning now would interfere with the connection attempt (WIFI_EVENT_STA_DISCONNECTED loops).
-    // Only scan if we are stable (have IP) or in AP-only mode.
-    if ((mode == WIFI_MODE_STA || mode == WIFI_MODE_APSTA) && get_device_ip() == 0) {
-        ESP_LOGD(TAG, "Skipping AP scan - STA is enabled but not connected (avoiding interference)");
-        return;
-    }
-    
-    esp_err_t err = esp_wifi_scan_start(&scan_config, true);  // Blocking scan
-    if (err != ESP_OK) {
-        ESP_LOGD(TAG, "WiFi scan deferred: %s", esp_err_to_name(err));
-        return;
-    }
-    
-    uint16_t ap_count = 0;
-    esp_wifi_scan_get_ap_num(&ap_count);
-    
-    if (ap_count == 0) {
-        ESP_LOGI(TAG, "No APs found in scan");
-        s_found_other_aps = false;
-        return;
-    }
-    
-    // Limit to reasonable number
-    if (ap_count > 20) ap_count = 20;
-    
-    wifi_ap_record_t *ap_records = malloc(sizeof(wifi_ap_record_t) * ap_count);
-    if (!ap_records) {
-        ESP_LOGE(TAG, "Failed to allocate memory for AP records");
-        esp_wifi_scan_get_ap_records(&ap_count, NULL);  // Clear scan results
-        return;
-    }
-    
-    err = esp_wifi_scan_get_ap_records(&ap_count, ap_records);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to get AP records: %s", esp_err_to_name(err));
-        free(ap_records);
-        return;
-    }
-    
-    // Check for other PwnPower APs
+void peer_discovery_process_scan_results(const void *aps, uint16_t count) {
+    const wifi_ap_record_t *ap_records = (const wifi_ap_record_t *)aps;
     bool found_other = false;
-    for (int i = 0; i < ap_count; i++) {
+    
+    for (int i = 0; i < count; i++) {
         const char *ssid = (const char *)ap_records[i].ssid;
         
         // Check if SSID starts with "PwnPower"
@@ -741,38 +676,42 @@ void peer_discovery_scan_for_aps(void) {
             esp_wifi_get_mac(WIFI_IF_AP, our_ap_mac);
             
             if (memcmp(ap_records[i].bssid, our_ap_mac, 6) != 0) {
-                ESP_LOGI(TAG, "Found another PwnPower AP: %s (BSSID: %02x:%02x:%02x:%02x:%02x:%02x)",
+                // Determine if this is a leader or follower AP
+                bool is_leader_ap = (strcmp(ssid, "PwnPower") == 0);
+                
+                ESP_LOGD(TAG, "Found PwnPower AP (%s): %s (BSSID: %02x:%02x:%02x:%02x:%02x:%02x)",
+                         is_leader_ap ? "Leader" : "Follower",
                          ssid,
                          ap_records[i].bssid[0], ap_records[i].bssid[1],
                          ap_records[i].bssid[2], ap_records[i].bssid[3],
                          ap_records[i].bssid[4], ap_records[i].bssid[5]);
+                         
                 found_other = true;
                 break;
             }
         }
     }
-    
-    free(ap_records);
-    
-    // Update state if changed
-    if (found_other != s_found_other_aps) {
-        s_found_other_aps = found_other;
+
+    if (found_other) {
+        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+        s_last_pwnpower_ap_seen = now;
         
-        if (found_other) {
-            ESP_LOGI(TAG, "Other PwnPower AP detected - switching to follower SSID");
+        if (!s_found_other_aps) {
+            ESP_LOGI(TAG, "External scan found PwnPower AP - switching to follower SSID");
+            s_found_other_aps = true;
             s_current_role = PEER_ROLE_FOLLOWER;
             s_self.role = PEER_ROLE_FOLLOWER;
-        } else {
-            ESP_LOGI(TAG, "No other PwnPower APs - can use primary SSID");
-            // Only become leader if no UDP peers either
-            if (s_peer_count <= 1) {
-                s_current_role = PEER_ROLE_LEADER;
-                s_self.role = PEER_ROLE_LEADER;
-            }
+            update_hostname();
+            update_ap_ssid();
+            notify_event(PEER_EVENT_ROLE_CHANGED, &s_self);
         }
-        
-        update_hostname();
-        update_ap_ssid();
-        notify_event(PEER_EVENT_ROLE_CHANGED, &s_self);
     }
+}
+
+void peer_discovery_scan_for_aps(void) {
+    // Manual scan deprecated in favor of system background scans
+    // This function now just triggers a background scan if possible
+    #include "background_scan.h"
+    ESP_LOGI(TAG, "Triggering background scan for peer discovery");
+    background_scan_trigger();
 }

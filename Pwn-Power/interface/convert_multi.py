@@ -34,10 +34,10 @@ def generate_web_bundle():
     html = (script_dir / 'index_new.html').read_text(encoding='utf-8')
     css = (script_dir / 'styles.css').read_text(encoding='utf-8')
     charts_js = (script_dir / 'charts.js').read_text(encoding='utf-8')
+    export_js = (script_dir / 'export_manager.js').read_text(encoding='utf-8')
     js = (script_dir / 'app.js').read_text(encoding='utf-8')
-    csv_js = (script_dir / 'csv_generator.js').read_text(encoding='utf-8')
 
-    combined_js = charts_js + '\n\n' + csv_js + '\n\n' + js
+    combined_js = charts_js + '\n\n' + export_js + '\n\n' + js
     combined_html = inline_assets(html, css, combined_js)
     print(f"Combined size before gzip: {len(combined_html)} bytes")
     compressed = gzip.compress(combined_html.encode('utf-8'), compresslevel=9)

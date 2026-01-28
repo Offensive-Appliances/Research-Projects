@@ -22,6 +22,7 @@ idf_component_register(
         "tls_cert.c"
         "recovery.c"
         "peer_discovery.c"
+        "firmware_info.c"
     INCLUDE_DIRS
         "."
     EMBED_FILES

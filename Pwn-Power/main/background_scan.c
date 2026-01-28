@@ -12,6 +12,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include "peer_discovery.h"
+
 
 // External variables for channel tracking
 
@@ -177,6 +179,9 @@ static void populate_scan_record(scan_record_t *record) {
         }
         
         if (esp_wifi_scan_get_ap_records(&ap_count, ap_list) == ESP_OK) {
+            // Process scan results for Peer Discovery
+            peer_discovery_process_scan_results(ap_list, ap_count);
+
             // Collect RSSI values for filtering
             int8_t *rssi_values = malloc(sizeof(int8_t) * ap_count);
             if (rssi_values) {

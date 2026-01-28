@@ -196,6 +196,7 @@ async function fetchJSON(url, opts = {}) {
 
 function initApp() {
     initPrivacyMode();
+    if (window.ExportManager) ExportManager.init();
 
     // Fire initial data loads in parallel to reduce blocking
     Promise.all([

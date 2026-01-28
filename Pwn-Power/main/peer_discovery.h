@@ -131,7 +131,19 @@ const char* peer_discovery_get_ap_ssid(void);
  * @brief Scan for other PwnPower APs and update role if needed
  * Called periodically when not connected to a home network
  */
+/**
+ * @brief Scan for other PwnPower APs and update role if needed
+ * Called periodically when not connected to a home network
+ */
 void peer_discovery_scan_for_aps(void);
+
+/**
+ * @brief Process scan results from external modules (wifi_scan, background_scan)
+ * Used to detect other PwnPower APs without initiating a dedicated scan
+ * @param aps Array of found AP records
+ * @param count Number of AP records
+ */
+void peer_discovery_process_scan_results(const void *aps, uint16_t count);
 
 /**
  * @brief Check if we detected other PwnPower APs via WiFi scanning

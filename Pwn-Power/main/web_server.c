@@ -34,6 +34,10 @@
 #include <time.h>
 #include <string.h>
 #include "peer_discovery.h"
+#include "firmware_info.h"
+#include "esp_chip_info.h"
+#include "esp_ota_ops.h"
+#include "esp_system.h"
 
 extern const uint8_t _binary_web_content_gz_h_start[] asm("_binary_web_content_gz_h_start");
 extern const uint8_t _binary_web_content_gz_h_end[] asm("_binary_web_content_gz_h_end");
@@ -192,6 +196,40 @@ static esp_err_t auth_status_handler(httpd_req_t *req) {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddBoolToObject(root, "authorized", ok);
     cJSON_AddBoolToObject(root, "has_password", strlen(s_ui_password) > 0);
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json);
+    cJSON_free(json);
+    return ESP_OK;
+}
+
+static esp_err_t system_info_handler(httpd_req_t *req) {
+    update_last_request_time();
+
+    cJSON *root = cJSON_CreateObject();
+    
+    // Firmware Info
+    cJSON_AddStringToObject(root, "app_name", firmware_get_name());
+    cJSON_AddStringToObject(root, "version", firmware_get_version());
+    cJSON_AddStringToObject(root, "build_date", firmware_get_build_date());
+    cJSON_AddStringToObject(root, "target", firmware_get_target());
+
+    // Hardware/System Info
+    esp_chip_info_t chip_info;
+    esp_chip_info(&chip_info);
+    cJSON_AddStringToObject(root, "idf_version", esp_get_idf_version());
+    cJSON_AddNumberToObject(root, "chip_revision", (double)chip_info.revision);
+    cJSON_AddNumberToObject(root, "cpu_cores", (double)chip_info.cores);
+    
+    // Memory Info
+    cJSON_AddNumberToObject(root, "heap_free", (double)esp_get_free_heap_size());
+    cJSON_AddNumberToObject(root, "heap_min_free", (double)esp_get_minimum_free_heap_size());
+    
+    // Uptime
+    cJSON_AddNumberToObject(root, "uptime_sec", (double)(esp_timer_get_time() / 1000000ULL));
+
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
 
@@ -555,11 +593,24 @@ static esp_err_t index_handler(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     httpd_resp_set_hdr(req, "ETag", "\"pwn-v1\"");
 
-    esp_err_t ret = httpd_resp_send(req, WEB_UI_GZ, WEB_UI_GZ_SIZE);
+    // Send UI in 4KB chunks to reduce memory pressure
+    const size_t chunk_size = 4096;
+    size_t sent = 0;
+    esp_err_t ret = ESP_OK;
 
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "UI send failed: %s", esp_err_to_name(ret));
+    while (sent < WEB_UI_GZ_SIZE) {
+        size_t len = WEB_UI_GZ_SIZE - sent;
+        if (len > chunk_size) len = chunk_size;
+        ret = httpd_resp_send_chunk(req, WEB_UI_GZ + sent, len);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "UI chunk send failed: %s", esp_err_to_name(ret));
+            return ret;
+        }
+        sent += len;
     }
+
+    // Terminate chunked response
+    httpd_resp_send_chunk(req, NULL, 0);
     ESP_LOGD(TAG, "ROOT end heap=%lu", (unsigned long)esp_get_free_heap_size());
 
     return ret;
@@ -572,7 +623,24 @@ static esp_err_t login_page_handler(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     
-    esp_err_t ret = httpd_resp_send(req, LOGIN_UI_GZ, LOGIN_UI_GZ_SIZE);
+    // Send Login UI in 4KB chunks
+    const size_t chunk_size = 4096;
+    size_t sent = 0;
+    esp_err_t ret = ESP_OK;
+
+    while (sent < LOGIN_UI_GZ_SIZE) {
+        size_t len = LOGIN_UI_GZ_SIZE - sent;
+        if (len > chunk_size) len = chunk_size;
+        ret = httpd_resp_send_chunk(req, LOGIN_UI_GZ + sent, len);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Login UI chunk send failed: %s", esp_err_to_name(ret));
+            return ret;
+        }
+        sent += len;
+    }
+
+    // Terminate chunked response
+    httpd_resp_send_chunk(req, NULL, 0);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Login page send failed: %s", esp_err_to_name(ret));
     }
@@ -2520,6 +2588,7 @@ static esp_err_t register_routes(httpd_handle_t server) {
     register_authed(server, "/intelligence", HTTP_GET, intelligence_handler);
     register_authed(server, "/devices/presence", HTTP_GET, device_presence_handler);
     register_authed(server, "/intelligence/unified", HTTP_GET, unified_intelligence_handler);
+    register_authed(server, "/system/info", HTTP_GET, system_info_handler);
 
     register_authed(server, "/ap/config", HTTP_GET, ap_config_get_handler);
     register_authed(server, "/ap/config", HTTP_POST, ap_config_set_handler);

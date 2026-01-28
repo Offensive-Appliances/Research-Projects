@@ -1534,3 +1534,50 @@ body.privacy-mode .privacy-indicator {
 header {
     position: relative;
 }
+
+/* Export Cards */
+.export-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    gap: 8px;
+}
+
+.export-card h4 {
+    margin-bottom: 2px;
+}
+
+.export-icon {
+    font-size: 32px;
+    margin: 8px 0;
+}
+
+.export-list {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    gap: 8px;
+}
+
+.btn-block {
+    width: 100%;
+    justify-content: center;
+}
+
+.btn-outline {
+    background: transparent;
+    border: 1px solid var(--border-color);
+    color: var(--text-muted);
+}
+
+.btn-outline:hover {
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--text-primary);
+    border-color: var(--text-primary);
+}
+
+.btn-sm {
+    padding: 6px 12px;
+    font-size: 12px;
+}
