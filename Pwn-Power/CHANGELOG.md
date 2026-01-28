@@ -37,6 +37,7 @@
 - Improved server socket exhaustion
 - Changed SoftAP IP to 192.168.66.1 to prevent conflicts with STA connection
 - Changed history samples to use absolute time instead of relative time
+- Fixed issue where old samples would 'disappear' after a while
 
 ## v1.0
 

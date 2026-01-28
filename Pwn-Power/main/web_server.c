@@ -1973,19 +1973,30 @@ static esp_err_t history_samples_handler(httpd_req_t *req) {
                 continue;
             }
 
-            // Compact array format: [epoch_ts, ap_count, client_count, [channels], [[hash,count],...]]
-            static char buf[256];
+            // Channel data: [[ids],[counts]]
+            char ch_buf[128];
+            int p = 0;
+            p += snprintf(ch_buf + p, sizeof(ch_buf) - p, "[[");
+            int count = 0;
+            for(int k=0; k<7; k++) {
+                if(chunk[i].top_channels[k] == 0) break;
+                count++;
+                p += snprintf(ch_buf + p, sizeof(ch_buf) - p, "%s%u", k==0?"":",", chunk[i].top_channels[k]);
+            }
+            p += snprintf(ch_buf + p, sizeof(ch_buf) - p, "],[");
+            for(int k=0; k<count; k++) {
+                p += snprintf(ch_buf + p, sizeof(ch_buf) - p, "%s%u", k==0?"":",", chunk[i].top_counts[k]);
+            }
+            p += snprintf(ch_buf + p, sizeof(ch_buf) - p, "]]");
+
+            static char buf[300];
             int written = snprintf(buf, sizeof(buf),
-                "%s[%lu,%u,%u,[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u],[",
+                "%s[%lu,%u,%u,%s,[",
                 first ? "" : ",",
                 (unsigned long)epoch_ts,
                 chunk[i].ap_count,
                 chunk[i].client_count,
-                chunk[i].channel_counts[0], chunk[i].channel_counts[1], chunk[i].channel_counts[2],
-                chunk[i].channel_counts[3], chunk[i].channel_counts[4], chunk[i].channel_counts[5],
-                chunk[i].channel_counts[6], chunk[i].channel_counts[7], chunk[i].channel_counts[8],
-                chunk[i].channel_counts[9], chunk[i].channel_counts[10], chunk[i].channel_counts[11],
-                chunk[i].channel_counts[12]);
+                ch_buf);
             if (written <= 0 || written >= (int)sizeof(buf)) {
                 free(chunk);
                 httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "History JSON buffer overflow");

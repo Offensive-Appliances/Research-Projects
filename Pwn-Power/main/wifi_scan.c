@@ -56,8 +56,8 @@ static volatile uint32_t s_hidden_ap_count = 0;
 static volatile uint32_t s_probe_request_count = 0;
 
 // Smart channel weighting system
-uint32_t channel_scan_counts[14] = {0};     // Times each channel was scanned
-uint32_t channel_discovery_counts[14] = {0}; // Devices found per channel
+uint32_t channel_scan_counts[MAX_CHANNEL_ID + 1] = {0};     // Times each channel was scanned
+uint32_t channel_discovery_counts[MAX_CHANNEL_ID + 1] = {0}; // Devices found per channel
 uint32_t last_channel_update = 0;
 
 #define CHANNEL_LEARNING_RATE 0.2f
@@ -355,7 +355,7 @@ uint32_t get_channel_dwell_time(uint8_t channel, bool is_background_scan) {
 }
 
 void update_channel_activity(uint8_t channel, uint32_t devices_found, int8_t *rssi_values, uint32_t rssi_count) {
-    if (channel < 1 || channel > 13) return;
+    if (channel < 1 || channel > MAX_CHANNEL_ID) return;
     
     // Apply RSSI cutoff threshold - only count devices within useful range
     uint32_t valid_devices = 0;
@@ -384,7 +384,7 @@ static void maintain_channel_learning(void) {
     // Reset counters if they get too old (every 24 hours)
     if (now - last_channel_update > 86400) {
         // Decay the discovery counts slightly to adapt to changes
-        for (int ch = 1; ch <= 13; ch++) {
+        for (int ch = 1; ch <= MAX_CHANNEL_ID; ch++) {
             channel_discovery_counts[ch] = (uint32_t)(channel_discovery_counts[ch] * 0.8);
             channel_scan_counts[ch] = (uint32_t)(channel_scan_counts[ch] * 0.8);
         }
@@ -1320,13 +1320,13 @@ void wifi_scan_stations() {
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_promiscuous_rx_cb(stations_sniffer);
 
-    uint32_t scan_time_ms = 4000;
-    uint32_t dwell_time_ms = 200;
+    uint32_t scan_time_ms = 2500; // Reduced from 4000ms for responsiveness
+    uint32_t dwell_time_ms = 125; // Reduced from 200ms (standard beacon interval is 100ms)
     int ch_count = known_channel_count > 0 ? known_channel_count : (int)get_scan_channels_size();
     const uint8_t* channels = get_scan_channels();
     uint32_t iterations = scan_time_ms / (dwell_time_ms * (uint32_t)ch_count);
     if (iterations == 0) iterations = 1;
-    if (iterations > 8) iterations = 8;
+    if (iterations > 4) iterations = 4; // Cap at 4 iterations (was 8)
     for (uint32_t iter = 0; iter < iterations; iter++) {
         for (int i = 0; i < ch_count; i++) {
             uint8_t ch = (known_channel_count > 0) ? known_ap_channels[i] : channels[i];
@@ -1355,6 +1355,11 @@ void wifi_scan_stations() {
         
         // Give WiFi stack time to fully restore mode
         vTaskDelay(pdMS_TO_TICKS(300));
+        
+        // CRITICAL: Clear flag BEFORE connecting so that if connection fails/disconnects,
+        // the disconnect handler knows it can safely retry (instead of thinking scan is active)
+        // This fixes the issue where a failed reconnect was ignored due to "Station scan in progress"
+        station_scan_active = false;
         
         esp_wifi_connect();
         
@@ -1398,10 +1403,11 @@ void wifi_scan_stations() {
                 ESP_LOGE(TAG, "Failed to get WIFI_STA_DEF netif handle - cannot restart DHCP");
             }
         }
+    } else {
+        // If we weren't connected, just clear the flag now
+        station_scan_active = false;
     }
     
-    // Now safe to clear - either connected or disconnect handler will take over
-    station_scan_active = false;
     ESP_LOGI(TAG, "Station scan complete, cleared scan_active flag");
 }
 

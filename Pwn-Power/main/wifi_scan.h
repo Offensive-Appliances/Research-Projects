@@ -58,10 +58,11 @@ void update_channel_activity(uint8_t channel, uint32_t devices_found, int8_t *rs
 
 // Channel weighting constants
 #define RSSI_CUTOFF_THRESHOLD -85  // Ignore networks weaker than -85 dBm
+#define MAX_CHANNEL_ID 200
 
 // Channel tracking variables (shared with background_scan)
-extern uint32_t channel_scan_counts[14];
-extern uint32_t channel_discovery_counts[14];
+extern uint32_t channel_scan_counts[MAX_CHANNEL_ID + 1];
+extern uint32_t channel_discovery_counts[MAX_CHANNEL_ID + 1];
 extern uint32_t last_channel_update;
 
 // Memory management

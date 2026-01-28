@@ -12,7 +12,7 @@ typedef struct httpd_req httpd_req_t;
 
 #define SCAN_STORAGE_PARTITION "scandata"
 #define SCAN_MAGIC 0x50574E53  // "PWNS"
-#define SCAN_VERSION 3
+#define SCAN_VERSION 4
 #define MAX_APS_PER_SCAN 32
 #define MAX_STATIONS_PER_AP 8
 #define MAX_SCAN_HISTORY 1
@@ -95,7 +95,8 @@ typedef struct __attribute__((packed)) {
     uint8_t flags;                 // bit0=time_valid, bits1-3=ssid_count (0-6), bits4-7=reserved
     uint8_t ap_count;
     uint8_t client_count;          // clamped to 255
-    uint8_t channel_counts[13];    // ap count per channel 1-13
+    uint8_t top_channels[7];       // Channel IDs of the top 7 most congested channels
+    uint8_t top_counts[7];         // Device counts for the top 7 channels
     ssid_client_entry_t ssid_clients[MAX_SSID_CLIENTS_PER_SAMPLE];
 } history_sample_t;
 

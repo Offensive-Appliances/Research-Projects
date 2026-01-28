@@ -14,8 +14,7 @@
 #include <time.h>
 
 // External variables for channel tracking
-extern uint32_t channel_scan_counts[14];
-extern uint32_t channel_discovery_counts[14];
+
 extern void update_channel_activity(uint8_t channel, uint32_t devices_found, int8_t *rssi_values, uint32_t rssi_count);
 
 extern bool pwnpower_time_is_synced(void);
@@ -143,7 +142,12 @@ static void populate_scan_record(scan_record_t *record) {
 
     uint8_t ap_idx = 0;
     
-    for (uint8_t ch = 1; ch <= 13 && ap_idx < MAX_APS_PER_SCAN; ch++) {
+    // Use dynamic channel list
+    const uint8_t *channels = get_scan_channels();
+    size_t channel_count = get_scan_channels_size();
+    
+    for (size_t i = 0; i < channel_count && ap_idx < MAX_APS_PER_SCAN; i++) {
+        uint8_t ch = channels[i];
         // Get smart dwell time for this channel
         uint32_t dwell_time = get_background_channel_dwell_time(ch);
         
@@ -271,9 +275,22 @@ static void populate_scan_record(scan_record_t *record) {
     esp_wifi_set_promiscuous_rx_cb(promisc_cb);
     esp_wifi_set_promiscuous(true);
     
-    for (uint8_t ch = 1; ch <= 13; ch++) {
-        esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
-        vTaskDelay(pdMS_TO_TICKS(1000));
+    // Use dynamic channel list for promiscuous hopping
+    channels = get_scan_channels();
+    channel_count = get_scan_channels_size();
+    
+    // Safety timeout
+    uint32_t scan_start_sec = get_uptime_sec();
+    
+    for (size_t i = 0; i < channel_count; i++) {
+        // Watchdog check
+        if ((get_uptime_sec() - scan_start_sec) > 45) {
+            ESP_LOGW(TAG, "Background scan station phase timed out - aborting");
+            break;
+        }
+
+        esp_wifi_set_channel(channels[i], WIFI_SECOND_CHAN_NONE);
+        vTaskDelay(pdMS_TO_TICKS(250)); 
     }
     
     esp_wifi_set_promiscuous(false);
@@ -297,7 +314,8 @@ static void populate_scan_record(scan_record_t *record) {
         // Wait for connection to stabilize before clearing scan flag
         // This prevents the disconnect handler from racing with us
         bool connected = false;
-        for (int wait = 0; wait < 100; wait++) {  // 10 seconds max
+        // Reduced wait time since we're not blocking the whole system as hard
+        for (int wait = 0; wait < 60; wait++) {  // 6 seconds max
             vTaskDelay(pdMS_TO_TICKS(100));
             
             wifi_ap_record_t ap_check;
@@ -307,8 +325,8 @@ static void populate_scan_record(scan_record_t *record) {
                     ESP_LOGI(TAG, "STA associated after background scan, waiting for DHCP...");
                     connected = true;
                 }
-                // After 3s of being associated, assume stable enough
-                if (wait > 30) {
+                // After 2s of being associated, assume stable enough
+                if (wait > 20) {
                     ESP_LOGI(TAG, "STA connection stabilized after background scan");
                     break;
                 }
@@ -430,7 +448,7 @@ static void background_scan_task(void *arg) {
         history_sample_t sample;
         memset(&sample, 0, sizeof(sample));
         
-        uint32_t base_epoch = 0; // Removed usage
+
 
         bool save_history = (record->header.time_valid && record->header.epoch_ts > 0);
         if (save_history) {
@@ -444,10 +462,45 @@ static void background_scan_task(void *arg) {
             sample.client_count = 0;
         }
         
+        uint8_t ch_counts[MAX_CHANNEL_ID + 1] = {0};
         for (uint8_t i = 0; i < record->header.ap_count; i++) {
             uint8_t ch = record->aps[i].channel;
-            if (ch >= 1 && ch <= 13) {
-                sample.channel_counts[ch - 1]++;
+            if (ch <= MAX_CHANNEL_ID) {
+                ch_counts[ch]++;
+            }
+        }
+
+        typedef struct { uint8_t ch; uint8_t count; } ch_count_t;
+        ch_count_t sorted_ch[MAX_CHANNEL_ID + 1];
+        int ch_idx = 0;
+        
+        for (int c = 1; c <= MAX_CHANNEL_ID; c++) {
+             if (ch_counts[c] > 0) {
+                 sorted_ch[ch_idx].ch = c;
+                 sorted_ch[ch_idx].count = ch_counts[c];
+                 ch_idx++;
+             }
+        }
+        
+        // Sort by count descending
+        for (int i = 0; i < ch_idx - 1; i++) {
+            for (int j = i + 1; j < ch_idx; j++) {
+                if (sorted_ch[j].count > sorted_ch[i].count) {
+                    ch_count_t tmp = sorted_ch[i];
+                    sorted_ch[i] = sorted_ch[j];
+                    sorted_ch[j] = tmp;
+                }
+            }
+        }
+        
+        // Store top 7
+        for (int i = 0; i < 7; i++) {
+            if (i < ch_idx) {
+                sample.top_channels[i] = sorted_ch[i].ch;
+                sample.top_counts[i] = sorted_ch[i].count;
+            } else {
+                sample.top_channels[i] = 0;
+                sample.top_counts[i] = 0;
             }
         }
         

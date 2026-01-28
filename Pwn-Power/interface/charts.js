@@ -1067,18 +1067,24 @@ function renderCharts(samples, timeRange = null) {
             // Build series only for active channels
             const series = [];
             const windowSize = samples.length > 150 ? 7 : (samples.length > 60 ? 5 : (samples.length > 20 ? 3 : 1));
-            activeChannels.forEach(ch => {
-                const channelNum = ch + 1;
+            const sortedChannels = Array.from(activeChannels).sort((a, b) => a - b);
+
+            sortedChannels.forEach(ch => {
+                const channelNum = ch;
                 const data = [];
                 let sum = 0;
 
                 samples.forEach((s, idx) => {
-                    const value = s.channel_counts && s.channel_counts[ch] ? s.channel_counts[ch] : 0;
+                    const value = (s.channel_counts instanceof Map)
+                        ? (s.channel_counts.get(ch) || 0)
+                        : (s.channel_counts && s.channel_counts[ch] ? s.channel_counts[ch] : 0); // fallback if somehow not map
+
                     sum += value;
                     if (idx >= windowSize) {
-                        const prev = samples[idx - windowSize].channel_counts && samples[idx - windowSize].channel_counts[ch]
-                            ? samples[idx - windowSize].channel_counts[ch]
-                            : 0;
+                        const prevSample = samples[idx - windowSize];
+                        const prev = (prevSample.channel_counts instanceof Map)
+                            ? (prevSample.channel_counts.get(ch) || 0)
+                            : (prevSample.channel_counts && prevSample.channel_counts[ch] ? prevSample.channel_counts[ch] : 0);
                         sum -= prev;
                     }
 
@@ -1094,7 +1100,7 @@ function renderCharts(samples, timeRange = null) {
 
                 series.push({
                     label: `Ch ${channelNum}`,
-                    color: CHANNEL_COLORS[ch],
+                    color: CHANNEL_COLORS[(channelNum - 1) % CHANNEL_COLORS.length] || '#888',
                     data: data
                 });
             });
@@ -1114,13 +1120,13 @@ async function loadHistoryCharts(days) {
     // For 'from-start', fetch all available data (use large days value)
     const fetchDays = days === 'from-start' ? 365 : days;
     const data = await fetchJSON(`/history/samples?days=${fetchDays}`);
-    
+
     // Parse compact format: {"s":[[epoch,ap,cli,[channels],[[hash,cnt],...]],...]}
     // parseCompactHistorySamples is defined in app.js and converts to object format
-    const samples = (typeof parseCompactHistorySamples === 'function') 
+    const samples = (typeof parseCompactHistorySamples === 'function')
         ? parseCompactHistorySamples(data)
         : (data && data.samples ? data.samples : []);
-    
+
     if (!samples || samples.length === 0) {
         showToast('No history data available yet');
         drawNoDataOnCanvas('#activity-chart');
@@ -1151,8 +1157,8 @@ async function loadHistoryCharts(days) {
             desc.textContent = days === 1
                 ? 'Network activity charts (last 24 hours)'
                 : days < 1
-                ? `Network activity charts (last ${Math.round(days * 24)} hours)`
-                : `Network activity charts (last ${days} days)`;
+                    ? `Network activity charts (last ${Math.round(days * 24)} hours)`
+                    : `Network activity charts (last ${days} days)`;
         }
     }
 

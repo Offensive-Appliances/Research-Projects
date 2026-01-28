@@ -38,7 +38,24 @@ function parseCompactHistorySamples(data) {
         epoch_ts: arr[0],
         ap_count: arr[1],
         client_count: arr[2],
-        channel_counts: arr[3],
+        channel_counts: (() => {
+            const data = arr[3];
+            const map = new Map();
+            if (Array.isArray(data) && data.length === 2 && Array.isArray(data[0]) && Array.isArray(data[1])) {
+                // New sparse format: [[ids], [counts]]
+                const ids = data[0];
+                const counts = data[1];
+                for (let i = 0; i < ids.length; i++) {
+                    map.set(ids[i], counts[i]);
+                }
+            } else if (Array.isArray(data)) {
+                // Legacy sparse format or old [c1...c13] format
+                data.forEach((cnt, idx) => {
+                    if (cnt > 0) map.set(idx + 1, cnt);
+                });
+            }
+            return map;
+        })(),
         ssid_clients: (arr[4] || []).map(sc => ({ hash: sc[0], count: sc[1] })),
         time_valid: arr[0] > 0
     }));
