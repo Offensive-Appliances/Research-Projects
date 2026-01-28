@@ -28,6 +28,8 @@
 #include "recovery.h"
 #include <time.h>
 #include "lwip/ip4_addr.h"
+#include "lwip/netdb.h"
+#include "lwip/dns.h"
 #include "peer_discovery.h"
 
 #define TAG "PwnPower"
@@ -55,16 +57,41 @@ static const int RETRY_INTERVAL_COUNT = 5;
 static int s_current_retry_interval = 0;
 
 static void pwnpower_sntp_sync_time(void) {
+    // Debug DNS resolution for NTP
+    struct addrinfo hints = {0}, *res;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    int err = getaddrinfo("pool.ntp.org", "123", &hints, &res);
+    if (err != 0) {
+        ESP_LOGE(TAG, "DNS lookup for pool.ntp.org failed: %d", err);
+    } else {
+        struct sockaddr_in *addr = (struct sockaddr_in *)res->ai_addr;
+        uint32_t ip = addr->sin_addr.s_addr;
+        ESP_LOGI(TAG, "DNS lookup for pool.ntp.org success: %d.%d.%d.%d",
+                 (int)(ip & 0xFF), (int)((ip >> 8) & 0xFF),
+                 (int)((ip >> 16) & 0xFF), (int)((ip >> 24) & 0xFF));
+        freeaddrinfo(res);
+    }
+
     if (!esp_sntp_enabled()) {
         esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
         esp_sntp_setservername(0, "pool.ntp.org");
+        esp_sntp_setservername(1, "time.google.com");
+        esp_sntp_setservername(2, "time.windows.com");
         esp_sntp_set_time_sync_notification_cb(pwnpower_time_sync_cb);
         esp_sntp_init();
         s_sntp_started = true;
-        ESP_LOGI(TAG, "SNTP started");
+        ESP_LOGI(TAG, "SNTP started with 3 servers (pool.ntp.org, time.google.com, time.windows.com)");
     } else {
-        esp_sntp_restart();
-        ESP_LOGI(TAG, "SNTP restart requested");
+        s_time_synced = false; // Reset to force re-check
+        esp_sntp_stop(); 
+        esp_sntp_setoperatingmode(SNTP_OPMODE_POLL); // Ensure mode is set
+        esp_sntp_setservername(0, "pool.ntp.org");
+        esp_sntp_setservername(1, "time.google.com");
+        esp_sntp_setservername(2, "time.windows.com");
+        esp_sntp_set_time_sync_notification_cb(pwnpower_time_sync_cb);
+        esp_sntp_init();
+        ESP_LOGI(TAG, "SNTP restarted - checking for time sync...");
     }
 }
 
@@ -97,21 +124,49 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
             return;
         }
         
-        wifi_mode_t current_mode;
-        esp_wifi_get_mode(&current_mode);
-        if (current_mode == WIFI_MODE_STA) {
-            ESP_LOGI(TAG, "Re-enabling AP after disconnect");
-            esp_wifi_set_mode(WIFI_MODE_APSTA);
-        }
+        // NOTE: We no longer re-enable AP here immediately.
+        // Instead, we stay in STA mode during reconnect attempts to avoid channel conflicts.
+        // The AP will be re-enabled:
+        // 1. After successful STA connection (in IP_EVENT_STA_GOT_IP)
+        // 2. After all retry attempts exhausted (below)
+        // 3. By the periodic reconnect task
         
         sta_config_t sta_cfg;
         bool should_retry = (sta_config_get(&sta_cfg) == ESP_OK && sta_cfg.auto_connect);
         if (should_retry && s_retry_num < MAX_RETRY) {
+            // Keep STA mode during reconnect attempts for cleaner channel handling
+            wifi_mode_t current_mode;
+            esp_wifi_get_mode(&current_mode);
+            if (current_mode == WIFI_MODE_APSTA) {
+                ESP_LOGI(TAG, "Temporarily switching to STA mode for reconnect");
+                esp_wifi_set_mode(WIFI_MODE_STA);
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+            
+            vTaskDelay(pdMS_TO_TICKS(2000));  // Increased delay to allow driver to settle
+            esp_wifi_disconnect(); // Ensure clean state before retrying
+            vTaskDelay(pdMS_TO_TICKS(100)); 
             esp_wifi_connect();
             s_retry_num++;
             ESP_LOGI(TAG, "Retry connecting to STA (%d/%d)", s_retry_num, MAX_RETRY);
         } else if (s_retry_num >= MAX_RETRY) {
             ESP_LOGW(TAG, "Failed to connect to STA after %d retries", MAX_RETRY);
+            
+            // Re-enable AP after all retries exhausted so device is accessible
+            // BUT only if we have enough heap - AP creation needs ~8KB
+            wifi_mode_t current_mode;
+            esp_wifi_get_mode(&current_mode);
+            uint32_t free_heap = esp_get_free_heap_size();
+            if (current_mode == WIFI_MODE_STA) {
+                if (free_heap > 15000) {  // Need at least 15KB free to safely enable AP
+                    ESP_LOGI(TAG, "Re-enabling AP after connection failure (heap: %lu)", (unsigned long)free_heap);
+                    esp_wifi_set_mode(WIFI_MODE_APSTA);
+                } else {
+                    ESP_LOGW(TAG, "Skipping AP re-enable - low heap (%lu bytes), would crash", (unsigned long)free_heap);
+                    // Stay in STA mode to conserve memory, will try again on next periodic retry
+                }
+            }
+            
             // Schedule next retry with exponential backoff
             uint32_t interval = RETRY_INTERVALS[s_current_retry_interval];
             s_next_retry_time = s_last_disconnect_time + interval;
@@ -139,10 +194,27 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
             scan_storage_set_home_ssid(sta_cfg.ssid);
 
             if (!sta_cfg.ap_while_connected) {
+                // If user EXPLICITLY disabled AP-while-connected, respect that
                 ESP_LOGI(TAG, "Disabling AP (ap_while_connected=false)");
                 esp_wifi_set_mode(WIFI_MODE_STA);
+            } else {
+                // Default: Keep AP running
+                ESP_LOGI(TAG, "Keeping AP active (ap_while_connected=true)");
+                // No mode change needed, we are already in APSTA
             }
-        }
+                // Re-enable AP if it was disabled during reconnect attempts
+                wifi_mode_t current_mode;
+                esp_wifi_get_mode(&current_mode);
+                if (current_mode == WIFI_MODE_STA) {
+                    uint32_t free_heap = esp_get_free_heap_size();
+                    if (free_heap > 15000) {  // Need at least 15KB free to safely enable AP
+                        ESP_LOGI(TAG, "Re-enabling AP after successful connection (heap: %lu)", (unsigned long)free_heap);
+                        esp_wifi_set_mode(WIFI_MODE_APSTA);
+                    } else {
+                        ESP_LOGW(TAG, "Skipping AP re-enable - low heap (%lu bytes)", (unsigned long)free_heap);
+                    }
+                }
+            }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_AP_STAIPASSIGNED) {
         ip_event_ap_staipassigned_t *event = (ip_event_ap_staipassigned_t *)event_data;
         ESP_LOGI(TAG, "DHCP assigned IP to station: " IPSTR, IP2STR(&event->ip));
@@ -204,8 +276,8 @@ void wifi_init_softap() {
     esp_netif_create_default_wifi_sta();
     esp_netif_t *ap_netif = esp_netif_create_default_wifi_ap();
     esp_netif_ip_info_t ip_info = {0};
-    IP4_ADDR(&ip_info.ip, 192, 168, 4, 1);
-    IP4_ADDR(&ip_info.gw, 192, 168, 4, 1);
+    IP4_ADDR(&ip_info.ip, 192, 168, 66, 1);
+    IP4_ADDR(&ip_info.gw, 192, 168, 66, 1);
     IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0);
     ESP_ERROR_CHECK(esp_netif_dhcps_stop(ap_netif));
     ESP_ERROR_CHECK(esp_netif_set_ip_info(ap_netif, &ip_info));
@@ -322,11 +394,18 @@ static void heap_monitor_task(void *arg) {
         // Log heap stats every 30 seconds
         vTaskDelay(pdMS_TO_TICKS(30000));
 
+        bool synced = pwnpower_time_is_synced();
+        time_t now;
+        time(&now);
+        struct tm tm_info;
+        localtime_r(&now, &tm_info);
+
         uint32_t free_heap = esp_get_free_heap_size();
         uint32_t min_free_heap = esp_get_minimum_free_heap_size();
         uint32_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
 
         ESP_LOGI(TAG, "=== HEAP STATS ===");
+        ESP_LOGI(TAG, "Time Sync: %s (Year: %d)", synced ? "OK" : "NOT SYNCED", tm_info.tm_year + 1900);
         ESP_LOGI(TAG, "Free heap: %lu bytes (%.1f KB)",
                  (unsigned long)free_heap, free_heap / 1024.0f);
         ESP_LOGI(TAG, "Min free ever: %lu bytes (%.1f KB)",
@@ -450,7 +529,7 @@ void app_main() {
     ESP_LOGI(TAG, "Heap after sta_reconnect task: %lu bytes", (unsigned long)esp_get_free_heap_size());
 
     // start periodic heap monitor task
-    xTaskCreate(heap_monitor_task, "heap_monitor", 2048, NULL, 1, NULL);
+    xTaskCreate(heap_monitor_task, "heap_monitor", 4096, NULL, 1, NULL);
     ESP_LOGI(TAG, "Started heap monitor task");
 
     ESP_LOGI(TAG, "=== APP INITIALIZATION COMPLETE ===");

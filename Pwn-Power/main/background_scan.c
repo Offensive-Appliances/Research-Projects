@@ -287,11 +287,43 @@ static void populate_scan_record(scan_record_t *record) {
     }
 
     if (was_sta_connected) {
-        ESP_LOGI(TAG, "Reconnecting STA");
+        ESP_LOGI(TAG, "Reconnecting STA after background scan");
+        
+        // Give WiFi stack time to fully restore mode
+        vTaskDelay(pdMS_TO_TICKS(300));
+        
         esp_wifi_connect();
+        
+        // Wait for connection to stabilize before clearing scan flag
+        // This prevents the disconnect handler from racing with us
+        bool connected = false;
+        for (int wait = 0; wait < 100; wait++) {  // 10 seconds max
+            vTaskDelay(pdMS_TO_TICKS(100));
+            
+            wifi_ap_record_t ap_check;
+            esp_err_t ap_err = esp_wifi_sta_get_ap_info(&ap_check);
+            if (ap_err == ESP_OK) {
+                if (!connected) {
+                    ESP_LOGI(TAG, "STA associated after background scan, waiting for DHCP...");
+                    connected = true;
+                }
+                // After 3s of being associated, assume stable enough
+                if (wait > 30) {
+                    ESP_LOGI(TAG, "STA connection stabilized after background scan");
+                    break;
+                }
+            } else {
+                connected = false;
+            }
+        }
+        
+        if (!connected) {
+            ESP_LOGW(TAG, "STA reconnection after background scan timed out - disconnect handler will retry");
+        }
     }
     
     wifi_scan_set_station_scan_active(false);
+    ESP_LOGI(TAG, "Background scan station phase complete, cleared scan_active flag");
 
     for (int s = 0; s < temp_station_count; s++) {
         for (uint8_t a = 0; a < record->header.ap_count; a++) {
@@ -369,6 +401,23 @@ static void background_scan_task(void *arg) {
             continue;
         }
         
+        // Don't start background scan if manual scan is running
+        if (wifi_scan_is_in_progress() || wifi_scan_is_station_scan_active()) {
+            ESP_LOGI(TAG, "Deferring scan - manual scan in progress");
+            continue;
+        }
+        
+        // Defer if a scan just completed (give user time to view results)
+        uint32_t last_scan_ts = wifi_scan_get_results_timestamp();
+        if (!was_triggered && last_scan_ts > 0) {
+            time_t now_epoch;
+            time(&now_epoch);
+            if ((uint32_t)now_epoch - last_scan_ts < 15) {  // 15 second grace period after scan
+                ESP_LOGI(TAG, "Deferring scan - recent scan completed (%lus ago)", (unsigned long)((uint32_t)now_epoch - last_scan_ts));
+                continue;
+            }
+        }
+        
         scan_state = BG_SCAN_RUNNING;
         ESP_LOGI(TAG, "=== BACKGROUND SCAN START ===");
         ESP_LOGI(TAG, "Free heap before scan: %lu bytes", (unsigned long)esp_get_free_heap_size());
@@ -381,32 +430,11 @@ static void background_scan_task(void *arg) {
         history_sample_t sample;
         memset(&sample, 0, sizeof(sample));
         
-        uint32_t base_epoch = scan_storage_get_history_base_epoch();
+        uint32_t base_epoch = 0; // Removed usage
 
-        // Reset base epoch if time just synced or if delta would overflow
-        if (record->header.time_valid && record->header.epoch_ts > 0) {
-            if (base_epoch == 0) {
-                // First time sync - set initial base
-                base_epoch = record->header.epoch_ts;
-                scan_storage_set_history_base_epoch(base_epoch);
-                ESP_LOGI(TAG, "history base epoch initialized: %lu", (unsigned long)base_epoch);
-            } else {
-                uint32_t delta = record->header.epoch_ts - base_epoch;
-                // Reset base epoch if delta exceeds 16-bit limit (65535 sec = ~18 hours)
-                // Use threshold of 60000 seconds (~16.6 hours) to prevent overflow
-                if (delta > 60000) {
-                    base_epoch = record->header.epoch_ts;
-                    scan_storage_set_history_base_epoch(base_epoch);
-                    ESP_LOGW(TAG, "history base epoch reset due to overflow: %lu (delta was %lu)",
-                             (unsigned long)base_epoch, (unsigned long)delta);
-                }
-            }
-        }
-
-        bool save_history = (record->header.time_valid && base_epoch > 0 && record->header.epoch_ts >= base_epoch);
+        bool save_history = (record->header.time_valid && record->header.epoch_ts > 0);
         if (save_history) {
-            uint32_t delta = record->header.epoch_ts - base_epoch;
-            sample.timestamp_delta_sec = (delta > 65535) ? 65535 : delta;
+            sample.timestamp = record->header.epoch_ts;
             sample.flags = HISTORY_FLAG_TIME_VALID;
         }
         sample.ap_count = record->header.ap_count;
@@ -496,7 +524,7 @@ static void background_scan_task(void *arg) {
                 ESP_LOGE(TAG, "Failed to save history sample: %s", esp_err_to_name(err));
             }
         } else {
-            ESP_LOGD(TAG, "skipping history sample: time not synced");
+            ESP_LOGW(TAG, "Skipping history sample: Time not synced (SNTP/Internet required)");
         }
         
         // flush tracked devices to nvs after each scan

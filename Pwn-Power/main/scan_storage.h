@@ -12,11 +12,11 @@ typedef struct httpd_req httpd_req_t;
 
 #define SCAN_STORAGE_PARTITION "scandata"
 #define SCAN_MAGIC 0x50574E53  // "PWNS"
-#define SCAN_VERSION 2
+#define SCAN_VERSION 3
 #define MAX_APS_PER_SCAN 32
 #define MAX_STATIONS_PER_AP 8
 #define MAX_SCAN_HISTORY 1
-#define MAX_HISTORY_SAMPLES 14400
+#define MAX_HISTORY_SAMPLES 14200
 #define MAX_DEVICE_EVENTS 512
 #define MAX_SSID_CLIENTS_PER_SAMPLE 6
 
@@ -85,13 +85,13 @@ typedef struct __attribute__((packed)) {
     uint32_t history_count;
     uint32_t event_write_idx;
     uint32_t event_count;
-    uint32_t history_base_epoch;  // base epoch for history delta timestamps
 } storage_index_t;
 
 // compact history sample for charts (fixed size ring buffer)
-// Optimized to 48 bytes per sample for ~20 days in 768KB partition
+// Optimized to ~50 bytes per sample for ~5 days in 768KB partition
+// UPDATED: Now using 32-bit absolute timestamp (SCAN_VERSION 3)
 typedef struct __attribute__((packed)) {
-    uint16_t timestamp_delta_sec;  // seconds since ring base epoch
+    uint32_t timestamp;            // absolute unix epoch timestamp
     uint8_t flags;                 // bit0=time_valid, bits1-3=ssid_count (0-6), bits4-7=reserved
     uint8_t ap_count;
     uint8_t client_count;          // clamped to 255
@@ -237,8 +237,8 @@ esp_err_t scan_storage_send_unified_intelligence_chunked(httpd_req_t *req);
 
 // history sample ring buffer
 esp_err_t scan_storage_append_history_sample(const history_sample_t *sample);
-esp_err_t scan_storage_get_history_samples(uint32_t max_count, history_sample_t *samples, uint32_t *actual_count, uint32_t base_epoch);
-esp_err_t scan_storage_get_history_samples_window(uint32_t start_idx, uint32_t max_count, history_sample_t *samples, uint32_t *actual_count, uint32_t base_epoch);
+esp_err_t scan_storage_get_history_samples(uint32_t max_count, history_sample_t *samples, uint32_t *actual_count);
+esp_err_t scan_storage_get_history_samples_window(uint32_t start_idx, uint32_t max_count, history_sample_t *samples, uint32_t *actual_count);
 uint32_t scan_storage_get_history_count(void);
 
 // device event ring buffer

@@ -11,6 +11,7 @@
 #include "freertos/semphr.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+#include "wifi_scan.h"
 #include <string.h>
 
 #define TAG "PeerDiscovery"
@@ -85,16 +86,26 @@ static void get_device_mac(uint8_t *mac) {
 }
 
 // Get device IP address
+// Get device IP address
 static uint32_t get_device_ip(void) {
     esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    if (netif == NULL) {
-        netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (netif) {
+        if (esp_netif_is_netif_up(netif)) {
+            esp_netif_ip_info_t ip_info;
+            if (esp_netif_get_ip_info(netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
+                return ip_info.ip.addr;
+            }
+        }
     }
-    if (netif == NULL) return 0;
     
-    esp_netif_ip_info_t ip_info;
-    if (esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
-        return ip_info.ip.addr;
+    netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (netif) {
+        if (esp_netif_is_netif_up(netif)) {
+            esp_netif_ip_info_t ip_info;
+            if (esp_netif_get_ip_info(netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
+                return ip_info.ip.addr;
+            }
+        }
     }
     return 0;
 }
@@ -268,6 +279,11 @@ static void send_announce(void) {
     s_self.ip_addr = get_device_ip();
     s_self.last_seen = (uint32_t)(esp_timer_get_time() / 1000);
     
+    // Skip announce if we don't have a valid IP (not connected to network)
+    if (s_self.ip_addr == 0) {
+        return;
+    }
+    
     // Sync self to peer list (s_peers[0] is always self)
     xSemaphoreTake(s_peer_mutex, portMAX_DELAY);
     if (s_peer_count > 0 && s_peers[0].is_self) {
@@ -295,7 +311,13 @@ static void send_announce(void) {
     int err = sendto(s_udp_socket, &msg, sizeof(msg), 0,
                      (struct sockaddr *)&dest_addr, sizeof(dest_addr));
     if (err < 0) {
-        ESP_LOGW(TAG, "Failed to send announce: %d", errno);
+        // Only log occasionally to avoid spam
+        static uint32_t last_warn = 0;
+        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+        if (now - last_warn > 30000) {  // Log at most once per 30 seconds
+            ESP_LOGW(TAG, "Failed to send announce: %d", errno);
+            last_warn = now;
+        }
     }
 }
 
@@ -362,9 +384,11 @@ static void discovery_task(void *arg) {
     while (s_running) {
         uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
         
-        // Periodic announce
+        // Periodic announce (skip if station scan is in progress to avoid interference)
         if (now - last_announce >= PEER_ANNOUNCE_INTERVAL_MS) {
-            send_announce();
+            if (!wifi_scan_is_in_progress() && !wifi_scan_is_station_scan_active()) {
+                send_announce();
+            }
             last_announce = now;
         }
         
@@ -377,8 +401,8 @@ static void discovery_task(void *arg) {
         // Periodic scan for other PwnPower APs (when not finding peers via UDP)
         // This helps detect other PwnPower devices even when not on the same network
         if (now - last_ap_scan >= PEER_AP_SCAN_INTERVAL_MS) {
-            // Only scan if we haven't found peers via UDP (saves resources)
-            if (s_peer_count <= 1) {
+            // Only scan if we haven't found peers via UDP and no other scan is running
+            if (s_peer_count <= 1 && !wifi_scan_is_in_progress() && !wifi_scan_is_station_scan_active()) {
                 peer_discovery_scan_for_aps();
             }
             last_ap_scan = now;
@@ -653,9 +677,29 @@ void peer_discovery_scan_for_aps(void) {
         .scan_time.active.max = 300,
     };
     
+    // Don't scan if another scan is already in progress
+    if (wifi_scan_is_in_progress() || wifi_scan_is_station_scan_active()) {
+        ESP_LOGD(TAG, "Skipping AP scan - another scan in progress");
+        return;
+    }
+    
+    // Check WiFi state before scanning
+    wifi_mode_t mode;
+    if (esp_wifi_get_mode(&mode) != ESP_OK) {
+        return;
+    }
+
+    // If we are in STA mode (or APSTA) and don't have an IP, we are likely connecting/disconnected.
+    // Scanning now would interfere with the connection attempt (WIFI_EVENT_STA_DISCONNECTED loops).
+    // Only scan if we are stable (have IP) or in AP-only mode.
+    if ((mode == WIFI_MODE_STA || mode == WIFI_MODE_APSTA) && get_device_ip() == 0) {
+        ESP_LOGD(TAG, "Skipping AP scan - STA is enabled but not connected (avoiding interference)");
+        return;
+    }
+    
     esp_err_t err = esp_wifi_scan_start(&scan_config, true);  // Blocking scan
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "WiFi scan failed: %s", esp_err_to_name(err));
+        ESP_LOGD(TAG, "WiFi scan deferred: %s", esp_err_to_name(err));
         return;
     }
     

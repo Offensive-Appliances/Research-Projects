@@ -1940,8 +1940,8 @@ static esp_err_t history_samples_handler(httpd_req_t *req) {
         return ESP_FAIL;
     }
     
-    extern uint32_t scan_storage_get_history_base_epoch(void);
-    uint32_t base_epoch = scan_storage_get_history_base_epoch();
+    // extern uint32_t scan_storage_get_history_base_epoch(void);
+    // uint32_t base_epoch = scan_storage_get_history_base_epoch();
     
     httpd_resp_set_type(req, "application/json");
     // Compact format: {"s":[[epoch,ap,cli,[ch0-12],[[hash,cnt],...]],...]}
@@ -1952,7 +1952,7 @@ static esp_err_t history_samples_handler(httpd_req_t *req) {
     while (remaining > 0) {
         uint32_t request_count = remaining > HISTORY_CHUNK_SIZE ? HISTORY_CHUNK_SIZE : remaining;
         uint32_t actual = 0;
-        esp_err_t err = scan_storage_get_history_samples_window(start_idx, request_count, chunk, &actual, base_epoch);
+        esp_err_t err = scan_storage_get_history_samples_window(start_idx, request_count, chunk, &actual);
         ESP_LOGD(TAG, "history_samples_handler: requested=%u, actual=%u", request_count, actual);
         if (err != ESP_OK) {
             free(chunk);
@@ -1964,8 +1964,8 @@ static esp_err_t history_samples_handler(httpd_req_t *req) {
             uint32_t epoch_ts = 0;
             bool time_valid = HISTORY_IS_TIME_VALID(chunk[i].flags);
 
-            if (time_valid && base_epoch > 0) {
-                epoch_ts = base_epoch + chunk[i].timestamp_delta_sec;
+            if (time_valid) {
+                epoch_ts = chunk[i].timestamp;
             }
 
             // incremental update: skip samples older than or equal to since_ts
@@ -2537,7 +2537,7 @@ static esp_err_t register_routes(httpd_handle_t server) {
 static esp_err_t redirect_handler(httpd_req_t *req) {
     char host[128] = {0};
     if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK) {
-        strlcpy(host, "192.168.4.1", sizeof(host));
+        strlcpy(host, "192.168.66.1", sizeof(host));
     }
 
     char location[192];
@@ -2614,11 +2614,11 @@ static httpd_handle_t start_https_server(void) {
     conf.prvtkey_len = strlen(s_tls_bundle.key_pem) + 1;
     conf.httpd.max_uri_handlers = 58;  // Increased for peer discovery routes
 #ifdef CONFIG_IDF_TARGET_ESP32C5
-    conf.httpd.max_open_sockets = 2;
+    conf.httpd.max_open_sockets = 4;
     conf.httpd.backlog_conn = 1;
     conf.httpd.stack_size = 5120;
 #else
-    conf.httpd.max_open_sockets = 2;
+    conf.httpd.max_open_sockets = 4;
     conf.httpd.backlog_conn = 1;
     conf.httpd.stack_size = 6144;
 #endif

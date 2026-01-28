@@ -9,7 +9,7 @@ typedef struct {
 
 /**
  * Load server cert/key from NVS or generate a new self-signed RSA-2048 cert for
- * hosts: pwnpower.local and 192.168.4.1. Results are cached in NVS.
+ * hosts: pwnpower.local and 192.168.66.1. Results are cached in NVS.
  * Returns true on success and fills out bundle.
  */
 bool tls_cert_load_or_generate(tls_cert_bundle_t *bundle);

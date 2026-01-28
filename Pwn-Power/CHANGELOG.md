@@ -25,7 +25,7 @@
 - Added support for the ESP32-C5
 - Added a recovery system to clear NVS and Storage partition on 5 rapid power cycles
 - Added peer discovery to switch between multiple devices on a home network from one interface
-
+- Added limiting so you can't select clients on different channels
 
 ### Changed
 - Merged WiFi Recon and Attack sections into a single section
@@ -33,7 +33,10 @@
 - Separated web interface into seperate js, css and html files
 - Revised web interface styling
 - Increased AP storage limit from 16 to 32 networks per scan
-
+- Fixed potential hang while scanning
+- Improved server socket exhaustion
+- Changed SoftAP IP to 192.168.66.1 to prevent conflicts with STA connection
+- Changed history samples to use absolute time instead of relative time
 
 ## v1.0
 

@@ -11,6 +11,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "cJSON.h"
+#include "esp_netif.h"
 #include "sdkconfig.h"
 #include "ouis.h"
 #include "scan_storage.h"
@@ -39,8 +40,8 @@ static uint32_t scan_results_timestamp = 0;  // Timestamp when results were gene
 static bool scan_was_truncated = false;      // Flag if results were truncated due to size
 static volatile bool station_scan_active = false;
 static volatile bool station_scan_background = false;
-static TaskHandle_t s_station_scan_task = NULL;
-static cJSON *s_pending_ap_data = NULL;
+// static TaskHandle_t s_station_scan_task = NULL;
+// static cJSON *s_pending_ap_data = NULL;
 static SemaphoreHandle_t scan_mutex = NULL;
 static TaskHandle_t s_wifi_scan_task_handle = NULL;
 static void wifi_scan_task(void *arg);
@@ -182,7 +183,7 @@ const uint8_t* get_scan_channels(void) {
     return dynamic_channels;
 }
 
-const size_t get_scan_channels_size(void) {
+size_t get_scan_channels_size(void) {
     init_country_channels();
     return dynamic_channels_count;
 }
@@ -786,12 +787,29 @@ void wifi_scan_update_ui_cache_from_record(const scan_record_t *record) {
     if (!record) return;
     if (!scan_mutex) scan_mutex = xSemaphoreCreateMutex();
     
+    // Check heap before allocating - UI cache is optional, save memory for critical operations
+    uint32_t free_heap = esp_get_free_heap_size();
+    if (free_heap < 10000) {
+        ESP_LOGW(TAG, "Skipping UI cache update - low heap (%lu bytes)", (unsigned long)free_heap);
+        return;
+    }
+    
     cJSON *root = cJSON_CreateObject();
     cJSON *rows = cJSON_AddArrayToObject(root, "rows");
     
     uint32_t now_sec = record->header.time_valid ? record->header.epoch_ts : record->header.uptime_sec;
     
-    for (int i = 0; i < record->header.ap_count; i++) {
+    // Determine safe AP limit based on heap
+    // Each AP entry in JSON DOM takes approx 1KB of heap
+    int max_aps = record->header.ap_count;
+    if (free_heap < 20000) {
+        max_aps = 10; // Restrict to top 10 if heap is low < 20KB
+        ESP_LOGW(TAG, "Low heap during UI update (%lu), limiting to %d/%d APs", (unsigned long)free_heap, max_aps, record->header.ap_count);
+    } else if (free_heap < 30000) {
+        max_aps = 20; // Restrict to top 20 if heap < 30KB
+    }
+    
+    for (int i = 0; i < record->header.ap_count && i < max_aps; i++) {
         const stored_ap_t *ap = &record->aps[i];
         
         cJSON *ap_entry = cJSON_CreateObject();
@@ -804,12 +822,17 @@ void wifi_scan_update_ui_cache_from_record(const scan_record_t *record) {
         cJSON_AddNumberToObject(ap_entry, "last_seen", now_sec);
         cJSON_AddBoolToObject(ap_entry, "hidden", ap->hidden);
         
-        char vendor[64] = "Unknown";
-        ouis_lookup_vendor(ap->bssid, vendor, sizeof(vendor));
-        cJSON_AddStringToObject(ap_entry, "Vendor", vendor);
+        // Skip vendor lookup if memory is very low within the loop
+        if (esp_get_free_heap_size() > 8000) {
+            char vendor[64] = "Unknown";
+            ouis_lookup_vendor(ap->bssid, vendor, sizeof(vendor));
+            cJSON_AddStringToObject(ap_entry, "Vendor", vendor);
+        } else {
+            cJSON_AddStringToObject(ap_entry, "Vendor", "");
+        }
         
-        // add stations if present
-        if (ap->station_count > 0) {
+        // add stations if present - limit stations if low memory
+        if (ap->station_count > 0 && esp_get_free_heap_size() > 10000) {
             cJSON *stations_array = cJSON_AddArrayToObject(ap_entry, "stations");
             for (int s = 0; s < ap->station_count; s++) {
                 const stored_station_t *sta = &ap->stations[s];
@@ -818,9 +841,11 @@ void wifi_scan_update_ui_cache_from_record(const scan_record_t *record) {
                 cJSON_AddNumberToObject(sta_obj, "rssi", sta->rssi);
                 cJSON_AddNumberToObject(sta_obj, "last_seen", now_sec);
                 
-                char sta_vendor[64] = "Unknown";
-                ouis_lookup_vendor(sta->mac, sta_vendor, sizeof(sta_vendor));
-                cJSON_AddStringToObject(sta_obj, "vendor", sta_vendor);
+                if (esp_get_free_heap_size() > 8000) {
+                    char sta_vendor[64] = "Unknown";
+                    ouis_lookup_vendor(sta->mac, sta_vendor, sizeof(sta_vendor));
+                    cJSON_AddStringToObject(sta_obj, "vendor", sta_vendor);
+                }
                 
                 cJSON_AddItemToArray(stations_array, sta_obj);
             }
@@ -975,7 +1000,7 @@ static void stations_sniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
 
     // Parse beacons (0x08) and probe responses (0x0B) for WPS
     if (frame_type == 0 && (frame_subtype == 0x08 || frame_subtype == 0x0B)) {
-        uint8_t *bssid = (frame_subtype == 0x08) ? (payload + 16) : (payload + 16);
+        uint8_t *bssid = payload + 16;
         uint8_t *frame_body = payload + 24;
 
         // Skip fixed parameters (timestamp: 8, beacon interval: 2, capabilities: 2)
@@ -989,21 +1014,24 @@ static void stations_sniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
 
     // Monitor for probe responses (0x0B) that might reveal hidden SSIDs
     if (frame_type == 0 && frame_subtype == 0x0B) {
+        if (rx_ctrl->sig_len < 36) return; // Need at least header + fixed params
         uint8_t *bssid = payload + 16;
         uint8_t *frame_body = payload + 24;
+        uint8_t *frame_end = payload + rx_ctrl->sig_len;
         
         // Skip fixed parameters (timestamp: 8, beacon interval: 2, capabilities: 2)
         frame_body += 12;
         
         // Parse parameters - look for SSID parameter (ID 0x00)
-        while (frame_body[0] != 0x00 && frame_body[0] != 0xFF && frame_body < payload + pkt->rx_ctrl.sig_len) {
+        while (frame_body + 2 <= frame_end && frame_body[0] != 0x00 && frame_body[0] != 0xFF) {
             uint8_t param_len = frame_body[1];
+            if (frame_body + 2 + param_len > frame_end) break;
             frame_body += 2 + param_len;
         }
         
-        if (frame_body[0] == 0x00) {
+        if (frame_body + 2 <= frame_end && frame_body[0] == 0x00) {
             uint8_t ssid_len = frame_body[1];
-            if (ssid_len > 0 && ssid_len < 33) {
+            if (ssid_len > 0 && ssid_len < 33 && frame_body + 2 + ssid_len <= frame_end) {
                 // Check if this matches any of our hidden APs
                 for (int h = 0; h < s_hidden_ap_idx && h < MAX_HIDDEN_APS; h++) {
                     if (!s_hidden_aps[h].revealed && memcmp(s_hidden_aps[h].bssid, bssid, 6) == 0) {
@@ -1020,21 +1048,24 @@ static void stations_sniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
     
     // Monitor for association requests (0x00) that reveal hidden SSIDs
     if (frame_type == 0 && frame_subtype == 0x00) {
+        if (rx_ctrl->sig_len < 26) return; // Need at least header + capability info
         uint8_t *bssid = payload + 16;
         uint8_t *frame_body = payload + 24;
+        uint8_t *frame_end = payload + rx_ctrl->sig_len;
         
         // Skip fixed parameters
         frame_body += 2; // Capability info
         
-        // Parse parameters - look for SSID parameter (ID 0x00)
-        while (frame_body[0] != 0x00 && frame_body[0] != 0xFF && frame_body < payload + pkt->rx_ctrl.sig_len) {
+        // Parse parameters - look for SSID parameter (ID 0x00) with proper bounds checking
+        while (frame_body + 2 <= frame_end && frame_body[0] != 0x00 && frame_body[0] != 0xFF) {
             uint8_t param_len = frame_body[1];
+            if (frame_body + 2 + param_len > frame_end) break; // Prevent overflow
             frame_body += 2 + param_len;
         }
         
-        if (frame_body[0] == 0x00) {
+        if (frame_body + 2 <= frame_end && frame_body[0] == 0x00) {
             uint8_t ssid_len = frame_body[1];
-            if (ssid_len > 0 && ssid_len < 33) {
+            if (ssid_len > 0 && ssid_len < 33 && frame_body + 2 + ssid_len <= frame_end) {
                 // Check if this matches any of our hidden APs
                 for (int h = 0; h < s_hidden_ap_idx && h < MAX_HIDDEN_APS; h++) {
                     if (!s_hidden_aps[h].revealed && memcmp(s_hidden_aps[h].bssid, bssid, 6) == 0) {
@@ -1083,8 +1114,11 @@ static void stations_sniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
             ESP_LOGD(TAG, "PROBE_FINGERPRINT: Vendor: %s, Fingerprint: %s",
                      temp_station.device_vendor, temp_station.device_fingerprint);
                      
-            // Update existing station record or create new one
-            xSemaphoreTake(stations_mutex, portMAX_DELAY);
+            // Update existing station record or create new one (with timeout to avoid blocking callback)
+            if (xSemaphoreTake(stations_mutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+                // Mutex busy, skip this update to avoid blocking the sniffer callback
+                return;
+            }
             bool station_exists = false;
             for(int i=0; i<stations_count; i++) {
                 if(memcmp(stations[i].station_mac, probe_mac, 6) == 0) {
@@ -1193,7 +1227,11 @@ static void stations_sniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
     // Vendor will be filled later during fingerprint processing
     candidate.device_vendor[0] = '\0';
     
-    xSemaphoreTake(stations_mutex, portMAX_DELAY);
+    // Acquire mutex with timeout to avoid blocking the sniffer callback
+    if (xSemaphoreTake(stations_mutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+        // Mutex busy, skip this update
+        return;
+    }
     bool exists = false;
     for(int i=0; i<stations_count; i++) {
         if(memcmp(stations[i].station_mac, candidate.station_mac, 6) == 0 && memcmp(stations[i].ap_bssid, candidate.ap_bssid, 6) == 0) { 
@@ -1305,17 +1343,66 @@ void wifi_scan_stations() {
     
     // restore original mode and reconnect if needed
     if(original_mode != WIFI_MODE_STA) {
-        ESP_LOGI(TAG, "Restoring original mode");
+        ESP_LOGI(TAG, "Restoring original mode (APSTA)");
         esp_wifi_set_mode(original_mode);
         vTaskDelay(pdMS_TO_TICKS(500));
     }
     
-    station_scan_active = false;
-    
+    // Keep station_scan_active=true during reconnection to prevent
+    // the disconnect handler from interfering with our reconnect attempt
     if(was_sta_connected) {
-        ESP_LOGI(TAG, "Reconnecting STA");
+        ESP_LOGI(TAG, "Reconnecting STA after station scan");
+        
+        // Give WiFi stack time to fully restore mode
+        vTaskDelay(pdMS_TO_TICKS(300));
+        
         esp_wifi_connect();
+        
+        // Wait for connection to fully stabilize (including DHCP)
+        // This prevents the disconnect handler from racing with us
+        // esp_wifi_sta_get_ap_info only checks WiFi association, not DHCP
+        // We wait up to 10 seconds for stability
+        bool connected = false;
+        for (int wait = 0; wait < 100; wait++) {  // 10 seconds max
+            vTaskDelay(pdMS_TO_TICKS(100));
+            
+            wifi_ap_record_t ap_check;
+            esp_err_t ap_err = esp_wifi_sta_get_ap_info(&ap_check);
+            if (ap_err == ESP_OK) {
+                if (!connected) {
+                    ESP_LOGI(TAG, "STA associated after station scan, waiting for DHCP...");
+                    connected = true;
+                }
+                // Continue waiting a bit more for DHCP/stability
+                // The IP event will reset retry counters
+                if (wait > 30) {  // After 3s of being associated, assume stable enough
+                    ESP_LOGI(TAG, "STA connection stabilized after station scan");
+                    break;
+                }
+            } else {
+                connected = false;  // Re-check if we need to reconnect
+            }
+        }
+        
+        if (!connected) {
+            ESP_LOGW(TAG, "STA reconnection after station scan timed out - disconnect handler will retry");
+        } else {
+            // Explicitly force DHCP client restart to ensure IP assignment
+            // This fixes an issue where the device reconnects but fails to get an IP address
+            esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+            if (netif) {
+                ESP_LOGI(TAG, "Explicitly starting DHCP client after scan reconnect (netif=%p)", netif);
+                esp_netif_dhcpc_stop(netif); // Ensure clean state
+                esp_netif_dhcpc_start(netif);
+            } else {
+                ESP_LOGE(TAG, "Failed to get WIFI_STA_DEF netif handle - cannot restart DHCP");
+            }
+        }
     }
+    
+    // Now safe to clear - either connected or disconnect handler will take over
+    station_scan_active = false;
+    ESP_LOGI(TAG, "Station scan complete, cleared scan_active flag");
 }
 
 const char* wifi_scan_get_station_results() {

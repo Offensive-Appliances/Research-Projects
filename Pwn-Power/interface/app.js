@@ -2,6 +2,10 @@ let scanData = [];
 let accumulatedNetworks = new Map();
 let selectedAP = null;
 let selectedClients = {};
+
+// Client selection limits
+const MAX_DEAUTH_CLIENTS = 10;
+const MAX_HANDSHAKE_CLIENTS = 5;
 let scanInterval = null;
 let agoTicker = null;
 let privacyMode = false;
@@ -597,36 +601,112 @@ function renderNetworkTable(tableId, selectable, status) {
 
 function selectAP(row, ap) {
     const wasSelected = row.classList.contains('selected');
-    $$('#wifi-table tr.selected').forEach(r => r.classList.remove('selected'));
 
     if (wasSelected) {
+        // Deselecting AP - clear everything
+        $$('#wifi-table tr.selected').forEach(r => r.classList.remove('selected'));
         selectedAP = null;
         selectedClients = {};
         $('#attack-options').style.display = 'none';
     } else {
-        selectedClients = {};
+        // Selecting a new AP
+        const previousAP = selectedAP;
+
+        // Remove selected class from all AP rows (but keep client rows for now)
+        $$('#wifi-table tr.selected:not(.client-row)').forEach(r => r.classList.remove('selected'));
+
+        // If selecting a different AP, clear all client selections
+        if (previousAP && previousAP.MAC !== ap.MAC) {
+            // Clear client selections from the old AP
+            $$('#wifi-table tr.client-row.selected').forEach(r => r.classList.remove('selected'));
+            selectedClients = {};
+        } else if (!previousAP) {
+            // Check if we have client selections from a different AP
+            const existingClientAPs = Object.keys(selectedClients).filter(mac => selectedClients[mac]?.length > 0);
+            if (existingClientAPs.length > 0 && !existingClientAPs.includes(ap.MAC)) {
+                // Clear client selections from different APs
+                $$('#wifi-table tr.client-row.selected').forEach(r => r.classList.remove('selected'));
+                selectedClients = {};
+            }
+        }
+
         row.classList.add('selected');
         selectedAP = ap;
         $('#attack-options').style.display = 'block';
-        $('#selected-target').textContent = ap.SSID || ap.MAC;
+
+        // Update target text to show AP + client count
+        const clientCount = selectedClients[ap.MAC]?.length || 0;
+        if (clientCount > 0) {
+            $('#selected-target').textContent = `${ap.SSID || ap.MAC} (${clientCount} client${clientCount !== 1 ? 's' : ''})`;
+        } else {
+            $('#selected-target').textContent = ap.SSID || ap.MAC;
+        }
     }
 }
 
+function getSelectedChannel() {
+    // Find the channel of currently selected clients (if any)
+    for (const apMac of Object.keys(selectedClients)) {
+        if (selectedClients[apMac].length > 0) {
+            const ap = accumulatedNetworks.get(apMac);
+            if (ap) return { channel: ap.Channel, apMac };
+        }
+    }
+    return null;
+}
+
 function selectClient(row, apMac, staMac) {
-    row.classList.toggle('selected');
     if (!selectedClients[apMac]) selectedClients[apMac] = [];
     const idx = selectedClients[apMac].indexOf(staMac);
-    if (idx > -1) {
+    const isDeselecting = idx > -1;
+
+    // Check constraints when selecting (not deselecting)
+    if (!isDeselecting) {
+        // Check channel - can only select clients from same channel
+        const currentSelection = getSelectedChannel();
+        const thisAP = accumulatedNetworks.get(apMac);
+        if (currentSelection && thisAP && currentSelection.channel !== thisAP.Channel) {
+            const existingAP = accumulatedNetworks.get(currentSelection.apMac);
+            showToast(`Cannot mix channels (CH${currentSelection.channel} vs CH${thisAP.Channel})`);
+            return;
+        }
+
+        // Check client count limit
+        const totalSelected = Object.values(selectedClients).flat().length;
+        if (totalSelected >= MAX_DEAUTH_CLIENTS) {
+            showToast(`Maximum ${MAX_DEAUTH_CLIENTS} clients can be selected`);
+            return;
+        }
+        if (totalSelected >= MAX_HANDSHAKE_CLIENTS) {
+            showToast(`Note: Only ${MAX_HANDSHAKE_CLIENTS} clients recommended for handshake capture`);
+        }
+    }
+
+    row.classList.toggle('selected');
+    if (isDeselecting) {
         selectedClients[apMac].splice(idx, 1);
     } else {
         selectedClients[apMac].push(staMac);
     }
 
     const hasSelectedClients = Object.values(selectedClients).some(arr => arr.length > 0);
-    if (hasSelectedClients && !selectedAP) {
+    const totalClients = Object.values(selectedClients).flat().length;
+
+    if (selectedAP) {
+        // AP is selected - update display to show AP + client count
+        const clientCount = selectedClients[selectedAP.MAC]?.length || 0;
+        if (clientCount > 0) {
+            $('#selected-target').textContent = `${selectedAP.SSID || selectedAP.MAC} (${clientCount} client${clientCount !== 1 ? 's' : ''})`;
+        } else {
+            $('#selected-target').textContent = selectedAP.SSID || selectedAP.MAC;
+        }
+    } else if (hasSelectedClients) {
+        // Only clients selected (no AP)
         $('#attack-options').style.display = 'block';
-        $('#selected-target').textContent = `${Object.values(selectedClients).flat().length} client(s)`;
-    } else if (!hasSelectedClients && !selectedAP) {
+        const channel = getSelectedChannel()?.channel;
+        $('#selected-target').textContent = `${totalClients} client(s) on CH${channel}`;
+    } else {
+        // Nothing selected
         $('#attack-options').style.display = 'none';
     }
 }
@@ -827,6 +907,11 @@ async function startDeauth() {
     if (!selectedAP) return showToast('Select a target first');
 
     const targets = selectedClients[selectedAP.MAC] || [];
+    if (targets.length > MAX_DEAUTH_CLIENTS) {
+        showToast(`Too many clients selected (max ${MAX_DEAUTH_CLIENTS}). Deselect some.`);
+        return;
+    }
+
     const body = {
         mac: selectedAP.MAC,
         channel: String(selectedAP.Channel),
@@ -834,7 +919,7 @@ async function startDeauth() {
         sta: targets
     };
 
-    showToast('Deauth started...');
+    showToast(`Deauth started (${targets.length || 'broadcast'} target${targets.length !== 1 ? 's' : ''})...`);
     await fetchJSON('/attack', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -846,7 +931,13 @@ async function startHandshake() {
     if (isBlockedAction('Handshake capture')) return;
     if (!selectedAP) return showToast('Select a target first');
 
-    const targets = selectedClients[selectedAP.MAC] || [];
+    let targets = selectedClients[selectedAP.MAC] || [];
+    if (targets.length > MAX_HANDSHAKE_CLIENTS) {
+        // Limit to MAX_HANDSHAKE_CLIENTS for handshake capture
+        showToast(`Using first ${MAX_HANDSHAKE_CLIENTS} clients (${targets.length} selected)`);
+        targets = targets.slice(0, MAX_HANDSHAKE_CLIENTS);
+    }
+
     const body = {
         mac: selectedAP.MAC,
         channel: selectedAP.Channel,
@@ -854,7 +945,7 @@ async function startHandshake() {
         sta: targets
     };
 
-    showToast('Capturing handshake...');
+    showToast(`Capturing handshake (${targets.length || 'any'} client${targets.length !== 1 ? 's' : ''})...`);
     await fetchJSON('/handshake', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
