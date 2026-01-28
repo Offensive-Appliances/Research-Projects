@@ -2,6 +2,7 @@ let scanData = [];
 let accumulatedNetworks = new Map();
 let selectedAP = null;
 let selectedClients = {};
+let gpioValue = 0;
 
 // Client selection limits
 const MAX_DEAUTH_CLIENTS = 10;
@@ -1236,20 +1237,34 @@ async function controlGpio(value) {
     });
 
     if (res) {
-        const dot = $('#gpio-dot');
-        const text = $('#gpio-text');
-        if (dot) dot.className = value ? 'status-dot online' : 'status-dot offline';
-        if (text) text.textContent = value ? 'On' : 'Off';
+        gpioValue = value;
+        updateGpioUI(gpioValue);
+    }
+}
+
+async function toggleGpio() {
+    await controlGpio(gpioValue ? 0 : 1);
+}
+
+function updateGpioUI(isOn) {
+    const btn = $('#power-button');
+    const status = $('#power-status');
+    if (btn) {
+        if (isOn) btn.classList.add('active');
+        else btn.classList.remove('active');
+    }
+    if (status) {
+        status.textContent = isOn ? 'ON' : 'OFF';
+        if (isOn) status.classList.add('active');
+        else status.classList.remove('active');
     }
 }
 
 async function loadGpioStatus() {
     const res = await fetchJSON('/gpio/status?pin=4');
     if (res) {
-        const dot = $('#gpio-dot');
-        const text = $('#gpio-text');
-        if (dot) dot.className = res.value ? 'status-dot online' : 'status-dot offline';
-        if (text) text.textContent = res.value ? 'On' : 'Off';
+        gpioValue = res.value;
+        updateGpioUI(gpioValue);
     }
 }
 

@@ -146,8 +146,10 @@
 
     <div id="app-shell" style="display:none;">
         <header>
-            <h1>PwnPower</h1>
-            <div class="subtitle">Offensive Appliances Research</div>
+            <h1>PwnPower <span
+                    style="color: var(--accent); font-size: 0.5em; vertical-align: middle; opacity: 0.9; margin-left: 2px;">v2.0</span>
+            </h1>
+            <div class="subtitle">Offensive Appliances LLC</div>
             <div id="device-switcher" class="device-switcher" style="display:none;">
                 <button id="device-switcher-btn" class="device-switcher-btn" onclick="toggleDeviceSwitcher()">
                     <span id="current-device-name">This Device</span>
@@ -227,14 +229,19 @@
                 </div>
                 <div class="section-content">
                     <div class="card">
-                        <h4>GPIO Control</h4>
-                        <div class="muted">Control GPIO4 output</div>
-                        <div class="btn-group">
-                            <button class="btn" onclick="controlGpio(1)">Turn On</button>
-                            <button class="btn" onclick="controlGpio(0)">Turn Off</button>
-                            <div class="status-badge">
-                                <span id="gpio-dot" class="status-dot offline"></span>
-                                <span id="gpio-text">Off</span>
+                        <h4>Smart Plug Control</h4>
+                        <div class="muted">Control power to the passthrough outlet</div>
+                        <div class="power-button-container">
+                            <div>
+                                <button id="power-button" class="power-button" onclick="toggleGpio()">
+                                    <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                        <path
+                                            d="M12 3V12M18.3611 5.64001C19.6195 6.8988 20.4764 8.50246 20.8234 10.2482C21.1704 11.994 20.992 13.8034 20.3107 15.4478C19.6295 17.0921 18.4759 18.4976 16.9959 19.4864C15.5159 20.4752 13.776 21.0029 11.9961 21.0029C10.2162 21.0029 8.47625 20.4752 6.99627 19.4864C5.51629 18.4976 4.36274 17.0921 3.68146 15.4478C3.00019 13.8034 2.82179 11.994 3.16882 10.2482C3.51584 8.50246 4.37272 6.8988 5.6311 5.64001"
+                                            stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                            stroke-linejoin="round"></path>
+                                    </svg>
+                                </button>
+                                <div id="power-status" class="power-status">OFF</div>
                             </div>
                         </div>
                     </div>
@@ -734,22 +741,44 @@
 
             <section id="about" class="section">
                 <div class="section-title" onclick="toggleSection('about')">
-                    <h2>About</h2>
+                    <h2>Credits & Info</h2>
                     <span class="arrow">▼</span>
                 </div>
                 <div class="section-content">
-                    <div class="card-grid">
-                        <div class="card">
-                            <h4>PwnPower</h4>
-                            <div class="muted">ESP32-C3 WiFi Scanner</div>
-                            <div class="muted">Deauth & Handshake Capture</div>
+                    <div class="card"
+                        style="text-align: center; padding: 32px 16px; background: linear-gradient(145deg, var(--bg-card), var(--bg-primary)); border: 1px solid rgba(179, 23, 23, 0.3); position: relative; overflow: hidden;">
+                        <div
+                            style="position: absolute; top: -50px; right: -50px; width: 100px; height: 100px; background: var(--accent); opacity: 0.05; border-radius: 50%; filter: blur(40px);">
                         </div>
-                        <div class="card">
-                            <h4>Credits</h4>
-                            <div class="muted">Developer: Deki</div>
-                            <div class="muted">Lead + Hardware: Peaks</div>
-                            <div class="muted">Educational purposes only</div>
+
+                        <div
+                            style="font-size: 24px; font-weight: 800; color: var(--text-primary); margin-bottom: 4px; letter-spacing: -0.5px;">
+                            PwnPower <span style="color: var(--accent);">v2.0</span></div>
+                        <div
+                            style="font-size: 13px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 2px; margin-bottom: 24px;">
+                            Offensive Appliances LLC</div>
+
+                        <div
+                            style="display: flex; justify-content: center; gap: 48px; margin-bottom: 24px; flex-wrap: wrap;">
+                            <div style="text-align: center;">
+                                <div
+                                    style="font-size: 10px; color: var(--accent); text-transform: uppercase; font-weight: 700; letter-spacing: 1.5px; margin-bottom: 4px;">
+                                    Developed with love by</div>
+                                <div style="font-size: 16px; font-weight: 600;">deki</div>
+                            </div>
+                            <div style="text-align: center;">
+                                <div
+                                    style="font-size: 10px; color: var(--accent); text-transform: uppercase; font-weight: 700; letter-spacing: 1.5px; margin-bottom: 4px;">
+                                    License</div>
+                                <div style="font-size: 16px; font-weight: 600;">Open Source under MIT</div>
+                            </div>
                         </div>
+
+                        <div
+                            style="height: 1px; background: linear-gradient(90deg, transparent, var(--border-color), transparent); margin: 0 auto 20px; width: 60%;">
+                        </div>
+                        <div style="font-size: 11px; color: var(--text-muted); opacity: 0.7;">For
+                            educational and authorized testing only.</div>
                     </div>
                 </div>
             </section>

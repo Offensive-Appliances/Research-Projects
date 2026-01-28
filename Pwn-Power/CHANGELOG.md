@@ -2,6 +2,18 @@
 
 ## v2.0
 
+## new to rc3
+- Added a recovery system to clear NVS and Storage partition on 5 rapid power cycles
+- Added peer discovery to switch between multiple devices on a home network from one interface
+- Added limiting so you can't select clients on different channels
+- Fixed potential hang while scanning
+- Improved server socket exhaustion
+- Changed SoftAP IP to 192.168.66.1 to prevent conflicts with STA connection
+- Changed history samples to use absolute time instead of relative time
+- Fixed issue where old samples would 'disappear' after a while
+- Changed scan reports to allow downloading raw json and an image containing chart info seperately
+- Revisions to interface styling and layout
+
 ### Added
 - Secure login flow with token-based API protection for the web UI
 - Privacy mode toggle to censor PII (MACs, SSIDs, vendors) for demos and content creation
@@ -32,13 +44,7 @@
 - Changed to use custom partition table for extra flash storage
 - Separated web interface into seperate js, css and html files
 - Revised web interface styling
-- Increased AP storage limit from 16 to 32 networks per scan
-- Fixed potential hang while scanning
-- Improved server socket exhaustion
 - Changed SoftAP IP to 192.168.66.1 to prevent conflicts with STA connection
-- Changed history samples to use absolute time instead of relative time
-- Fixed issue where old samples would 'disappear' after a while
-- Changed scan reports to allow downloading raw json and an image containing chart info seperately
 
 ## v1.0
 
