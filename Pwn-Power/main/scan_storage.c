@@ -1620,6 +1620,19 @@ esp_err_t scan_storage_append_history_sample(const history_sample_t *sample) {
     return err;
 }
 
+// CRC8 (CCITT polynomial 0x07) over history sample fields preceding the crc8 byte
+uint8_t history_sample_crc8(const history_sample_t *sample) {
+    const uint8_t *data = (const uint8_t *)sample;
+    size_t len = offsetof(history_sample_t, crc8);
+    uint8_t crc = 0;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (uint8_t bit = 0; bit < 8; bit++) {
+            crc = (crc & 0x80) ? ((crc << 1) ^ 0x07) : (crc << 1);
+        }
+    }
+    return crc;
+}
 
 static uint32_t sanitize_history_samples(history_sample_t *samples, uint32_t count) {
     // ESP_LOGD(TAG, "sanitize_history_samples: input count=%u", count);
@@ -1635,11 +1648,27 @@ static uint32_t sanitize_history_samples(history_sample_t *samples, uint32_t cou
     for (uint32_t i = 0; i < count; i++) {
         history_sample_t *src = &samples[i];
 
+        // CRC8 integrity check - reject corrupted samples outright
+        if (history_sample_crc8(src) != src->crc8) {
+            continue;
+        }
+
         bool time_valid = HISTORY_IS_TIME_VALID(src->flags);
-        
+
         // Basic sanity checks
         if (src->ap_count >= 200 || src->client_count >= 250) {
              continue; // Garbage data
+        }
+
+        // Validate per-SSID client counts
+        uint8_t ssid_count = HISTORY_GET_SSID_COUNT(src->flags);
+        if (ssid_count > MAX_SSID_CLIENTS_PER_SAMPLE) {
+            continue; // Corrupt flags
+        }
+        for (uint8_t j = 0; j < ssid_count; j++) {
+            if (src->ssid_clients[j].client_count > 50) {
+                src->ssid_clients[j].client_count = 50;
+            }
         }
 
         if (time_valid) {

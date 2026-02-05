@@ -577,6 +577,7 @@ static void background_scan_task(void *arg) {
         ESP_LOGI(TAG, "Free heap after storage save: %lu bytes", (unsigned long)esp_get_free_heap_size());
         
         if (save_history) {
+            sample.crc8 = history_sample_crc8(&sample);
             err = scan_storage_append_history_sample(&sample);
             if (err != ESP_OK) {
                 ESP_LOGE(TAG, "Failed to save history sample: %s", esp_err_to_name(err));

@@ -12,7 +12,7 @@ typedef struct httpd_req httpd_req_t;
 
 #define SCAN_STORAGE_PARTITION "scandata"
 #define SCAN_MAGIC 0x50574E53  // "PWNS"
-#define SCAN_VERSION 4
+#define SCAN_VERSION 5
 #define MAX_APS_PER_SCAN 32
 #define MAX_STATIONS_PER_AP 8
 #define MAX_SCAN_HISTORY 1
@@ -98,6 +98,7 @@ typedef struct __attribute__((packed)) {
     uint8_t top_channels[7];       // Channel IDs of the top 7 most congested channels
     uint8_t top_counts[7];         // Device counts for the top 7 channels
     ssid_client_entry_t ssid_clients[MAX_SSID_CLIENTS_PER_SAMPLE];
+    uint8_t crc8;                  // CRC8 integrity check (computed over all preceding fields)
 } history_sample_t;
 
 // Helper macros for history_sample_t flags
@@ -107,6 +108,9 @@ typedef struct __attribute__((packed)) {
 #define HISTORY_GET_SSID_COUNT(flags) (((flags) & HISTORY_FLAG_SSID_COUNT_MASK) >> HISTORY_FLAG_SSID_COUNT_SHIFT)
 #define HISTORY_SET_SSID_COUNT(flags, count) ((flags) = ((flags) & ~HISTORY_FLAG_SSID_COUNT_MASK) | (((count) & 0x07) << HISTORY_FLAG_SSID_COUNT_SHIFT))
 #define HISTORY_IS_TIME_VALID(flags) ((flags) & HISTORY_FLAG_TIME_VALID)
+
+// CRC8 integrity check for history samples
+uint8_t history_sample_crc8(const history_sample_t *sample);
 
 // device lifecycle event (fixed size ring buffer)
 typedef struct __attribute__((packed)) {
