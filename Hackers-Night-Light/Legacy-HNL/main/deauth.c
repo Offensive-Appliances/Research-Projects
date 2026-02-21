@@ -315,6 +315,26 @@ void wifi_manager_stop_deauth(uint8_t bssid[6]) {
     if(!any_active && deauth_task_handle != NULL) {
         ESP_LOGI(TAG, "No active attacks, stopping deauth task");
         deauth_active = false;  // Set this while still holding mutex
+        
+        // Restore WiFi mode before killing task (task cleanup won't run after vTaskDelete)
+        wifi_mode_t current_mode;
+        esp_wifi_get_mode(&current_mode);
+        if (current_mode == WIFI_MODE_AP) {
+            ESP_LOGI(TAG, "Restoring APSTA mode before stopping task");
+            esp_wifi_disconnect();
+            esp_wifi_stop();
+            vTaskDelay(pdMS_TO_TICKS(100));
+            esp_wifi_set_mode(WIFI_MODE_APSTA);
+            esp_wifi_start();
+            vTaskDelay(pdMS_TO_TICKS(100));
+            
+            // Restore AP max_connection
+            wifi_config_t ap_cfg;
+            esp_wifi_get_config(WIFI_IF_AP, &ap_cfg);
+            ap_cfg.ap.max_connection = 4;
+            esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+        }
+        
         vTaskDelete(deauth_task_handle);
         deauth_task_handle = NULL;
     }

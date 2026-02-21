@@ -145,15 +145,18 @@ function hasValidTimestamp(sample) {
     return sample && sample.time_valid && sample.epoch_ts > 0;
 }
 
-function formatHistoryLabel(sample) {
+function formatHistoryLabel(sample, includeDate = false) {
     if (!sample) return '--';
     if (!hasValidTimestamp(sample)) {
         const hours = Math.floor(sample.uptime_sec / 3600);
         const mins = Math.floor((sample.uptime_sec % 3600) / 60);
         return hours > 0 ? `${hours}h${mins}m` : `${mins}m`;
     }
-    // Device epoch_ts is UTC, convert to local time for display
     const date = new Date(sample.epoch_ts * 1000);
+    if (includeDate) {
+        return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
+               date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+    }
     return date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
 }
 
@@ -408,6 +411,8 @@ function drawMultiLineChart(canvasId, samples, config) {
         ctx.font = (isMobile ? '10px' : '12px') + ' system-ui, sans-serif';
         ctx.textAlign = 'center';
         const labelCount = isMobile ? 3 : 5;
+        const hoursSpan = timeRangeMs / (1000 * 60 * 60);
+        const showDates = hoursSpan > 24;
 
         for (let i = 0; i < labelCount; i++) {
             const timeRatio = i / (labelCount - 1);
@@ -415,7 +420,13 @@ function drawMultiLineChart(canvasId, samples, config) {
             const x = padding.left + timeRatio * chartWidth;
 
             const date = new Date(timestamp);
-            const label = date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+            let label;
+            if (showDates) {
+                label = date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
+                        date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+            } else {
+                label = date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+            }
             ctx.fillText(label, x, rect.height - (isMobile ? 12 : 20));
         }
     } else {
@@ -658,6 +669,10 @@ function drawInteractiveChart(canvasId, samples, config, highlightIdx = -1) {
     ctx.font = (isMobile ? '10px' : '12px') + ' system-ui, sans-serif';
     ctx.textAlign = 'center';
     const labelCount = Math.min(isMobile ? 3 : 5, dataPoints.length);
+    
+    const timestamps = dataPoints.map(d => d.timestamp || 0).filter(t => t > 0);
+    const timeSpanMs = timestamps.length > 1 ? Math.max(...timestamps) - Math.min(...timestamps) : 0;
+    const showDates = timeSpanMs > 24 * 60 * 60 * 1000;
 
     if (labelCount === 1) {
         ctx.fillText(dataPoints[0].label, padding.left + chartWidth / 2, rect.height - (isMobile ? 12 : 20));
@@ -665,14 +680,27 @@ function drawInteractiveChart(canvasId, samples, config, highlightIdx = -1) {
         for (let i = 0; i < labelCount; i++) {
             const idx = Math.floor((i / (labelCount - 1)) * (dataPoints.length - 1));
             const x = padding.left + (idx / (dataPoints.length - 1)) * chartWidth;
-            ctx.fillText(dataPoints[idx].label, x, rect.height - (isMobile ? 12 : 20));
+            const d = dataPoints[idx];
+            let label = d.label;
+            if (d.timestamp && showDates) {
+                const date = new Date(d.timestamp);
+                label = date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
+                        date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+            }
+            ctx.fillText(label, x, rect.height - (isMobile ? 12 : 20));
         }
     }
 
     // Draw tooltip for highlighted point
     if (highlightIdx >= 0 && highlightIdx < points.length) {
         const p = points[highlightIdx];
-        const tooltipText = `${p.label}: ${p.value} ${config.unit}`;
+        let displayLabel = p.label;
+        if (p.timestamp && showDates) {
+            const date = new Date(p.timestamp);
+            displayLabel = date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
+                           date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+        }
+        const tooltipText = `${displayLabel}: ${p.value} ${config.unit}`;
         ctx.font = (isMobile ? '11px' : '13px') + ' system-ui, sans-serif';
         const textWidth = ctx.measureText(tooltipText).width;
         const tooltipPadding = isMobile ? 8 : 12;
