@@ -2694,9 +2694,9 @@ static httpd_handle_t start_https_server(void) {
     conf.prvtkey_len = strlen(s_tls_bundle.key_pem) + 1;
     conf.httpd.max_uri_handlers = 58;  // Increased for peer discovery routes
 #ifdef CONFIG_IDF_TARGET_ESP32C5
-    conf.httpd.max_open_sockets = 4;
+    conf.httpd.max_open_sockets = 2;
     conf.httpd.backlog_conn = 1;
-    conf.httpd.stack_size = 5120;
+    conf.httpd.stack_size = 4096;
 #else
     conf.httpd.max_open_sockets = 4;
     conf.httpd.backlog_conn = 1;
