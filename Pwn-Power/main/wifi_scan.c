@@ -1323,9 +1323,8 @@ void wifi_scan_stations() {
 
     // Restore mode and reconnect
     if(!is_sta_only) {
-        // APSTA mode: restore AP, then reconnect STA
-        ESP_LOGI(TAG, "Restoring APSTA mode");
-        esp_wifi_set_mode(WIFI_MODE_APSTA);
+        ESP_LOGI(TAG, "Restoring original WiFi mode");
+        esp_wifi_set_mode(original_mode);
         vTaskDelay(pdMS_TO_TICKS(500));  // AP needs time to initialize
     }
 
