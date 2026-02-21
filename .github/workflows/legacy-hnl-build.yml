@@ -1,0 +1,209 @@
+name: Build Legacy-HNL
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'Hackers-Night-Light/Legacy-HNL/**'
+  pull_request:
+    branches: [main, master]
+    paths:
+      - 'Hackers-Night-Light/Legacy-HNL/**'
+  workflow_dispatch:
+    inputs:
+      buildType:
+        description: "Select the build type"
+        required: true
+        type: choice
+        options:
+          - "prerelease"
+          - "all"
+        default: "prerelease"
+      releaseVersion:
+        description: "Release tag (e.g. v1.0.0). leave empty to auto-generate"
+        required: false
+        type: string
+        default: ""
+      releaseName:
+        description: "Release name (e.g. 'Bug Fix Release'). leave empty for auto-generated"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build for ${{ matrix.target.name }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Hackers-Night-Light/Legacy-HNL
+
+    strategy:
+      matrix:
+        target:
+          - { name: "esp32c3", idf_target: "esp32c3", sdkconfig_file: "configs/sdkconfig.esp32c3", zip_name: "legacy-hnl-esp32c3.zip", flash_size: "4MB" }
+          - { name: "esp32c5", idf_target: "esp32c5", sdkconfig_file: "configs/sdkconfig.esp32c5", zip_name: "legacy-hnl-esp32c5.zip", flash_size: "8MB" }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: actions/cache@v4
+        id: cache-idf
+        with:
+          path: |
+            ~/esp-idf
+            ~/.espressif
+          key: esp-idf-v5.5.1-${{ runner.os }}-${{ matrix.target.idf_target }}-${{ hashFiles('Hackers-Night-Light/Legacy-HNL/**') }}
+          restore-keys: |
+            esp-idf-v5.5.1-${{ runner.os }}-${{ matrix.target.idf_target }}-
+
+      - name: Install ESP-IDF Dependencies
+        if: steps.cache-idf.outputs.cache-hit != 'true'
+        working-directory: .
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git wget flex bison gperf python3-pip python3-venv cmake ninja-build ccache libffi-dev libssl-dev dfu-util libusb-1.0-0
+
+      - name: Install ESP-IDF
+        if: steps.cache-idf.outputs.cache-hit != 'true'
+        working-directory: .
+        run: |
+          rm -rf ~/esp-idf
+          git clone -b v5.5.1 --depth 1 --recursive https://github.com/espressif/esp-idf.git ~/esp-idf
+          ~/esp-idf/install.sh ${{ matrix.target.idf_target }}
+
+      - name: Apply Custom SDK Config
+        run: |
+          cp "${{ matrix.target.sdkconfig_file }}" sdkconfig
+          cp "${{ matrix.target.sdkconfig_file }}" sdkconfig.defaults
+
+      - name: Build Project
+        run: |
+          . ~/esp-idf/export.sh
+          export IDF_TARGET=${{ matrix.target.idf_target }}
+          idf.py build
+
+      - name: Package Binaries
+        run: |
+          . ~/esp-idf/export.sh
+          mkdir -p release
+          cp build/bootloader/bootloader.bin release/
+          cp build/partition_table/partition-table.bin release/partitions.bin
+          cp build/legacyhnl.bin release/firmware.bin
+          
+          python3 -m esptool --chip ${{ matrix.target.idf_target }} merge_bin \
+            --output release/legacy-hnl-merged.bin \
+            --flash_mode dio \
+            --flash_size ${{ matrix.target.flash_size }} \
+            0x0 release/bootloader.bin \
+            0x8000 release/partitions.bin \
+            0x20000 release/firmware.bin
+          
+          cd release && zip -j ../${{ matrix.target.zip_name }} *
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target.zip_name }}
+          path: Hackers-Night-Light/Legacy-HNL/${{ matrix.target.zip_name }}
+
+  upload_prerelease:
+    name: Create Pre-release and Upload Artifacts
+    needs: build
+    if: github.event.inputs.buildType == 'prerelease'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all_build_artifacts
+
+      - name: Verify and Prepare Artifacts for Upload
+        run: |
+          mkdir -p release_assets
+          find all_build_artifacts -name '*.zip' -exec cp {} release_assets/ \;
+          echo "Prepared release assets:"
+          ls -lh release_assets
+
+      - name: Generate Pre-release Tag and Title
+        id: pre_release_info
+        run: |
+          if [ -n "${{ github.event.inputs.releaseVersion }}" ]; then
+            TAG_NAME="${{ github.event.inputs.releaseVersion }}"
+          else
+            TAG_NAME="legacy-hnl-prerelease-$(date +'%Y%m%d-%H%M%S')-${GITHUB_SHA::7}"
+          fi
+          
+          if [ -n "${{ github.event.inputs.releaseName }}" ]; then
+            TITLE="${{ github.event.inputs.releaseName }}"
+          elif [ -n "${{ github.event.inputs.releaseVersion }}" ]; then
+            TITLE="Legacy-HNL Release $TAG_NAME"
+          else
+            TITLE="Legacy-HNL Pre-release $(date +'%Y-%m-%d %H:%M:%S')"
+          fi
+          
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "release_title=$TITLE" >> $GITHUB_OUTPUT
+          echo "Generated Tag: $TAG_NAME"
+          echo "Generated Title: $TITLE"
+
+      - name: Create GitHub Pre-Release and Upload Assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.pre_release_info.outputs.tag_name }}
+          TITLE: ${{ steps.pre_release_info.outputs.release_title }}
+        run: |
+          echo "Creating pre-release with tag $TAG and title '$TITLE'"
+          cat > release_notes.md <<EOF
+          Automated pre-release build for Legacy-HNL tag $TAG.
+
+          ## Flashing Instructions
+          Legacy-HNL uses OTA partition layouts:
+          - Application: firmware.bin at **0x20000**
+          - Bootloader: bootloader.bin at **0x0**
+          - Partition Table: partitions.bin at **0x8000**
+          - Flash Size: 4MB (ESP32-C3) or 8MB (ESP32-C5)
+
+          **Important:** Do NOT use factory offsets (0x10000 for app).
+
+          ## Supported Targets
+          - ESP32-C3: 4MB flash, 2.4GHz WiFi
+          - ESP32-C5: 8MB flash, 2.4GHz + 5GHz WiFi
+
+          ## Features
+          - WiFi scanning and monitoring
+          - BP5758 LED driver support
+          - Web interface for configuration
+          - OTA update support
+
+          EOF
+          if [ -z "$(ls -A release_assets/*.zip 2>/dev/null)" ]; then
+             echo "No ZIP files found in release_assets. Creating pre-release without assets."
+             gh release create "$TAG" \
+               --repo "$GITHUB_REPOSITORY" \
+               --title "$TITLE" \
+               --notes-file release_notes.md \
+               --prerelease
+          else
+             echo "Uploading assets from release_assets:"
+             ls -l release_assets/*.zip
+             gh release create "$TAG" \
+               --repo "$GITHUB_REPOSITORY" \
+               --title "$TITLE" \
+               --notes-file release_notes.md \
+               --prerelease \
+               release_assets/*.zip
+          fi
+          echo "Pre-release creation attempted."
