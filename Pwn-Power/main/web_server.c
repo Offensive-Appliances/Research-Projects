@@ -2638,7 +2638,7 @@ static httpd_handle_t start_http_redirect_server(void) {
     config.server_port = 80;
     config.lru_purge_enable = true;
     config.max_uri_handlers = 2;
-    config.max_open_sockets = 1;
+    config.max_open_sockets = 2;
     config.backlog_conn = 1;
     config.uri_match_fn = httpd_uri_match_wildcard;
 #ifdef CONFIG_IDF_TARGET_ESP32C5
@@ -2677,6 +2677,11 @@ static esp_err_t https_open_fn(httpd_handle_t hd, int sockfd) {
     return ESP_OK;
 }
 
+static void https_close_fn(httpd_handle_t hd, int sockfd) {
+    ESP_LOGD(TAG, "Closing socket fd=%d", sockfd);
+    close(sockfd);
+}
+
 static httpd_handle_t start_https_server(void) {
     if (!tls_cert_load_or_generate(&s_tls_bundle)) {
         ESP_LOGE(TAG, "TLS certificate generation failed");
@@ -2694,12 +2699,12 @@ static httpd_handle_t start_https_server(void) {
     conf.prvtkey_len = strlen(s_tls_bundle.key_pem) + 1;
     conf.httpd.max_uri_handlers = 58;  // Increased for peer discovery routes
 #ifdef CONFIG_IDF_TARGET_ESP32C5
-    conf.httpd.max_open_sockets = 2;
-    conf.httpd.backlog_conn = 1;
+    conf.httpd.max_open_sockets = 4;
+    conf.httpd.backlog_conn = 2;
     conf.httpd.stack_size = 4096;
 #else
-    conf.httpd.max_open_sockets = 4;
-    conf.httpd.backlog_conn = 1;
+    conf.httpd.max_open_sockets = 6;
+    conf.httpd.backlog_conn = 2;
     conf.httpd.stack_size = 6144;
 #endif
     conf.httpd.lru_purge_enable = true;
@@ -2709,7 +2714,8 @@ static httpd_handle_t start_https_server(void) {
     conf.httpd.keep_alive_idle = 5;
     conf.httpd.keep_alive_interval = 2;
     conf.httpd.keep_alive_count = 3;
-    conf.httpd.open_fn = https_open_fn; // check heap health before accepting connections
+    conf.httpd.open_fn = https_open_fn;
+    conf.httpd.close_fn = https_close_fn;
 
     httpd_handle_t server = NULL;
     esp_err_t err = httpd_ssl_start(&server, &conf);
