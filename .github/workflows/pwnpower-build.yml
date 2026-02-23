@@ -201,4 +201,92 @@ jobs:
                --prerelease \
                release_assets/*.zip
           fi
-          echo "Pre-release creation attempted."
+           echo "Pre-release creation attempted."
+
+  upload_release:
+    name: Create Release and Upload Artifacts
+    needs: build
+    if: github.event.inputs.buildType == 'all'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all_build_artifacts
+
+      - name: Verify and Prepare Artifacts for Upload
+        run: |
+          mkdir -p release_assets
+          find all_build_artifacts -name '*.zip' -exec cp {} release_assets/ \;
+          echo "Prepared release assets:"
+          ls -lh release_assets
+
+      - name: Generate Release Tag and Title
+        id: release_info
+        run: |
+          if [ -n "${{ github.event.inputs.releaseVersion }}" ]; then
+            TAG_NAME="${{ github.event.inputs.releaseVersion }}"
+          else
+            TAG_NAME="v$(date +'%Y.%m.%d')-${GITHUB_SHA::7}"
+          fi
+          
+          if [ -n "${{ github.event.inputs.releaseName }}" ]; then
+            TITLE="${{ github.event.inputs.releaseName }}"
+          elif [ -n "${{ github.event.inputs.releaseVersion }}" ]; then
+            TITLE="Release $TAG_NAME"
+          else
+            TITLE="Release $(date +'%Y-%m-%d %H:%M:%S')"
+          fi
+          
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "release_title=$TITLE" >> $GITHUB_OUTPUT
+          echo "Generated Tag: $TAG_NAME"
+          echo "Generated Title: $TITLE"
+
+      - name: Create GitHub Release and Upload Assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.release_info.outputs.tag_name }}
+          TITLE: ${{ steps.release_info.outputs.release_title }}
+        run: |
+          echo "Creating release with tag $TAG and title '$TITLE'"
+          cat > release_notes.md <<EOF
+          Automated release build for tag $TAG.
+
+          ## Flashing Instructions
+          PwnPower uses OTA partition layouts:
+          - Application: firmware.bin at **0x20000**
+          - Bootloader: bootloader.bin at **0x0**
+          - Partition Table: partitions.bin at **0x8000**
+          - Flash Size: 4MB (ESP32-C3) or 8MB (ESP32-C5)
+
+          **Important:** Do NOT use factory offsets (0x10000 for app).
+
+          ## Supported Targets
+          - ESP32-C3: 4MB flash, 2.4GHz WiFi
+          - ESP32-C5: 8MB flash, 2.4GHz + 5GHz WiFi
+
+          EOF
+          if [ -z "$(ls -A release_assets/*.zip 2>/dev/null)" ]; then
+             echo "No ZIP files found in release_assets. Creating release without assets."
+             gh release create "$TAG" \
+               --repo "$GITHUB_REPOSITORY" \
+               --title "$TITLE" \
+               --notes-file release_notes.md \
+               --latest
+          else
+             echo "Uploading assets from release_assets:"
+             ls -l release_assets/*.zip
+             gh release create "$TAG" \
+               --repo "$GITHUB_REPOSITORY" \
+               --title "$TITLE" \
+               --notes-file release_notes.md \
+               --latest \
+               release_assets/*.zip
+          fi
+          echo "Release creation attempted."
