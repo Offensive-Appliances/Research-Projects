@@ -2,9 +2,6 @@
 
 ## v2.0
 
-## new to rc4
-- Added CRC8 to history samples
-
 ### Added
 - Secure login flow with token-based API protection for the web UI
 - Privacy mode toggle to censor PII (MACs, SSIDs, vendors) for demos and content creation
