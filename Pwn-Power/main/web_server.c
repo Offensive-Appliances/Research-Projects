@@ -62,6 +62,81 @@ extern bool pwnpower_time_is_synced(void);
 static int s_smartplug_level = 0;
 static bool s_smartplug_inited = false;
 
+#define BL0937_CF_PIN    7
+#define BL0937_CF1_PIN   3
+#define BL0937_SEL_PIN   5
+
+typedef struct {
+    volatile uint32_t cf_pulses;
+    volatile uint32_t cf1_pulses;
+    volatile uint32_t cf_last_time;
+    volatile uint32_t cf1_last_time;
+    volatile float cf_freq;
+    volatile float cf1_freq;
+    int sel_state;
+    bool inited;
+    uint32_t last_read_time;
+    uint32_t last_cf_count;
+    uint32_t last_cf1_count;
+} bl0937_state_t;
+
+static bl0937_state_t s_bl0937 = {0};
+
+static void IRAM_ATTR bl0937_cf_isr_handler(void* arg) {
+    uint32_t now = esp_timer_get_time();
+    s_bl0937.cf_pulses++;
+    if (s_bl0937.cf_last_time > 0) {
+        uint32_t dt = now - s_bl0937.cf_last_time;
+        if (dt > 0 && dt < 1000000) {
+            s_bl0937.cf_freq = 1000000.0f / dt;
+        }
+    }
+    s_bl0937.cf_last_time = now;
+}
+
+static void IRAM_ATTR bl0937_cf1_isr_handler(void* arg) {
+    uint32_t now = esp_timer_get_time();
+    s_bl0937.cf1_pulses++;
+    if (s_bl0937.cf1_last_time > 0) {
+        uint32_t dt = now - s_bl0937.cf1_last_time;
+        if (dt > 0 && dt < 1000000) {
+            s_bl0937.cf1_freq = 1000000.0f / dt;
+        }
+    }
+    s_bl0937.cf1_last_time = now;
+}
+
+static void bl0937_init(void) {
+    if (s_bl0937.inited) return;
+    
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_POSEDGE,
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL << BL0937_CF_PIN) | (1ULL << BL0937_CF1_PIN),
+        .pull_down_en = 0,
+        .pull_up_en = 1,
+    };
+    gpio_config(&io_conf);
+    
+    gpio_config_t sel_conf = {
+        .intr_type = GPIO_INTR_DISABLE,
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL << BL0937_SEL_PIN),
+        .pull_down_en = 0,
+        .pull_up_en = 1,
+    };
+    gpio_config(&sel_conf);
+    
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(BL0937_CF_PIN, bl0937_cf_isr_handler, NULL);
+    gpio_isr_handler_add(BL0937_CF1_PIN, bl0937_cf1_isr_handler, NULL);
+    
+    s_bl0937.inited = true;
+    s_bl0937.last_read_time = esp_timer_get_time() / 1000;
+    ESP_LOGI(TAG, "BL0937 monitoring initialized (CF=IO%d, CF1=IO%d, SEL=IO%d)", 
+             BL0937_CF_PIN, BL0937_CF1_PIN, BL0937_SEL_PIN);
+}
+
 #ifndef HTTPD_503_SERVICE_UNAVAILABLE
 #define HTTPD_503_SERVICE_UNAVAILABLE 503
 #endif
@@ -1776,6 +1851,79 @@ static esp_err_t gpio_status_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+static esp_err_t bl0937_status_handler(httpd_req_t *req) {
+    update_last_request_time();
+    
+    if (!s_bl0937.inited) {
+        bl0937_init();
+    }
+    
+    uint32_t now = esp_timer_get_time() / 1000;
+    uint32_t dt_ms = now - s_bl0937.last_read_time;
+    
+    uint32_t cf_count = s_bl0937.cf_pulses;
+    uint32_t cf1_count = s_bl0937.cf1_pulses;
+    
+    uint32_t cf_rate = 0;
+    uint32_t cf1_rate = 0;
+    if (dt_ms > 0) {
+        cf_rate = (cf_count - s_bl0937.last_cf_count) * 1000 / dt_ms;
+        cf1_rate = (cf1_count - s_bl0937.last_cf1_count) * 1000 / dt_ms;
+    }
+    
+    s_bl0937.last_read_time = now;
+    s_bl0937.last_cf_count = cf_count;
+    s_bl0937.last_cf1_count = cf1_count;
+    
+    int sel_level = gpio_get_level(BL0937_SEL_PIN);
+    int cf_level = gpio_get_level(BL0937_CF_PIN);
+    int cf1_level = gpio_get_level(BL0937_CF1_PIN);
+    
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddNumberToObject(res, "cf_pin", BL0937_CF_PIN);
+    cJSON_AddNumberToObject(res, "cf1_pin", BL0937_CF1_PIN);
+    cJSON_AddNumberToObject(res, "sel_pin", BL0937_SEL_PIN);
+    
+    cJSON *pins = cJSON_AddObjectToObject(res, "pins");
+    cJSON_AddNumberToObject(pins, "cf_level", cf_level);
+    cJSON_AddNumberToObject(pins, "cf1_level", cf1_level);
+    cJSON_AddNumberToObject(pins, "sel_level", sel_level);
+    
+    cJSON *counts = cJSON_AddObjectToObject(res, "counts");
+    cJSON_AddNumberToObject(counts, "cf_total", cf_count);
+    cJSON_AddNumberToObject(counts, "cf1_total", cf1_count);
+    cJSON_AddNumberToObject(counts, "cf_rate_hz", cf_rate);
+    cJSON_AddNumberToObject(counts, "cf1_rate_hz", cf1_rate);
+    cJSON_AddNumberToObject(counts, "cf_freq_est", (double)s_bl0937.cf_freq);
+    cJSON_AddNumberToObject(counts, "cf1_freq_est", (double)s_bl0937.cf1_freq);
+    
+    cJSON_AddNumberToObject(res, "interval_ms", dt_ms);
+    cJSON_AddStringToObject(res, "sel_mode", sel_level ? "voltage" : "current");
+    cJSON_AddBoolToObject(res, "inited", s_bl0937.inited);
+    
+    char *out = cJSON_PrintUnformatted(res);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, out);
+    cJSON_free(out);
+    cJSON_Delete(res);
+    return ESP_OK;
+}
+
+static esp_err_t bl0937_reset_handler(httpd_req_t *req) {
+    s_bl0937.cf_pulses = 0;
+    s_bl0937.cf1_pulses = 0;
+    s_bl0937.cf_freq = 0;
+    s_bl0937.cf1_freq = 0;
+    s_bl0937.cf_last_time = 0;
+    s_bl0937.cf1_last_time = 0;
+    s_bl0937.last_cf_count = 0;
+    s_bl0937.last_cf1_count = 0;
+    
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"reset\"}");
+    return ESP_OK;
+}
+
 static esp_err_t scan_report_handler(httpd_req_t *req) {
     update_last_request_time();
     char chunk[512];
@@ -2717,6 +2865,9 @@ static esp_err_t register_routes(httpd_handle_t server) {
 
     register_authed(server, "/gpio", HTTP_POST, gpio_set_handler);
     register_authed(server, "/gpio/status", HTTP_GET, gpio_status_handler);
+    
+    register_authed(server, "/bl0937/status", HTTP_GET, bl0937_status_handler);
+    register_authed(server, "/bl0937/reset", HTTP_POST, bl0937_reset_handler);
 
     register_authed(server, "/wifi/connect", HTTP_POST, wifi_connect_handler);
     register_authed(server, "/wifi/settings", HTTP_POST, wifi_settings_handler);
@@ -3023,6 +3174,10 @@ static httpd_handle_t start_https_server(void) {
 #endif
 	conf.httpd.lru_purge_enable = true;
 	conf.httpd.send_wait_timeout = 10;
+	conf.httpd.recv_wait_timeout = 120;  // Large OTA uploads can stall between chunks on low-memory targets
+	conf.httpd.keep_alive_enable = false;
+	conf.httpd.keep_alive_idle = 5;
+	conf.httpd.keep_alive_interval = 2;
 	conf.httpd.keep_alive_count = 3;
     conf.httpd.open_fn = https_open_fn;
     conf.httpd.close_fn = https_close_fn;

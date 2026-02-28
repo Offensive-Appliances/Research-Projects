@@ -245,6 +245,54 @@
                             </div>
                         </div>
                     </div>
+                    
+                    <div class="card" style="margin-top:16px; border: 1px dashed rgba(255,255,255,0.2);">
+                        <h4 style="color: var(--accent);">BL0937 Power Monitor <span style="font-size:10px;opacity:0.7;">[EXPERIMENTAL]</span></h4>
+                        <div class="muted" style="margin-bottom:12px;">Real-time pin state monitoring for power measurement IC</div>
+                        
+                        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:16px;">
+                            <div class="pin-status-box" id="bl0937-cf-box">
+                                <div class="pin-label">CF (IO7)</div>
+                                <div class="pin-value" id="bl0937-cf-level">--</div>
+                                <div class="pin-desc">Active Power</div>
+                            </div>
+                            <div class="pin-status-box" id="bl0937-cf1-box">
+                                <div class="pin-label">CF1 (IO3)</div>
+                                <div class="pin-value" id="bl0937-cf1-level">--</div>
+                                <div class="pin-desc" id="bl0937-cf1-mode">Current/Voltage</div>
+                            </div>
+                            <div class="pin-status-box" id="bl0937-sel-box">
+                                <div class="pin-label">SEL (IO5)</div>
+                                <div class="pin-value" id="bl0937-sel-level">--</div>
+                                <div class="pin-desc" id="bl0937-sel-mode">Mode</div>
+                            </div>
+                        </div>
+                        
+                        <div style="background:rgba(0,0,0,0.3);padding:12px;border-radius:6px;margin-bottom:12px;">
+                            <div style="display:flex;justify-content:space-between;margin-bottom:8px;">
+                                <span class="muted">CF Pulse Count:</span>
+                                <strong id="bl0937-cf-count">0</strong>
+                            </div>
+                            <div style="display:flex;justify-content:space-between;margin-bottom:8px;">
+                                <span class="muted">CF Rate:</span>
+                                <strong id="bl0937-cf-rate">0 Hz</strong>
+                            </div>
+                            <div style="display:flex;justify-content:space-between;margin-bottom:8px;">
+                                <span class="muted">CF1 Pulse Count:</span>
+                                <strong id="bl0937-cf1-count">0</strong>
+                            </div>
+                            <div style="display:flex;justify-content:space-between;">
+                                <span class="muted">CF1 Rate:</span>
+                                <strong id="bl0937-cf1-rate">0 Hz</strong>
+                            </div>
+                        </div>
+                        
+                        <div class="btn-group">
+                            <button class="btn btn-sm" id="bl0937-refresh-btn" onclick="loadBL0937Status()">Refresh</button>
+                            <button class="btn btn-sm" id="bl0937-autorefresh-btn" onclick="toggleBL0937AutoRefresh()">Auto: OFF</button>
+                            <button class="btn btn-sm" onclick="resetBL0937Counts()">Reset Counts</button>
+                        </div>
+                    </div>
                 </div>
             </section>
 

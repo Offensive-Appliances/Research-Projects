@@ -2810,3 +2810,177 @@ if (typeof addTrackedInterval === 'function') {
     // Fallback: load peers after a delay
     setTimeout(loadPeerDevices, 2000);
 }
+
+// ============ BL0937 Power Monitor ============
+
+let bl0937AutoRefreshInterval = null;
+
+async function loadBL0937Status() {
+    const res = await fetchJSON('/bl0937/status');
+    if (!res) return;
+    
+    const cfBox = $('#bl0937-cf-box');
+    const cf1Box = $('#bl0937-cf1-box');
+    const selBox = $('#bl0937-sel-box');
+    
+    if (cfBox) {
+        const cfLevel = $('#bl0937-cf-level');
+        if (cfLevel) {
+            cfLevel.textContent = res.pins.cf_level ? 'HIGH' : 'LOW';
+            cfLevel.className = 'pin-value ' + (res.pins.cf_level ? 'high' : 'low');
+        }
+        cfBox.classList.toggle('active', res.pins.cf_level === 1);
+    }
+    
+    if (cf1Box) {
+        const cf1Level = $('#bl0937-cf1-level');
+        if (cf1Level) {
+            cf1Level.textContent = res.pins.cf1_level ? 'HIGH' : 'LOW';
+            cf1Level.className = 'pin-value ' + (res.pins.cf1_level ? 'high' : 'low');
+        }
+        cf1Box.classList.toggle('active', res.pins.cf1_level === 1);
+    }
+    
+    if (selBox) {
+        const selLevel = $('#bl0937-sel-level');
+        const selMode = $('#bl0937-sel-mode');
+        if (selLevel) {
+            selLevel.textContent = res.pins.sel_level ? 'HIGH' : 'LOW';
+            selLevel.className = 'pin-value ' + (res.pins.sel_level ? 'high' : 'low');
+        }
+        if (selMode) {
+            selMode.textContent = res.pins.sel_level ? 'Voltage Mode' : 'Current Mode';
+        }
+        selBox.classList.toggle('active', res.pins.sel_level === 1);
+    }
+    
+    const cf1ModeDesc = $('#bl0937-cf1-mode');
+    if (cf1ModeDesc) {
+        cf1ModeDesc.textContent = res.pins.sel_level ? 'Voltage RMS' : 'Current RMS';
+    }
+    
+    const cfCount = $('#bl0937-cf-count');
+    const cf1Count = $('#bl0937-cf1-count');
+    const cfRate = $('#bl0937-cf-rate');
+    const cf1Rate = $('#bl0937-cf1-rate');
+    
+    if (cfCount) cfCount.textContent = res.counts.cf_total.toLocaleString();
+    if (cf1Count) cf1Count.textContent = res.counts.cf1_total.toLocaleString();
+    if (cfRate) cfRate.textContent = res.counts.cf_rate_hz + ' Hz';
+    if (cf1Rate) cf1Rate.textContent = res.counts.cf1_rate_hz + ' Hz';
+}
+
+async function resetBL0937Counts() {
+    const res = await fetchJSON('/bl0937/reset', { method: 'POST' });
+    if (res && res.status === 'reset') {
+        showToast('BL0937 counts reset');
+        loadBL0937Status();
+    }
+}
+
+function toggleBL0937AutoRefresh() {
+    const btn = $('#bl0937-autorefresh-btn');
+    
+    if (bl0937AutoRefreshInterval) {
+        clearInterval(bl0937AutoRefreshInterval);
+        bl0937AutoRefreshInterval = null;
+        if (btn) btn.textContent = 'Auto: OFF';
+        showToast('BL0937 auto-refresh disabled');
+    } else {
+        bl0937AutoRefreshInterval = setInterval(loadBL0937Status, 500);
+        if (btn) btn.textContent = 'Auto: ON';
+        loadBL0937Status();
+        showToast('BL0937 auto-refresh enabled (500ms)');
+    }
+}
+
+function initOtaForm() {
+    const form = document.getElementById('ota-form');
+    if (!form) return;
+
+    form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+
+        const fileInput = document.getElementById('ota-file');
+        const statusEl = document.getElementById('ota-status');
+        const submitBtn = form.querySelector('button[type="submit"]');
+
+        if (!fileInput || !fileInput.files || fileInput.files.length === 0) {
+            if (statusEl) statusEl.textContent = 'No file selected.';
+            return;
+        }
+
+        const file = fileInput.files[0];
+        if (submitBtn) submitBtn.disabled = true;
+
+        otaUploadInProgress = true;
+        abortActiveJsonFetches();
+        const droppedQueuedRequests = requestQueue.clearPending(null);
+        if (activeScanController) {
+            activeScanController.abort();
+            activeScanController = null;
+        }
+        if (droppedQueuedRequests > 0) {
+            console.log(`OTA mode: dropped ${droppedQueuedRequests} queued API requests`);
+        }
+
+        if (statusEl) statusEl.textContent = 'Preparing OTA mode...';
+        try {
+            const prepHeaders = {};
+            if (authToken) prepHeaders['Authorization'] = `Bearer ${authToken}`;
+            const prepRes = await fetch('/ota/prepare', { method: 'POST', headers: prepHeaders });
+            if (!prepRes.ok) {
+                throw new Error(`Prepare failed (${prepRes.status})`);
+            }
+        } catch (err) {
+            otaUploadInProgress = false;
+            if (statusEl) statusEl.textContent = `OTA preparation failed: ${err.message}`;
+            if (submitBtn) submitBtn.disabled = false;
+            return;
+        }
+
+        // Stop all polling intervals before uploading.
+        // Each poll holds an open TLS connection; with ~44 KB free heap the device
+        // can't complete a new TLS handshake for the upload while those are active.
+        if (statusEl) statusEl.textContent = 'Stopping background polling...';
+        cleanupAllResources();
+        if (statusEl) statusEl.textContent = 'Waiting for OTA channel...';
+        await new Promise(resolve => setTimeout(resolve, 1200));
+
+        if (statusEl) statusEl.textContent = `Uploading ${file.name} (${(file.size / 1024).toFixed(1)} KB)...`;
+
+        try {
+            const headers = { 'Content-Type': 'application/octet-stream' };
+            if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+
+            const res = await fetch('/ota', {
+                method: 'POST',
+                headers,
+                body: file,
+            });
+
+            const text = await res.text();
+            let msg = text;
+            try {
+                const json = JSON.parse(text);
+                msg = json.message || json.status || text;
+            } catch (_) {}
+
+            if (res.ok) {
+                if (statusEl) statusEl.textContent = `Done: ${msg}`;
+                showToast('OTA upload complete — device rebooting...');
+            } else {
+                if (statusEl) statusEl.textContent = `Error ${res.status}: ${msg}`;
+                otaUploadInProgress = false;
+                if (submitBtn) submitBtn.disabled = false;
+            }
+        } catch (err) {
+            const httpUploader = `http://${window.location.host}/ota-upload${authToken ? `?token=${encodeURIComponent(authToken)}` : ''}`;
+            if (statusEl) {
+                statusEl.innerHTML = `Upload failed: ${err.message}<br>HTTPS upload reset detected. Open <a href="${httpUploader}" target="_blank" rel="noopener">HTTP OTA uploader</a> and upload the same .bin there.`;
+            }
+            otaUploadInProgress = false;
+            if (submitBtn) submitBtn.disabled = false;
+        }
+    });
+}
