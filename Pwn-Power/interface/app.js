@@ -3,6 +3,7 @@ let accumulatedNetworks = new Map();
 let selectedAP = null;
 let selectedClients = {};
 let gpioValue = 0;
+let otaUploadInProgress = false;
 
 // Client selection limits
 const MAX_DEAUTH_CLIENTS = 10;
@@ -18,6 +19,7 @@ let authToken = null;
 let appInitialized = false;
 let authPasswordEnabled = true;
 let historySamplesCache = { lastTimestamp: 0, samples: [] }; // Track latest timestamp for incremental updates
+let activeJsonFetchControllers = new Set();
 
 /**
  * Parse compact history sample format from backend.
@@ -66,6 +68,12 @@ const requestQueue = {
     maxConcurrent: 2,
     active: 0,
     queue: [],
+    clearPending(result = null) {
+        if (this.queue.length === 0) return 0;
+        const pending = this.queue.splice(0, this.queue.length);
+        pending.forEach(({ resolve }) => resolve(result));
+        return pending.length;
+    },
     async run(fn) {
         return new Promise((resolve, reject) => {
             this.queue.push({ fn, resolve, reject });
@@ -98,6 +106,11 @@ const scheduleIdle = (fn) => {
         setTimeout(fn, 0);
     }
 };
+
+function abortActiveJsonFetches() {
+    activeJsonFetchControllers.forEach((controller) => controller.abort());
+    activeJsonFetchControllers.clear();
+}
 
 async function fetchAuthed(url, opts = {}) {
     const headers = Object.assign({}, opts.headers || {});
@@ -161,12 +174,25 @@ function setBusyState(manualBusy, backgroundBusy) {
 }
 
 async function fetchJSON(url, opts = {}) {
+    if (otaUploadInProgress && !url.includes('/ota')) {
+        return null;
+    }
     return requestQueue.run(async () => {
+        if (otaUploadInProgress && !url.includes('/ota')) {
+            return null;
+        }
+        const controller = new AbortController();
+        activeJsonFetchControllers.add(controller);
         try {
             const headers = Object.assign({}, opts.headers || {});
             if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
 
-            const res = await fetch(url, { ...opts, headers });
+            const mergedOpts = { ...opts, headers };
+            if (!mergedOpts.signal) {
+                mergedOpts.signal = controller.signal;
+            }
+
+            const res = await fetch(url, mergedOpts);
             if (!res.ok) {
                 console.error(`HTTP error for ${url}: ${res.status} ${res.statusText}`);
                 if (res.status === 401) {
@@ -189,8 +215,13 @@ async function fetchJSON(url, opts = {}) {
                 return null;
             }
         } catch (e) {
+            if (e && e.name === 'AbortError') {
+                return null;
+            }
             console.error(`Fetch error for ${url}:`, e);
             return null;
+        } finally {
+            activeJsonFetchControllers.delete(controller);
         }
     });
 }
@@ -1941,6 +1972,7 @@ async function testWebhook(e) {
 document.addEventListener('DOMContentLoaded', () => {
     initLoginUI();
     checkAuthAndStart();
+    initOtaForm();
 });
 
 window.addEventListener('beforeunload', cleanupAllResources);

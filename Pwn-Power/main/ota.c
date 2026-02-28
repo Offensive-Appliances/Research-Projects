@@ -5,16 +5,21 @@
 
 static const char *TAG = "OTA";
 
-esp_err_t ota_begin(size_t expected_size, esp_ota_handle_t *out_handle, const esp_partition_t **out_part) {
+esp_err_t ota_begin(esp_ota_handle_t *out_handle, const esp_partition_t **out_part) {
 	if(!out_handle || !out_part) return ESP_ERR_INVALID_ARG;
 	const esp_partition_t *update_part = esp_ota_get_next_update_partition(NULL);
 	if (!update_part) {
 		ESP_LOGE(TAG, "no update partition, go fix your damn partitions");
 		return ESP_ERR_NOT_FOUND;
 	}
-	ESP_LOGI(TAG, "writing to partition subtype %d at offset 0x%lx", update_part->subtype, (unsigned long)update_part->address);
+	ESP_LOGI(TAG, "writing to partition subtype %d at offset 0x%lx size=0x%lx",
+		update_part->subtype, (unsigned long)update_part->address, (unsigned long)update_part->size);
 	esp_ota_handle_t h = 0;
-	esp_err_t err = esp_ota_begin(update_part, expected_size == 0 ? OTA_SIZE_UNKNOWN : expected_size, &h);
+	// OTA_WITH_SEQUENTIAL_WRITES erases one flash sector (4KB) just before each write,
+	// instead of erasing the entire partition (~1.6MB = ~12 seconds) upfront.
+	// Without this, esp_ota_begin blocks for ~12s erasing flash, the TCP receive window
+	// fills (~524KB), and the browser closes the connection before recv is ever called.
+	esp_err_t err = esp_ota_begin(update_part, OTA_WITH_SEQUENTIAL_WRITES, &h);
 	if (err != ESP_OK) {
 		ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
 		return err;

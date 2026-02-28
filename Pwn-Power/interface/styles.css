@@ -1722,3 +1722,50 @@ input[type="file"]::-webkit-file-upload-button:hover {
     background: rgba(255, 255, 255, 0.1);
     border-color: var(--accent);
 }
+
+/* BL0937 Pin Status Boxes */
+.pin-status-box {
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 12px;
+    text-align: center;
+    transition: all 0.2s ease;
+}
+
+.pin-status-box:hover {
+    border-color: rgba(255, 255, 255, 0.15);
+}
+
+.pin-status-box.active {
+    border-color: var(--success);
+    box-shadow: 0 0 10px rgba(0, 255, 0, 0.2);
+}
+
+.pin-status-box .pin-label {
+    font-size: 10px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+}
+
+.pin-status-box .pin-value {
+    font-size: 24px;
+    font-weight: 700;
+    margin: 4px 0;
+    transition: color 0.2s;
+}
+
+.pin-status-box .pin-value.high {
+    color: var(--success);
+}
+
+.pin-status-box .pin-value.low {
+    color: var(--text-muted);
+}
+
+.pin-status-box .pin-desc {
+    font-size: 11px;
+    color: var(--text-muted);
+}

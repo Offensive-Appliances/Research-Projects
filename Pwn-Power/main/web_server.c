@@ -38,6 +38,7 @@
 #include "esp_chip_info.h"
 #include "esp_ota_ops.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"
 
 extern const uint8_t _binary_web_content_gz_h_start[] asm("_binary_web_content_gz_h_start");
 extern const uint8_t _binary_web_content_gz_h_end[] asm("_binary_web_content_gz_h_end");
@@ -73,6 +74,11 @@ static hs_args_t hs_args;
 static httpd_handle_t s_https_server = NULL;
 static httpd_handle_t s_http_redirect_server = NULL; // http->https redirect server
 static tls_cert_bundle_t s_tls_bundle;
+static volatile bool s_ota_upload_in_progress = false;
+static bool s_ota_restore_bg_auto_scan = true;
+static bool s_ota_restore_idle_auto_hs = true;
+static bool s_ota_scans_paused = false;
+static bool s_ota_scan_tasks_stopped = false;
 
 static char s_ui_password[65] = {0};
 static char s_auth_token[65] = {0};
@@ -104,6 +110,76 @@ uint32_t webserver_get_last_request_time(void) {
 
 static void update_last_request_time(void) {
     g_last_request_time = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+}
+
+static void ota_quiet_scan_tasks(bool full_stop) {
+    if (!s_ota_scans_paused) {
+        const bg_scan_config_t *bg_cfg = background_scan_get_config();
+        const idle_scan_config_t *idle_cfg = idle_scanner_get_config();
+        s_ota_restore_bg_auto_scan = bg_cfg ? bg_cfg->auto_scan : true;
+        s_ota_restore_idle_auto_hs = idle_cfg ? idle_cfg->auto_handshake : true;
+    }
+
+    background_scan_set_enabled(false);
+    idle_scanner_set_auto_handshake(false);
+    s_ota_scans_paused = true;
+
+    if (full_stop && !s_ota_scan_tasks_stopped) {
+        background_scan_stop();
+        idle_scanner_stop();
+        s_ota_scan_tasks_stopped = true;
+        ESP_LOGI(TAG, "OTA prep: scan tasks stopped");
+    }
+}
+
+static void ota_restore_scan_tasks(void) {
+    if (!s_ota_scans_paused) {
+        return;
+    }
+
+    if (s_ota_scan_tasks_stopped) {
+        esp_err_t bg_start = background_scan_start();
+        if (bg_start != ESP_OK && bg_start != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "OTA restore: background_scan_start=%s", esp_err_to_name(bg_start));
+        }
+
+        esp_err_t idle_start = idle_scanner_start();
+        if (idle_start != ESP_OK && idle_start != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "OTA restore: idle_scanner_start=%s", esp_err_to_name(idle_start));
+        }
+    }
+
+    background_scan_set_enabled(s_ota_restore_bg_auto_scan);
+    idle_scanner_set_auto_handshake(s_ota_restore_idle_auto_hs);
+    s_ota_scans_paused = false;
+    s_ota_scan_tasks_stopped = false;
+    ESP_LOGI(TAG, "OTA restore: scan settings restored");
+}
+
+static void ota_close_other_http_sessions(httpd_req_t *req) {
+    if (!req || !s_https_server) {
+        return;
+    }
+
+    int keep_fd = httpd_req_to_sockfd(req);
+    int client_fds[8];
+    memset(client_fds, -1, sizeof(client_fds));
+    size_t fd_count = sizeof(client_fds) / sizeof(client_fds[0]);
+
+    esp_err_t list_err = httpd_get_client_list(s_https_server, &fd_count, client_fds);
+    if (list_err != ESP_OK) {
+        ESP_LOGW(TAG, "OTA prep: failed to list sessions: %s", esp_err_to_name(list_err));
+        return;
+    }
+
+    for (size_t i = 0; i < fd_count; i++) {
+        int fd = client_fds[i];
+        if (fd < 0 || fd == keep_fd) {
+            continue;
+        }
+        ESP_LOGI(TAG, "OTA prep: closing session fd=%d", fd);
+        httpd_sess_trigger_close(s_https_server, fd);
+    }
 }
 
 static void auth_generate_token(void) {
@@ -575,23 +651,25 @@ static esp_err_t index_handler(httpd_req_t *req) {
         return ESP_OK;
     }
 
-    char etag_buf[64];
-    size_t buf_len = sizeof(etag_buf);
-    if (httpd_req_get_hdr_value_str(req, "If-None-Match", etag_buf, buf_len) == ESP_OK) {
-        if (strcmp(etag_buf, "\"pwn-v1\"") == 0) {
-            ESP_LOGD(TAG, "Cached UI 304");
-            httpd_resp_set_status(req, "304 Not Modified");
-            httpd_resp_send(req, NULL, 0);
-            return ESP_OK;
-        }
-    }
+	char etag_buf[64];
+	char etag_expected[64];
+	snprintf(etag_expected, sizeof(etag_expected), "\"pwn-%u\"", (unsigned)WEB_UI_GZ_SIZE);
+	size_t buf_len = sizeof(etag_buf);
+	if (httpd_req_get_hdr_value_str(req, "If-None-Match", etag_buf, buf_len) == ESP_OK) {
+		if (strcmp(etag_buf, etag_expected) == 0) {
+			ESP_LOGD(TAG, "Cached UI 304");
+			httpd_resp_set_status(req, "304 Not Modified");
+			httpd_resp_send(req, NULL, 0);
+			return ESP_OK;
+		}
+	}
 
     ESP_LOGD(TAG, "Sending UI (%u bytes)", (unsigned int)WEB_UI_GZ_SIZE);
 
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
-    httpd_resp_set_hdr(req, "ETag", "\"pwn-v1\"");
+	httpd_resp_set_hdr(req, "ETag", etag_expected);
 
     // Send UI in 4KB chunks to reduce memory pressure
     const size_t chunk_size = 4096;
@@ -1108,6 +1186,11 @@ static esp_err_t handshake_pcap_handler(httpd_req_t *req) {
 }
 
 static esp_err_t ota_upload_handler(httpd_req_t *req) {
+	ESP_LOGI(TAG, "OTA upload handler invoked, content_len=%d", (int)req->content_len);
+	if (s_ota_upload_in_progress) {
+		httpd_resp_send_err(req, HTTPD_503_SERVICE_UNAVAILABLE, "OTA already in progress");
+		return ESP_FAIL;
+	}
 	if(deauth_task_handle != NULL) {
 		httpd_resp_send_err(req, HTTPD_503_SERVICE_UNAVAILABLE, "Cannot update during active attack");
 		return ESP_FAIL;
@@ -1117,43 +1200,84 @@ static esp_err_t ota_upload_handler(httpd_req_t *req) {
 		return ESP_FAIL;
 	}
 
-	ESP_LOGI(TAG, "OTA upload start, len=%d", (int)req->content_len);
+	update_last_request_time();
+	ota_quiet_scan_tasks(false);
+
+	ESP_LOGI(TAG, "OTA upload start: content_len=%d heap_free=%lu largest_block=%u",
+		(int)req->content_len,
+		(unsigned long)esp_get_free_heap_size(),
+		(unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 
 	esp_ota_handle_t handle = 0;
 	const esp_partition_t *part = NULL;
-	if (ota_begin(req->content_len, &handle, &part) != ESP_OK) {
-		ESP_LOGE(TAG, "ota begin failed");
+	if (ota_begin(&handle, &part) != ESP_OK) {
+		ESP_LOGE(TAG, "ota_begin failed: heap_free=%lu", (unsigned long)esp_get_free_heap_size());
 		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA begin failed (no OTA partition?)");
+		ota_restore_scan_tasks();
 		return ESP_FAIL;
 	}
+	ESP_LOGI(TAG, "OTA partition: label=%s offset=0x%08lx size=0x%08lx",
+		part->label, (unsigned long)part->address, (unsigned long)part->size);
+	s_ota_upload_in_progress = true;
 
 	esp_err_t status = ESP_FAIL;
 	char *buf = malloc(4096);
 	if (!buf) {
-		ESP_LOGE(TAG, "malloc failed");
+		ESP_LOGE(TAG, "malloc(4096) failed: heap_free=%lu largest_block=%u",
+			(unsigned long)esp_get_free_heap_size(),
+			(unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "malloc failed");
 		goto ota_upload_cleanup;
 	}
 
 	size_t remaining = req->content_len;
+	size_t written = 0;
+	size_t next_log = 65536; // log every 64 KB
+	int timeout_streak = 0;
 	while (remaining > 0) {
+		update_last_request_time();
 		int to_read = remaining > 4096 ? 4096 : (int)remaining;
 		int r = httpd_req_recv(req, buf, to_read);
+		if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+			timeout_streak++;
+			if (timeout_streak <= 10) {
+				ESP_LOGW(TAG, "recv timeout (%d/10) at written=%u remaining=%u", timeout_streak, (unsigned)written, (unsigned)remaining);
+				update_last_request_time();
+				continue;
+			}
+			ESP_LOGE(TAG, "recv timeout limit reached at written=%u remaining=%u", (unsigned)written, (unsigned)remaining);
+			httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Receive timeout");
+			goto ota_upload_cleanup;
+		}
 		if (r <= 0) {
-			ESP_LOGE(TAG, "recv failed r=%d", r);
+			ESP_LOGE(TAG, "recv error r=%d at written=%u remaining=%u heap_free=%lu",
+				r, (unsigned)written, (unsigned)remaining,
+				(unsigned long)esp_get_free_heap_size());
 			httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Receive failed");
 			goto ota_upload_cleanup;
 		}
-		if (ota_write(handle, buf, (size_t)r) != ESP_OK) {
-			ESP_LOGE(TAG, "ota write failed");
+		timeout_streak = 0;
+		esp_err_t wr = ota_write(handle, buf, (size_t)r);
+		if (wr != ESP_OK) {
+			ESP_LOGE(TAG, "ota_write failed: %s at written=%u remaining=%u",
+				esp_err_to_name(wr), (unsigned)written, (unsigned)remaining);
 			httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA write failed");
 			goto ota_upload_cleanup;
 		}
+		written += (size_t)r;
 		remaining -= (size_t)r;
+		if (written >= next_log) {
+			ESP_LOGI(TAG, "OTA progress: %u KB written, %u KB remaining, heap_free=%lu largest=%u",
+				(unsigned)(written / 1024), (unsigned)(remaining / 1024),
+				(unsigned long)esp_get_free_heap_size(),
+				(unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+			next_log += 65536;
+		}
 	}
+	ESP_LOGI(TAG, "OTA recv complete: %u bytes written", (unsigned)written);
 
 	if (ota_finish_and_set_boot(handle, part) != ESP_OK) {
-		ESP_LOGE(TAG, "ota finish failed");
+		ESP_LOGE(TAG, "ota_finish_and_set_boot failed");
 		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA finish failed");
 		goto ota_upload_cleanup;
 	}
@@ -1179,9 +1303,28 @@ ota_upload_cleanup:
 		free(buf);
 	}
 	if (status != ESP_OK) {
+		ota_restore_scan_tasks();
+		s_ota_upload_in_progress = false;
 		return ESP_FAIL;
 	}
+	s_ota_upload_in_progress = false;
 	ota_schedule_reboot_ms(3000);
+	return ESP_OK;
+}
+
+static esp_err_t ota_prepare_handler(httpd_req_t *req) {
+	update_last_request_time();
+	ESP_LOGI(TAG, "OTA prepare handler invoked");
+
+	if (s_ota_upload_in_progress) {
+		httpd_resp_send_err(req, HTTPD_503_SERVICE_UNAVAILABLE, "OTA already in progress");
+		return ESP_FAIL;
+	}
+
+	ota_quiet_scan_tasks(true);
+
+	httpd_resp_set_type(req, "application/json");
+	httpd_resp_sendstr(req, "{\"status\":\"prepared\"}");
 	return ESP_OK;
 }
 
@@ -1209,7 +1352,7 @@ static esp_err_t ota_fetch_handler(httpd_req_t *req) {
 
 	esp_ota_handle_t handle = 0;
 	const esp_partition_t *part = NULL;
-	if (ota_begin(0, &handle, &part) != ESP_OK) {
+	if (ota_begin(&handle, &part) != ESP_OK) {
 		cJSON_Delete(root);
 		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA begin failed");
 		return ESP_FAIL;
@@ -1408,6 +1551,8 @@ AUTHE_URI(uri_security_stats, "/security/stats", HTTP_GET, security_stats_handle
 
 AUTHE_URI(uri_general_capture, "/capture", HTTP_POST, general_capture_handler);
 
+AUTHE_URI(uri_ota_prepare, "/ota/prepare", HTTP_POST, ota_prepare_handler);
+
 AUTHE_URI(uri_ota, "/ota", HTTP_POST, ota_upload_handler);
 
 AUTHE_URI(uri_ota_fetch, "/ota/fetch", HTTP_POST, ota_fetch_handler);
@@ -1603,7 +1748,6 @@ static esp_err_t gpio_status_handler(httpd_req_t *req) {
     const char *pin_q = httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK ? buf : NULL;
     int pin = SMARTPLUG_GPIO;
     if (pin_q) {
-        // parse pin param if provided
         char *p = strstr(pin_q, "pin=");
         if (p) pin = atoi(p+4);
     }
@@ -1613,7 +1757,6 @@ static esp_err_t gpio_status_handler(httpd_req_t *req) {
         return ESP_FAIL;
     }
 
-    // report last set level; initialize if not yet
     if (!s_smartplug_inited) {
         gpio_pad_select_gpio(pin);
         gpio_set_direction(pin, GPIO_MODE_OUTPUT);
@@ -2560,6 +2703,7 @@ static esp_err_t register_routes(httpd_handle_t server) {
     httpd_register_uri_handler(server, &uri_capture_history);
     httpd_register_uri_handler(server, &uri_security_stats);
     httpd_register_uri_handler(server, &uri_general_capture);
+    httpd_register_uri_handler(server, &uri_ota_prepare);
     httpd_register_uri_handler(server, &uri_ota);
     httpd_register_uri_handler(server, &uri_ota_fetch);
     httpd_register_uri_handler(server, &uri_auth_status);
@@ -2615,22 +2759,167 @@ static esp_err_t register_routes(httpd_handle_t server) {
 }
 
 static esp_err_t redirect_handler(httpd_req_t *req) {
-    char host[128] = {0};
-    if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK) {
-        strlcpy(host, "192.168.66.1", sizeof(host));
-    }
+	char host[128] = {0};
+	if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK) {
+		strlcpy(host, "192.168.66.1", sizeof(host));
+	}
 
-    char location[192];
-    int written = snprintf(location, sizeof(location), "https://%s/", host);
-    if (written <= 0 || written >= (int)sizeof(location)) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Redirect failed");
-        return ESP_FAIL;
-    }
+	char location[192];
+	int written = snprintf(location, sizeof(location), "https://%s/", host);
+	if (written <= 0 || written >= (int)sizeof(location)) {
+		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Redirect failed");
+		return ESP_FAIL;
+	}
 
-    httpd_resp_set_status(req, "301 Moved Permanently");
-    httpd_resp_set_hdr(req, "Location", location);
-    httpd_resp_send(req, NULL, 0);
-    return ESP_OK;
+	httpd_resp_set_status(req, "301 Moved Permanently");
+	httpd_resp_set_hdr(req, "Location", location);
+	httpd_resp_send(req, NULL, 0);
+	return ESP_OK;
+}
+
+static esp_err_t http_ota_upload_page_handler(httpd_req_t *req) {
+	static const char page[] =
+		"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+		"<title>PwnPower OTA Upload</title>"
+		"<style>body{font-family:sans-serif;max-width:640px;margin:24px auto;padding:0 16px}"
+		"button{padding:10px 14px;font-size:16px}input{display:block;margin:12px 0}#status{margin-top:14px;white-space:pre-wrap}</style>"
+		"</head><body><h2>HTTP OTA Upload</h2>"
+		"<p>This page uploads firmware over HTTP to avoid HTTPS upload resets on low-memory targets.</p>"
+		"<input id='bin' type='file' accept='.bin,application/octet-stream'>"
+		"<button id='go'>Upload Firmware</button><div id='status'></div>"
+		"<script>"
+		"const q=new URLSearchParams(location.search);const token=q.get('token')||'';"
+		"const status=document.getElementById('status');"
+		"document.getElementById('go').onclick=async()=>{"
+		"const f=document.getElementById('bin').files[0];if(!f){status.textContent='Choose a .bin file first.';return;}"
+		"status.textContent='Uploading '+f.name+' ('+(f.size/1024).toFixed(1)+' KB)...';"
+		"try{const h={'Content-Type':'application/octet-stream'};if(token)h['Authorization']='Bearer '+token;"
+		"const r=await fetch('/ota',{method:'POST',headers:h,body:f});const t=await r.text();"
+		"status.textContent=r.ok?('Done: '+t):('Error '+r.status+': '+t);}"
+		"catch(e){status.textContent='Upload failed: '+e.message;}};"
+		"</script></body></html>";
+
+	httpd_resp_set_type(req, "text/html");
+	httpd_resp_send(req, page, HTTPD_RESP_USE_STRLEN);
+	return ESP_OK;
+}
+
+static esp_err_t http_ota_handler(httpd_req_t *req) {
+	if (!auth_is_authorized(req)) {
+		ESP_LOGW(TAG, "HTTP OTA rejected: unauthorized");
+		httpd_resp_set_status(req, "401 Unauthorized");
+		httpd_resp_set_type(req, "application/json");
+		httpd_resp_sendstr(req, "{\"error\":\"unauthorized\"}");
+		return ESP_FAIL;
+	}
+	if (s_ota_upload_in_progress) {
+		httpd_resp_send_err(req, HTTPD_503_SERVICE_UNAVAILABLE, "OTA already in progress");
+		return ESP_FAIL;
+	}
+
+	if(deauth_task_handle != NULL) {
+		httpd_resp_send_err(req, HTTPD_503_SERVICE_UNAVAILABLE, "Cannot update during active attack");
+		return ESP_FAIL;
+	}
+	if(hs_task_handle != NULL) {
+		httpd_resp_send_err(req, HTTPD_503_SERVICE_UNAVAILABLE, "Cannot update during handshake capture");
+		return ESP_FAIL;
+	}
+
+	update_last_request_time();
+	ota_quiet_scan_tasks(false);
+
+	ESP_LOGI(TAG, "HTTP OTA start: content_len=%d heap_free=%lu largest_block=%u",
+		(int)req->content_len,
+		(unsigned long)esp_get_free_heap_size(),
+		(unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+
+	esp_ota_handle_t handle = 0;
+	const esp_partition_t *part = NULL;
+	if (ota_begin(&handle, &part) != ESP_OK) {
+		ESP_LOGE(TAG, "ota_begin failed: heap_free=%lu", (unsigned long)esp_get_free_heap_size());
+		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA begin failed");
+		ota_restore_scan_tasks();
+		return ESP_FAIL;
+	}
+	ESP_LOGI(TAG, "OTA partition: label=%s offset=0x%08lx size=0x%08lx",
+		part->label, (unsigned long)part->address, (unsigned long)part->size);
+	s_ota_upload_in_progress = true;
+
+	esp_err_t status = ESP_FAIL;
+	char *buf = malloc(4096);
+	if (!buf) {
+		ESP_LOGE(TAG, "malloc(4096) failed");
+		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "malloc failed");
+		goto http_ota_cleanup;
+	}
+
+	size_t remaining = req->content_len;
+	size_t written = 0;
+	size_t next_log = 65536;
+	int timeout_streak = 0;
+	while (remaining > 0) {
+		update_last_request_time();
+		int to_read = remaining > 4096 ? 4096 : (int)remaining;
+		int r = httpd_req_recv(req, buf, to_read);
+		if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+			timeout_streak++;
+			if (timeout_streak <= 10) {
+				ESP_LOGW(TAG, "HTTP recv timeout (%d/10) at written=%u remaining=%u", timeout_streak, (unsigned)written, (unsigned)remaining);
+				update_last_request_time();
+				continue;
+			}
+			ESP_LOGE(TAG, "HTTP recv timeout limit reached at written=%u remaining=%u", (unsigned)written, (unsigned)remaining);
+			httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Receive timeout");
+			goto http_ota_cleanup;
+		}
+		if (r <= 0) {
+			ESP_LOGE(TAG, "recv error r=%d at written=%u remaining=%u", r, (unsigned)written, (unsigned)remaining);
+			httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Receive failed");
+			goto http_ota_cleanup;
+		}
+		timeout_streak = 0;
+		esp_err_t wr = ota_write(handle, buf, (size_t)r);
+		if (wr != ESP_OK) {
+			ESP_LOGE(TAG, "ota_write failed: %s", esp_err_to_name(wr));
+			httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA write failed");
+			goto http_ota_cleanup;
+		}
+		written += (size_t)r;
+		remaining -= (size_t)r;
+		if (written >= next_log) {
+			ESP_LOGI(TAG, "HTTP OTA progress: %u KB written, %u KB remaining",
+				(unsigned)(written / 1024), (unsigned)(remaining / 1024));
+			next_log += 65536;
+		}
+	}
+	ESP_LOGI(TAG, "HTTP OTA recv complete: %u bytes written", (unsigned)written);
+
+	if (ota_finish_and_set_boot(handle, part) != ESP_OK) {
+		ESP_LOGE(TAG, "ota_finish_and_set_boot failed");
+		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA finish failed");
+		goto http_ota_cleanup;
+	}
+
+	ESP_LOGI(TAG, "HTTP OTA complete, erasing data and rebooting soon");
+	
+	scan_storage_clear();
+	nvs_flash_erase();
+	
+	httpd_resp_set_type(req, "application/json");
+	httpd_resp_sendstr(req, "{\"status\":\"ok\",\"message\":\"Firmware uploaded. Rebooting in 3 seconds...\"}");
+	status = ESP_OK;
+
+http_ota_cleanup:
+	if (buf) free(buf);
+	if (status != ESP_OK) {
+		ota_restore_scan_tasks();
+		s_ota_upload_in_progress = false;
+		return ESP_FAIL;
+	}
+	s_ota_upload_in_progress = false;
+	ota_schedule_reboot_ms(3000);
+	return ESP_OK;
 }
 
 static httpd_handle_t start_http_redirect_server(void) {
@@ -2642,7 +2931,7 @@ static httpd_handle_t start_http_redirect_server(void) {
     config.backlog_conn = 1;
     config.uri_match_fn = httpd_uri_match_wildcard;
 #ifdef CONFIG_IDF_TARGET_ESP32C5
-    config.stack_size = 3072;
+    config.stack_size = 4096;
 #endif
 
     httpd_uri_t redirect_uri = {
@@ -2652,12 +2941,28 @@ static httpd_handle_t start_http_redirect_server(void) {
         .user_ctx = NULL,
     };
 
-    httpd_handle_t server = NULL;
-    if (httpd_start(&server, &config) == ESP_OK) {
-        httpd_register_uri_handler(server, &redirect_uri);
-        ESP_LOGI(TAG, "HTTP redirect server started on :80");
-    } else {
-        ESP_LOGW(TAG, "Failed to start HTTP redirect server");
+	httpd_uri_t ota_uri = {
+		.uri = "/ota",
+		.method = HTTP_POST,
+		.handler = http_ota_handler,
+		.user_ctx = NULL,
+	};
+
+	httpd_uri_t ota_page_uri = {
+		.uri = "/ota-upload",
+		.method = HTTP_GET,
+		.handler = http_ota_upload_page_handler,
+		.user_ctx = NULL,
+	};
+
+	httpd_handle_t server = NULL;
+	if (httpd_start(&server, &config) == ESP_OK) {
+		httpd_register_uri_handler(server, &ota_uri);
+		httpd_register_uri_handler(server, &ota_page_uri);
+		httpd_register_uri_handler(server, &redirect_uri);
+		ESP_LOGI(TAG, "HTTP server started on :80 (redirect + OTA)");
+	} else {
+        ESP_LOGW(TAG, "Failed to start HTTP server");
     }
 
     return server;
@@ -2665,7 +2970,16 @@ static httpd_handle_t start_http_redirect_server(void) {
 
 // Connection open handler - checks heap health before accepting HTTPS connections
 static esp_err_t https_open_fn(httpd_handle_t hd, int sockfd) {
-    uint32_t free_heap = esp_get_free_heap_size();
+	if (s_ota_upload_in_progress) {
+		ESP_LOGW(TAG, "Rejecting new HTTPS connection: OTA upload in progress");
+		return ESP_FAIL;
+	}
+
+    // Use largest contiguous block, not total free heap.
+    // Fragmentation can leave 40KB "free" but no single alloc > 10KB succeeding.
+    // mbedTLS dynamic buffer requires ~17KB contiguous during handshake (observed worst-case: 16749 bytes).
+    // After boot + WiFi init the C3 largest block settles at ~27KB; threshold must stay well below that.
+    size_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
 
     // Reject connections if heap is critically low
     // TLS handshakes need ~6-8KB for crypto buffers
@@ -2707,13 +3021,9 @@ static httpd_handle_t start_https_server(void) {
     conf.httpd.backlog_conn = 2;
     conf.httpd.stack_size = 6144;
 #endif
-    conf.httpd.lru_purge_enable = true;
-    conf.httpd.send_wait_timeout = 5;
-    conf.httpd.recv_wait_timeout = 5;
-    conf.httpd.keep_alive_enable = false;
-    conf.httpd.keep_alive_idle = 5;
-    conf.httpd.keep_alive_interval = 2;
-    conf.httpd.keep_alive_count = 3;
+	conf.httpd.lru_purge_enable = true;
+	conf.httpd.send_wait_timeout = 10;
+	conf.httpd.keep_alive_count = 3;
     conf.httpd.open_fn = https_open_fn;
     conf.httpd.close_fn = https_close_fn;
 
