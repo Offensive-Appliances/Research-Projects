@@ -96,14 +96,14 @@ typedef struct {
     int8_t rssi;
 } temp_station_t;
 
-static temp_station_t temp_stations[128];
+static temp_station_t temp_stations[64];
 static volatile int temp_station_count = 0;
 static uint32_t s_last_deauth_log_ms = 0;
 static uint32_t s_deauth_log_count = 0;
 
 static void promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     if (type != WIFI_PKT_DATA && type != WIFI_PKT_MGMT) return;
-    if (temp_station_count >= 128) return;
+    if (temp_station_count >= 64) return;
     
     wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
     if (pkt->rx_ctrl.sig_len < 24) return;

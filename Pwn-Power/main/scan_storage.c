@@ -33,8 +33,8 @@
 
 static flash_manager_t flash_mgr;
 static storage_index_t storage_index;
-static char report_json[4096];
-static char intelligence_json[2048];
+static char report_json[1024];
+static char intelligence_json[512];
 static ring_buffer_ctx_t history_ring;
 static ring_buffer_ctx_t events_ring;
 
@@ -1045,7 +1045,7 @@ esp_err_t scan_storage_get_device_presence(const uint8_t *mac, device_presence_t
 }
 
 const char* scan_storage_get_device_presence_json(void) {
-    static char buf[6144];
+    static char buf[4096];
     int pos = 0;
     uint32_t now = get_uptime_sec();
 
@@ -1060,7 +1060,7 @@ const char* scan_storage_get_device_presence_json(void) {
     
     pos += snprintf(buf + pos, sizeof(buf) - pos, "{\"devices\":[");
     
-    for (int i = 0; i < tracked_device_count && pos < (int)sizeof(buf) - 400; i++) {
+    for (int i = 0; i < tracked_device_count && pos < (int)sizeof(buf) - 200; i++) {
         device_presence_t *dev = &tracked_devices[i];
         
         uint32_t last_seen_ago;
@@ -1568,7 +1568,7 @@ esp_err_t scan_storage_send_unified_intelligence_chunked(httpd_req_t *req) {
 }
 
 const char* scan_storage_get_unified_intelligence_json(void) {
-    static char unified_buf[6144];
+    static char unified_buf[64];
     snprintf(unified_buf, sizeof(unified_buf), "{\"error\":\"deprecated - use chunked endpoint\"}");
     return unified_buf;
 }
