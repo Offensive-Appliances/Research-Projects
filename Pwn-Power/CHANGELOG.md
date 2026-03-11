@@ -1,5 +1,13 @@
 # PwnPower Changelog
 
+## v2.1
+
+### Fixed
+- Removed blocking delay from the Wi-Fi disconnect event callback by deferring reconnect attempts to a timer.
+- Fixed a webhook payload memory leak by ensuring JSON payload buffers are freed on all send paths.
+- Replaced shared static handshake/general-capture task arguments with per-request heap arguments and task-owned cleanup.
+- Reduced promiscuous deauth log spam by rate-limiting and aggregating deauth logging in background scans.
+
 ## v2.0
 
 ### Added

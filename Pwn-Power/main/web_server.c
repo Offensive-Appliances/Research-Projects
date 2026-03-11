@@ -33,6 +33,7 @@
 #include <stddef.h>
 #include <time.h>
 #include <string.h>
+#include <stdlib.h>
 #include "peer_discovery.h"
 #include "firmware_info.h"
 #include "esp_chip_info.h"
@@ -69,7 +70,6 @@ static bool s_smartplug_inited = false;
 #define MAX_HS_STA 10
 typedef struct { uint8_t bssid[6]; int channel; int duration; uint8_t stas[MAX_HS_STA][6]; int sta_count; } hs_args_t;
 static TaskHandle_t hs_task_handle = NULL;
-static hs_args_t hs_args;
 
 static httpd_handle_t s_https_server = NULL;
 static httpd_handle_t s_http_redirect_server = NULL; // http->https redirect server
@@ -625,12 +625,18 @@ static bool attempt_sta_connect(const char *ssid, const char *password,
 }
 static void hs_task(void *arg) {
 	hs_args_t *a = (hs_args_t*)arg;
+	if (!a) {
+		hs_task_handle = NULL;
+		vTaskDelete(NULL);
+		return;
+	}
 	ESP_LOGI(TAG, "hs_task start: bssid=%02X:%02X:%02X:%02X:%02X:%02X channel=%d duration=%d sta_count=%d",
 			a->bssid[0], a->bssid[1], a->bssid[2], a->bssid[3], a->bssid[4], a->bssid[5], a->channel, a->duration, a->sta_count);
 	vTaskDelay(pdMS_TO_TICKS(300));
 	int e = 0;
 	start_handshake_capture(a->bssid, a->channel, a->duration, a->stas, a->sta_count, &e);
 	ESP_LOGI(TAG, "Handshake capture done: eapol=%d", e);
+	free(a);
 	hs_task_handle = NULL;
 	vTaskDelete(NULL);
 }
@@ -1153,18 +1159,30 @@ static esp_err_t handshake_handler(httpd_req_t *req) {
         httpd_resp_send_err(req, HTTPD_503_SERVICE_UNAVAILABLE, "handshake busy");
         return ESP_FAIL;
     }
-    memcpy(hs_args.bssid, bssid, 6);
-    hs_args.channel = channel;
-    hs_args.duration = duration;
-    memcpy(hs_args.stas, stas, sizeof(stas));
-    hs_args.sta_count = sta_count;
+    hs_args_t *task_args = (hs_args_t*)malloc(sizeof(hs_args_t));
+    if (!task_args) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+        return ESP_FAIL;
+    }
+    memcpy(task_args->bssid, bssid, 6);
+    task_args->channel = channel;
+    task_args->duration = duration;
+    memcpy(task_args->stas, stas, sizeof(stas));
+    task_args->sta_count = sta_count;
     ESP_LOGI(TAG, "Handshake capture start: bssid=%s, channel=%d, duration=%d, sta_count=%d", mac_json->valuestring, channel, duration, sta_count);
+    cJSON_Delete(root);
+
+    if (xTaskCreate(hs_task, "hs_task", 4096, task_args, 5, &hs_task_handle) != pdPASS) {
+        free(task_args);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to start capture task");
+        return ESP_FAIL;
+    }
+
     cJSON *res = cJSON_CreateObject();
     cJSON_AddStringToObject(res, "status", "started");
     json_send_response(req, res);
-    ESP_LOGI(TAG, "Handshake response sent, starting capture task");
-    cJSON_Delete(root);
-    xTaskCreate(hs_task, "hs_task", 4096, &hs_args, 5, &hs_task_handle);
+    ESP_LOGI(TAG, "Handshake response sent, capture task started");
     return ESP_OK;
 }
 
@@ -1476,8 +1494,13 @@ AUTHE_URI(uri_handshake_alt, "/handshake", HTTP_POST, handshake_handler);
 typedef struct { int channel; int duration; } gc_args_t;
 static void gc_task(void *arg) {
     gc_args_t *a = (gc_args_t*)arg;
+    if (!a) {
+        vTaskDelete(NULL);
+        return;
+    }
     vTaskDelay(pdMS_TO_TICKS(200));
     start_general_capture(a->channel, a->duration);
+    free(a);
     vTaskDelete(NULL);
 }
 
@@ -2926,13 +2949,20 @@ static httpd_handle_t start_http_redirect_server(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 2;
+    config.max_uri_handlers = 3;
     config.max_open_sockets = 2;
     config.backlog_conn = 1;
     config.uri_match_fn = httpd_uri_match_wildcard;
 #ifdef CONFIG_IDF_TARGET_ESP32C5
     config.stack_size = 4096;
 #endif
+
+    httpd_uri_t redirect_root = {
+        .uri = "/",
+        .method = HTTP_GET,
+        .handler = redirect_handler,
+        .user_ctx = NULL,
+    };
 
     httpd_uri_t redirect_uri = {
         .uri = "/*",
@@ -2957,6 +2987,7 @@ static httpd_handle_t start_http_redirect_server(void) {
 
 	httpd_handle_t server = NULL;
 	if (httpd_start(&server, &config) == ESP_OK) {
+		httpd_register_uri_handler(server, &redirect_root);
 		httpd_register_uri_handler(server, &ota_uri);
 		httpd_register_uri_handler(server, &ota_page_uri);
 		httpd_register_uri_handler(server, &redirect_uri);
@@ -2980,6 +3011,7 @@ static esp_err_t https_open_fn(httpd_handle_t hd, int sockfd) {
     // mbedTLS dynamic buffer requires ~17KB contiguous during handshake (observed worst-case: 16749 bytes).
     // After boot + WiFi init the C3 largest block settles at ~27KB; threshold must stay well below that.
     size_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    size_t free_heap = esp_get_free_heap_size();
 
     // Reject connections if heap is critically low
     // TLS handshakes need ~6-8KB for crypto buffers

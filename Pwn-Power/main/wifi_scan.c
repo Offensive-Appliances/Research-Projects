@@ -57,6 +57,33 @@ static volatile uint32_t s_deauth_last_seen = 0;
 static volatile uint32_t s_hidden_ap_count = 0;
 static volatile uint32_t s_probe_request_count = 0;
 
+static void restore_wifi_mode_with_retry(wifi_mode_t target_mode, const char *context) {
+    esp_err_t err = ESP_FAIL;
+    for (int i = 0; i < 3; i++) {
+        err = esp_wifi_set_mode(target_mode);
+        if (err == ESP_OK) {
+            return;
+        }
+        ESP_LOGW(TAG, "%s: esp_wifi_set_mode(%d) failed (%s), retry %d/3",
+                 context,
+                 (int)target_mode,
+                 esp_err_to_name(err),
+                 i + 1);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    ESP_LOGW(TAG, "%s: mode restore failed, attempting wifi restart fallback", context);
+    esp_wifi_stop();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    err = esp_wifi_set_mode(target_mode);
+    if (err == ESP_OK) {
+        err = esp_wifi_start();
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "%s: fallback restore failed: %s", context, esp_err_to_name(err));
+    }
+}
+
 // Smart channel weighting system
 uint32_t channel_scan_counts[MAX_CHANNEL_ID + 1] = {0};     // Times each channel was scanned
 uint32_t channel_discovery_counts[MAX_CHANNEL_ID + 1] = {0}; // Devices found per channel
@@ -1283,12 +1310,18 @@ void wifi_scan_stations() {
     }
 
     // For APSTA mode, need to switch to STA-only for promiscuous scanning
+    bool station_phase_enabled = true;
     if(!is_sta_only) {
         ESP_LOGI(TAG, "Temporarily switching to STA mode for station scan");
         esp_wifi_deauth_sta(0);  // Kick AP clients first
         vTaskDelay(pdMS_TO_TICKS(100));
-        esp_wifi_set_mode(WIFI_MODE_STA);
-        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_err_t mode_err = esp_wifi_set_mode(WIFI_MODE_STA);
+        if (mode_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to switch to STA mode for station scan: %s", esp_err_to_name(mode_err));
+            station_phase_enabled = false;
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
     }
 
     // Reset station count for new scan
@@ -1298,24 +1331,26 @@ void wifi_scan_stations() {
 
     ESP_LOGI(TAG, "Starting station scan (probes: 0)");
 
-    // Run promiscuous scan
-    esp_wifi_set_promiscuous(true);
-    esp_wifi_set_promiscuous_rx_cb(stations_sniffer);
+    if (station_phase_enabled) {
+        // Run promiscuous scan
+        esp_wifi_set_promiscuous(true);
+        esp_wifi_set_promiscuous_rx_cb(stations_sniffer);
 
-    int ch_count = known_channel_count > 0 ? known_channel_count : (int)get_scan_channels_size();
-    const uint8_t* channels = get_scan_channels();
-    uint32_t dwell_time_ms = 125;
-    uint32_t iterations = 2;  // ~2.5s total for typical channel counts
+        int ch_count = known_channel_count > 0 ? known_channel_count : (int)get_scan_channels_size();
+        const uint8_t* channels = get_scan_channels();
+        uint32_t dwell_time_ms = 125;
+        uint32_t iterations = 2;  // ~2.5s total for typical channel counts
 
-    for (uint32_t iter = 0; iter < iterations; iter++) {
-        for (int i = 0; i < ch_count; i++) {
-            uint8_t ch = (known_channel_count > 0) ? known_ap_channels[i] : channels[i];
-            esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
-            vTaskDelay(pdMS_TO_TICKS(dwell_time_ms));
+        for (uint32_t iter = 0; iter < iterations; iter++) {
+            for (int i = 0; i < ch_count; i++) {
+                uint8_t ch = (known_channel_count > 0) ? known_ap_channels[i] : channels[i];
+                esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+                vTaskDelay(pdMS_TO_TICKS(dwell_time_ms));
+            }
         }
-    }
 
-    esp_wifi_set_promiscuous(false);
+        esp_wifi_set_promiscuous(false);
+    }
     ESP_LOGI(TAG, "Station scan done, probes: %lu", (unsigned long)s_probe_request_count);
 
     // Probe hidden APs
@@ -1324,7 +1359,7 @@ void wifi_scan_stations() {
     // Restore mode and reconnect
     if(!is_sta_only) {
         ESP_LOGI(TAG, "Restoring original WiFi mode");
-        esp_wifi_set_mode(original_mode);
+        restore_wifi_mode_with_retry(original_mode, "wifi_scan_stations");
         vTaskDelay(pdMS_TO_TICKS(500));  // AP needs time to initialize
     }
 

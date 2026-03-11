@@ -12,6 +12,33 @@
 
 static const char *TAG = "Handshake";
 
+static void restore_wifi_mode_with_retry(wifi_mode_t target_mode, const char *context) {
+    esp_err_t err = ESP_FAIL;
+    for (int i = 0; i < 3; i++) {
+        err = esp_wifi_set_mode(target_mode);
+        if (err == ESP_OK) {
+            return;
+        }
+        ESP_LOGW(TAG, "%s: esp_wifi_set_mode(%d) failed (%s), retry %d/3",
+                 context,
+                 (int)target_mode,
+                 esp_err_to_name(err),
+                 i + 1);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    ESP_LOGW(TAG, "%s: mode restore failed, attempting wifi restart fallback", context);
+    esp_wifi_stop();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    err = esp_wifi_set_mode(target_mode);
+    if (err == ESP_OK) {
+        err = esp_wifi_start();
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "%s: fallback restore failed: %s", context, esp_err_to_name(err));
+    }
+}
+
 static volatile int s_eapol_count = 0;
 static wifi_promiscuous_filter_t s_prev_filter;
 static bool s_prev_filter_valid = false;
@@ -237,8 +264,12 @@ esp_err_t start_handshake_capture(uint8_t bssid[6], int channel, int duration_se
     ESP_LOGI(TAG, "original mode=%d", (int)original_mode);
     if (original_mode == WIFI_MODE_APSTA) {
         ESP_LOGI(TAG, "switching to STA for capture");
-        esp_wifi_set_mode(WIFI_MODE_STA);
-        vTaskDelay(pdMS_TO_TICKS(100));
+        esp_err_t mode_err = esp_wifi_set_mode(WIFI_MODE_STA);
+        if (mode_err == ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        } else {
+            ESP_LOGW(TAG, "Failed to switch to STA for capture: %s", esp_err_to_name(mode_err));
+        }
     }
 
     s_eapol_count = 0;
@@ -282,7 +313,7 @@ esp_err_t start_handshake_capture(uint8_t bssid[6], int channel, int duration_se
     esp_wifi_set_promiscuous_rx_cb(NULL);
     ESP_LOGI(TAG, "promisc disabled");
 
-    esp_wifi_set_mode(original_mode);
+    restore_wifi_mode_with_retry(original_mode, "start_handshake_capture");
     vTaskDelay(pdMS_TO_TICKS(100));
 
     if (eapol_count_out) *eapol_count_out = s_eapol_count;
@@ -316,8 +347,12 @@ esp_err_t start_handshake_capture_preserve(uint8_t bssid[6], int channel, int du
     ESP_LOGI(TAG, "original mode=%d", (int)original_mode);
     if (original_mode == WIFI_MODE_APSTA) {
         ESP_LOGI(TAG, "switching to STA for capture");
-        esp_wifi_set_mode(WIFI_MODE_STA);
-        vTaskDelay(pdMS_TO_TICKS(100));
+        esp_err_t mode_err = esp_wifi_set_mode(WIFI_MODE_STA);
+        if (mode_err == ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        } else {
+            ESP_LOGW(TAG, "Failed to switch to STA for preserve capture: %s", esp_err_to_name(mode_err));
+        }
     }
 
     // Check if we should preserve existing EAPOL frames
@@ -375,7 +410,7 @@ esp_err_t start_handshake_capture_preserve(uint8_t bssid[6], int channel, int du
     esp_wifi_set_promiscuous_rx_cb(NULL);
     ESP_LOGI(TAG, "promisc disabled");
 
-    esp_wifi_set_mode(original_mode);
+    restore_wifi_mode_with_retry(original_mode, "start_handshake_capture_preserve");
     vTaskDelay(pdMS_TO_TICKS(100));
 
     if (eapol_count_out) *eapol_count_out = s_eapol_count;
@@ -405,8 +440,12 @@ esp_err_t start_general_capture(int channel, int duration_seconds) {
     wifi_mode_t original_mode;
     esp_wifi_get_mode(&original_mode);
     if (original_mode == WIFI_MODE_APSTA) {
-        esp_wifi_set_mode(WIFI_MODE_STA);
-        vTaskDelay(pdMS_TO_TICKS(100));
+        esp_err_t mode_err = esp_wifi_set_mode(WIFI_MODE_STA);
+        if (mode_err == ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        } else {
+            ESP_LOGW(TAG, "Failed to switch to STA for general capture: %s", esp_err_to_name(mode_err));
+        }
     }
     handshake_clear_pcap();
     s_capture_all = true;
@@ -434,7 +473,7 @@ esp_err_t start_general_capture(int channel, int duration_seconds) {
     }
     esp_wifi_set_promiscuous_rx_cb(NULL);
     s_capture_all = false;
-    esp_wifi_set_mode(original_mode);
+    restore_wifi_mode_with_retry(original_mode, "start_general_capture");
     vTaskDelay(pdMS_TO_TICKS(100));
     return ESP_OK;
 }

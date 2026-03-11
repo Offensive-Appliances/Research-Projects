@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/timers.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -55,6 +56,24 @@ static uint32_t s_next_retry_time = 0;
 static const uint32_t RETRY_INTERVALS[] = {30, 60, 120, 300, 600}; // 30s, 1m, 2m, 5m, 10m
 static const int RETRY_INTERVAL_COUNT = 5;
 static int s_current_retry_interval = 0;
+static TimerHandle_t s_sta_retry_timer = NULL;
+
+static void sta_retry_timer_cb(TimerHandle_t timer) {
+    (void)timer;
+
+    if (wifi_scan_is_station_scan_active()) {
+        ESP_LOGI(TAG, "Station scan active, skipping deferred reconnect");
+        return;
+    }
+
+    sta_config_t sta_cfg;
+    if (sta_config_get(&sta_cfg) != ESP_OK || !sta_cfg.auto_connect || strlen(sta_cfg.ssid) == 0) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "Deferred STA reconnect attempt");
+    esp_wifi_connect();
+}
 
 static void pwnpower_sntp_sync_time(void) {
     // Debug DNS resolution for NTP
@@ -133,8 +152,20 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
             s_retry_num++;
             uint32_t delay_ms = 1000 * s_retry_num;  // 1s, 2s, 3s, 4s, 5s
             ESP_LOGI(TAG, "STA disconnected, retry %d/%d in %lums", s_retry_num, MAX_RETRY, (unsigned long)delay_ms);
-            vTaskDelay(pdMS_TO_TICKS(delay_ms));
-            esp_wifi_connect();
+
+            if (!s_sta_retry_timer) {
+                s_sta_retry_timer = xTimerCreate("sta_retry", pdMS_TO_TICKS(delay_ms), pdFALSE, NULL, sta_retry_timer_cb);
+                if (!s_sta_retry_timer) {
+                    ESP_LOGE(TAG, "Failed to create STA retry timer, connecting immediately");
+                    esp_wifi_connect();
+                    return;
+                }
+            }
+
+            if (xTimerChangePeriod(s_sta_retry_timer, pdMS_TO_TICKS(delay_ms), 0) != pdPASS) {
+                ESP_LOGW(TAG, "Failed to schedule deferred reconnect, connecting immediately");
+                esp_wifi_connect();
+            }
         } else {
             // Exhausted immediate retries, schedule periodic retry
             ESP_LOGW(TAG, "STA connection failed after %d retries", MAX_RETRY);

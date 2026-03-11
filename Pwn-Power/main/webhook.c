@@ -398,6 +398,7 @@ static esp_err_t send_event(const device_event_t *event) {
     }
     
     char *json_str = cJSON_PrintUnformatted(root);
+    esp_err_t result = ESP_FAIL;
     cJSON_Delete(root);
     
     if (!json_str) return ESP_ERR_NO_MEM;
@@ -451,11 +452,13 @@ static esp_err_t send_event(const device_event_t *event) {
 
     if (err == ESP_OK && status_code >= 200 && status_code < 300) {
         ESP_LOGI(TAG, "Webhook sent successfully (status=%d)", status_code);
-        return ESP_OK;
+        result = ESP_OK;
     } else {
         ESP_LOGW(TAG, "Webhook failed (err=%d, status=%d)", err, status_code);
-        return ESP_FAIL;
     }
+
+    free(json_str);
+    return result;
 }
 
 static void webhook_dispatcher_task(void *arg) {

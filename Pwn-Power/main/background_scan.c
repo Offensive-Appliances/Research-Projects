@@ -51,6 +51,33 @@ static uint32_t get_uptime_sec(void) {
     return (uint32_t)(esp_timer_get_time() / 1000000ULL);
 }
 
+static void restore_wifi_mode_with_retry(wifi_mode_t target_mode, const char *context) {
+    esp_err_t err = ESP_FAIL;
+    for (int i = 0; i < 3; i++) {
+        err = esp_wifi_set_mode(target_mode);
+        if (err == ESP_OK) {
+            return;
+        }
+        ESP_LOGW(TAG, "%s: esp_wifi_set_mode(%d) failed (%s), retry %d/3",
+                 context,
+                 (int)target_mode,
+                 esp_err_to_name(err),
+                 i + 1);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    ESP_LOGW(TAG, "%s: mode restore failed, attempting wifi restart fallback", context);
+    esp_wifi_stop();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    err = esp_wifi_set_mode(target_mode);
+    if (err == ESP_OK) {
+        err = esp_wifi_start();
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "%s: fallback restore failed: %s", context, esp_err_to_name(err));
+    }
+}
+
 static uint32_t hash_ssid(const uint8_t *ssid, size_t len) {
     uint32_t hash = 5381;
     for (size_t i = 0; i < len && ssid[i] != 0; i++) {
@@ -71,6 +98,8 @@ typedef struct {
 
 static temp_station_t temp_stations[128];
 static volatile int temp_station_count = 0;
+static uint32_t s_last_deauth_log_ms = 0;
+static uint32_t s_deauth_log_count = 0;
 
 static void promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     if (type != WIFI_PKT_DATA && type != WIFI_PKT_MGMT) return;
@@ -88,7 +117,18 @@ static void promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     // Check for deauthentication frames (same logic as stations_sniffer)
     if (frame_type == 0 && (frame_subtype == 0x0C || frame_subtype == 0x0A)) {
         wifi_scan_increment_deauth_count();
-        ESP_LOGI(TAG, "Deauth frame detected during background scan, total: %lu", (unsigned long)wifi_scan_get_deauth_count());
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+        s_deauth_log_count++;
+        if (s_last_deauth_log_ms == 0) {
+            s_last_deauth_log_ms = now_ms;
+        }
+        if ((now_ms - s_last_deauth_log_ms) >= 5000) {
+            ESP_LOGI(TAG, "Deauth frames during background scan: %lu in last 5s (total: %lu)",
+                     (unsigned long)s_deauth_log_count,
+                     (unsigned long)wifi_scan_get_deauth_count());
+            s_deauth_log_count = 0;
+            s_last_deauth_log_ms = now_ms;
+        }
         return; // Don't process as regular station data
     }
     
@@ -244,8 +284,6 @@ static void populate_scan_record(scan_record_t *record) {
 
     temp_station_count = 0;
     
-    wifi_scan_set_station_scan_active(true);
-    
     wifi_mode_t original_mode;
     esp_wifi_get_mode(&original_mode);
     
@@ -254,13 +292,15 @@ static void populate_scan_record(scan_record_t *record) {
     if (original_mode == WIFI_MODE_STA || original_mode == WIFI_MODE_APSTA) {
         was_sta_connected = (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK);
     }
-    
+
+    wifi_scan_set_station_scan_active(true);
+
     if (was_sta_connected) {
         ESP_LOGI(TAG, "Disconnecting STA for station scan");
         esp_wifi_disconnect();
         vTaskDelay(pdMS_TO_TICKS(300));
     }
-    
+
     if (original_mode == WIFI_MODE_APSTA || original_mode == WIFI_MODE_AP) {
         ESP_LOGI(TAG, "Temporarily switching to STA mode for channel hopping");
         ESP_LOGI(TAG, "Deauthenticating all AP clients...");
@@ -269,60 +309,64 @@ static void populate_scan_record(scan_record_t *record) {
     }
 
     ESP_LOGI(TAG, "Setting WiFi mode to STA (AP will be destroyed temporarily)");
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    vTaskDelay(pdMS_TO_TICKS(300));
-    ESP_LOGI(TAG, "Now in STA-only mode for promiscuous scanning");
+    esp_err_t mode_err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (mode_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to switch to STA mode for station phase: %s", esp_err_to_name(mode_err));
+    } else {
+        vTaskDelay(pdMS_TO_TICKS(300));
+        ESP_LOGI(TAG, "Now in STA-only mode for promiscuous scanning");
     
-    wifi_promiscuous_filter_t filt = {
-        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA
-    };
-    esp_wifi_set_promiscuous_filter(&filt);
-    esp_wifi_set_promiscuous_rx_cb(promisc_cb);
-    esp_wifi_set_promiscuous(true);
+        wifi_promiscuous_filter_t filt = {
+            .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA
+        };
+        esp_wifi_set_promiscuous_filter(&filt);
+        esp_wifi_set_promiscuous_rx_cb(promisc_cb);
+        esp_wifi_set_promiscuous(true);
     
-    // Use dynamic channel list for promiscuous hopping
-    channels = get_scan_channels();
-    channel_count = get_scan_channels_size();
+        // Use dynamic channel list for promiscuous hopping
+        channels = get_scan_channels();
+        channel_count = get_scan_channels_size();
     
-    // Safety timeout
-    uint32_t scan_start_sec = get_uptime_sec();
+        // Safety timeout
+        uint32_t scan_start_sec = get_uptime_sec();
     
-    for (size_t i = 0; i < channel_count; i++) {
-        // Watchdog check
-        if ((get_uptime_sec() - scan_start_sec) > 45) {
-            ESP_LOGW(TAG, "Background scan station phase timed out - aborting");
-            break;
-        }
+        for (size_t i = 0; i < channel_count; i++) {
+            // Watchdog check
+            if ((get_uptime_sec() - scan_start_sec) > 45) {
+                ESP_LOGW(TAG, "Background scan station phase timed out - aborting");
+                break;
+            }
 
-        esp_wifi_set_channel(channels[i], WIFI_SECOND_CHAN_NONE);
-        vTaskDelay(pdMS_TO_TICKS(250)); 
+            esp_wifi_set_channel(channels[i], WIFI_SECOND_CHAN_NONE);
+            vTaskDelay(pdMS_TO_TICKS(250)); 
+        }
+    
+        esp_wifi_set_promiscuous(false);
+        esp_wifi_set_promiscuous_rx_cb(NULL);
     }
-    
-    esp_wifi_set_promiscuous(false);
-    esp_wifi_set_promiscuous_rx_cb(NULL);
-    
+
     if (original_mode != WIFI_MODE_STA) {
         ESP_LOGI(TAG, "Restoring original WiFi mode (AP will restart)");
-        esp_wifi_set_mode(original_mode);
+        restore_wifi_mode_with_retry(original_mode, "background_scan");
         vTaskDelay(pdMS_TO_TICKS(500));
         ESP_LOGI(TAG, "WiFi mode restored, AP should be available again");
     }
 
     if (was_sta_connected) {
         ESP_LOGI(TAG, "Reconnecting STA after background scan");
-        
+
         // Give WiFi stack time to fully restore mode
         vTaskDelay(pdMS_TO_TICKS(300));
-        
+
         esp_wifi_connect();
-        
+
         // Wait for connection to stabilize before clearing scan flag
         // This prevents the disconnect handler from racing with us
         bool connected = false;
         // Reduced wait time since we're not blocking the whole system as hard
         for (int wait = 0; wait < 60; wait++) {  // 6 seconds max
             vTaskDelay(pdMS_TO_TICKS(100));
-            
+
             wifi_ap_record_t ap_check;
             esp_err_t ap_err = esp_wifi_sta_get_ap_info(&ap_check);
             if (ap_err == ESP_OK) {
@@ -339,12 +383,12 @@ static void populate_scan_record(scan_record_t *record) {
                 connected = false;
             }
         }
-        
+
         if (!connected) {
             ESP_LOGW(TAG, "STA reconnection after background scan timed out - disconnect handler will retry");
         }
     }
-    
+
     wifi_scan_set_station_scan_active(false);
     ESP_LOGI(TAG, "Background scan station phase complete, cleared scan_active flag");
 
