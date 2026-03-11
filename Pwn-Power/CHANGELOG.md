@@ -7,6 +7,11 @@
 - Fixed a webhook payload memory leak by ensuring JSON payload buffers are freed on all send paths.
 - Replaced shared static handshake/general-capture task arguments with per-request heap arguments and task-owned cleanup.
 - Reduced promiscuous deauth log spam by rate-limiting and aggregating deauth logging in background scans.
+- Potentially fixed issue where device access point wouldn't come up after a promiscuous scan.
+
+### Changed
+- Reduced static JSON buffer allocations by ~14KB RAM (report_json, intelligence_json, device_presence_buf, unified_buf).
+- Reduced background scan temp_stations buffer from 128 to 64 entries (~900 bytes saved).
 
 ## v2.0
 
