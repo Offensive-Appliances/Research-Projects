@@ -1299,6 +1299,114 @@ async function loadGpioStatus() {
     }
 }
 
+let powerData = {
+    power_out_w: 0,
+    power_in_w: 0,
+    power_net_w: 0,
+    energy_out_kwh: 0,
+    energy_in_kwh: 0,
+    energy_net_kwh: 0,
+    cf_hz: 0,
+    cf1_hz: 0,
+    relay_on: false
+};
+
+function formatPower(watts) {
+    if (watts === null || watts === undefined || isNaN(watts)) return '-- W';
+    const abs = Math.abs(watts);
+    if (abs < 0.1) return '0 W';
+    if (abs < 1000) return `${watts.toFixed(1)} W`;
+    return `${(watts / 1000).toFixed(2)} kW`;
+}
+
+function formatEnergy(kwh) {
+    if (kwh === null || kwh === undefined || isNaN(kwh)) return '-- kWh';
+    const abs = Math.abs(kwh);
+    if (abs < 0.001) return '0 kWh';
+    if (abs < 1) return `${(kwh * 1000).toFixed(0)} Wh`;
+    return `${kwh.toFixed(3)} kWh`;
+}
+
+function updatePowerUI() {
+    const powerEl = document.getElementById('power-current');
+    const directionEl = document.getElementById('power-direction');
+    const totalEnergyEl = document.getElementById('power-total-energy');
+    const cfOutValueEl = document.getElementById('cf-out-value');
+    const cfOutWattsEl = document.getElementById('cf-out-watts');
+    const cfInValueEl = document.getElementById('cf-in-value');
+    const cfInWattsEl = document.getElementById('cf-in-watts');
+    const energyExportedEl = document.getElementById('energy-exported');
+    const energyImportedEl = document.getElementById('energy-imported');
+    const cfOutBox = document.getElementById('cf-out-box');
+    const cfInBox = document.getElementById('cf-in-box');
+
+    if (powerEl) powerEl.textContent = formatPower(powerData.power_net_w);
+
+    if (directionEl) {
+        if (Math.abs(powerData.power_net_w) < 1) {
+            directionEl.textContent = 'Idle';
+        } else if (powerData.power_net_w > 0) {
+            directionEl.textContent = 'Exporting';
+            directionEl.style.color = 'var(--success)';
+        } else {
+            directionEl.textContent = 'Importing';
+            directionEl.style.color = 'var(--warning)';
+        }
+    }
+
+    if (totalEnergyEl) totalEnergyEl.textContent = formatEnergy(powerData.energy_net_kwh);
+
+    if (cfOutValueEl) cfOutValueEl.textContent = powerData.cf_hz.toFixed(1) + ' Hz';
+    if (cfOutWattsEl) cfOutWattsEl.textContent = formatPower(powerData.power_out_w);
+    if (cfInValueEl) cfInValueEl.textContent = powerData.cf1_hz.toFixed(1) + ' Hz';
+    if (cfInWattsEl) cfInWattsEl.textContent = formatPower(powerData.power_in_w);
+
+    if (energyExportedEl) energyExportedEl.textContent = formatEnergy(powerData.energy_out_kwh);
+    if (energyImportedEl) energyImportedEl.textContent = formatEnergy(powerData.energy_in_kwh);
+
+    if (cfOutBox) {
+        if (powerData.power_out_w > 1) {
+            cfOutBox.classList.add('active');
+            if (cfOutValueEl) cfOutValueEl.classList.add('high');
+        } else {
+            cfOutBox.classList.remove('active');
+            if (cfOutValueEl) cfOutValueEl.classList.remove('high');
+        }
+    }
+
+    if (cfInBox) {
+        if (powerData.power_in_w > 1) {
+            cfInBox.classList.add('active');
+            if (cfInValueEl) cfInValueEl.classList.add('high');
+        } else {
+            cfInBox.classList.remove('active');
+            if (cfInValueEl) cfInValueEl.classList.remove('high');
+        }
+    }
+}
+
+async function loadPowerData() {
+    try {
+        const res = await fetchJSON('/power/status');
+        if (res) {
+            powerData.power_out_w = res.power_out_w || 0;
+            powerData.power_in_w = res.power_in_w || 0;
+            powerData.power_net_w = res.power_net_w || 0;
+            powerData.energy_out_kwh = res.energy_out_kwh || 0;
+            powerData.energy_in_kwh = res.energy_in_kwh || 0;
+            powerData.energy_net_kwh = res.energy_net_kwh || 0;
+            powerData.cf_hz = res.cf_hz || 0;
+            powerData.cf1_hz = res.cf1_hz || 0;
+            powerData.relay_on = res.relay_on || false;
+            updatePowerUI();
+        }
+    } catch (e) {
+        console.debug('Power monitoring not available:', e);
+        const card = document.getElementById('power-monitoring-card');
+        if (card) card.style.display = 'none';
+    }
+}
+
 let deviceIntelligenceData = {
     devices: [],
     intelligence: null,
@@ -2815,6 +2923,22 @@ if (typeof addTrackedInterval === 'function') {
 
 let bl0937AutoRefreshInterval = null;
 
+function formatPower(watts) {
+    if (watts === null || watts === undefined || isNaN(watts)) return '-- W';
+    const abs = Math.abs(watts);
+    if (abs < 0.1) return '0 W';
+    if (abs < 1000) return `${watts.toFixed(1)} W`;
+    return `${(watts / 1000).toFixed(2)} kW`;
+}
+
+function formatEnergy(kwh) {
+    if (kwh === null || kwh === undefined || isNaN(kwh)) return '-- kWh';
+    const abs = Math.abs(kwh);
+    if (abs < 0.001) return '0 kWh';
+    if (abs < 1) return `${(kwh * 1000).toFixed(0)} Wh`;
+    return `${kwh.toFixed(3)} kWh`;
+}
+
 async function loadBL0937Status() {
     const res = await fetchJSON('/bl0937/status');
     if (!res) return;
@@ -2868,6 +2992,37 @@ async function loadBL0937Status() {
     if (cf1Count) cf1Count.textContent = res.counts.cf1_total.toLocaleString();
     if (cfRate) cfRate.textContent = res.counts.cf_rate_hz + ' Hz';
     if (cf1Rate) cf1Rate.textContent = res.counts.cf1_rate_hz + ' Hz';
+
+    const powerCurrentEl = $('#power-current');
+    const powerDirectionEl = $('#power-direction');
+    const powerTotalEnergyEl = $('#power-total-energy');
+    const powerOutEl = $('#power-out');
+    const powerInEl = $('#power-in');
+    const energyExportedEl = $('#energy-exported');
+    const energyImportedEl = $('#energy-imported');
+
+    if (res.power) {
+        const p = res.power;
+        if (powerCurrentEl) powerCurrentEl.textContent = formatPower(p.power_net_w);
+        if (powerOutEl) powerOutEl.textContent = formatPower(p.power_out_w);
+        if (powerInEl) powerInEl.textContent = formatPower(p.power_in_w);
+        if (energyExportedEl) energyExportedEl.textContent = formatEnergy(p.energy_out_kwh);
+        if (energyImportedEl) energyImportedEl.textContent = formatEnergy(p.energy_in_kwh);
+        if (powerTotalEnergyEl) powerTotalEnergyEl.textContent = formatEnergy(p.energy_net_kwh);
+
+        if (powerDirectionEl) {
+            if (Math.abs(p.power_net_w) < 1) {
+                powerDirectionEl.textContent = 'Idle';
+                powerDirectionEl.style.color = 'var(--text-muted)';
+            } else if (p.power_net_w > 0) {
+                powerDirectionEl.textContent = 'Exporting';
+                powerDirectionEl.style.color = 'var(--success)';
+            } else {
+                powerDirectionEl.textContent = 'Importing';
+                powerDirectionEl.style.color = 'var(--warning)';
+            }
+        }
+    }
 }
 
 async function resetBL0937Counts() {
@@ -2891,6 +3046,14 @@ function toggleBL0937AutoRefresh() {
         if (btn) btn.textContent = 'Auto: ON';
         loadBL0937Status();
         showToast('BL0937 auto-refresh enabled (500ms)');
+    }
+}
+
+async function resetBL0937Counts() {
+    const res = await fetchJSON('/bl0937/reset', { method: 'POST' });
+    if (res && res.status === 'reset') {
+        showToast('Counts reset');
+        loadBL0937Status();
     }
 }
 

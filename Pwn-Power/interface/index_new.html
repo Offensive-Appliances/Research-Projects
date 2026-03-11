@@ -246,18 +246,30 @@
                         </div>
                     </div>
                     
-                    <div class="card" style="margin-top:16px; border: 1px dashed rgba(255,255,255,0.2);">
-                        <h4 style="color: var(--accent);">BL0937 Power Monitor <span style="font-size:10px;opacity:0.7;">[EXPERIMENTAL]</span></h4>
-                        <div class="muted" style="margin-bottom:12px;">Real-time pin state monitoring for power measurement IC</div>
+                    <div class="card" style="margin-top:16px;">
+                        <h4>Power Monitoring</h4>
+                        <div class="muted" style="margin-bottom:12px;">Real-time energy flow measurement</div>
                         
+                        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;padding:16px;background:rgba(0,0,0,0.3);border-radius:8px;">
+                            <div>
+                                <div class="muted" style="font-size:11px;">Current Power</div>
+                                <div style="font-size:32px;font-weight:700;" id="power-current">-- W</div>
+                                <div style="font-size:12px;margin-top:4px;" id="power-direction">--</div>
+                            </div>
+                            <div style="text-align:right;">
+                                <div class="muted" style="font-size:11px;">Net Energy</div>
+                                <div style="font-size:20px;font-weight:600;" id="power-total-energy">-- kWh</div>
+                            </div>
+                        </div>
+
                         <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:16px;">
                             <div class="pin-status-box" id="bl0937-cf-box">
-                                <div class="pin-label">CF (IO7)</div>
+                                <div class="pin-label">CF (Energy Out)</div>
                                 <div class="pin-value" id="bl0937-cf-level">--</div>
                                 <div class="pin-desc">Active Power</div>
                             </div>
                             <div class="pin-status-box" id="bl0937-cf1-box">
-                                <div class="pin-label">CF1 (IO3)</div>
+                                <div class="pin-label">CF1 (Energy In)</div>
                                 <div class="pin-value" id="bl0937-cf1-level">--</div>
                                 <div class="pin-desc" id="bl0937-cf1-mode">Current/Voltage</div>
                             </div>
@@ -269,28 +281,50 @@
                         </div>
                         
                         <div style="background:rgba(0,0,0,0.3);padding:12px;border-radius:6px;margin-bottom:12px;">
-                            <div style="display:flex;justify-content:space-between;margin-bottom:8px;">
-                                <span class="muted">CF Pulse Count:</span>
-                                <strong id="bl0937-cf-count">0</strong>
-                            </div>
-                            <div style="display:flex;justify-content:space-between;margin-bottom:8px;">
-                                <span class="muted">CF Rate:</span>
-                                <strong id="bl0937-cf-rate">0 Hz</strong>
-                            </div>
-                            <div style="display:flex;justify-content:space-between;margin-bottom:8px;">
-                                <span class="muted">CF1 Pulse Count:</span>
-                                <strong id="bl0937-cf1-count">0</strong>
-                            </div>
-                            <div style="display:flex;justify-content:space-between;">
-                                <span class="muted">CF1 Rate:</span>
-                                <strong id="bl0937-cf1-rate">0 Hz</strong>
+                            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+                                <div>
+                                    <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+                                        <span class="muted" style="font-size:11px;">Power Out:</span>
+                                        <strong id="power-out" style="font-size:11px;">-- W</strong>
+                                    </div>
+                                    <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+                                        <span class="muted" style="font-size:11px;">Energy Exported:</span>
+                                        <strong id="energy-exported" style="font-size:11px;">-- kWh</strong>
+                                    </div>
+                                    <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+                                        <span class="muted" style="font-size:11px;">CF Rate:</span>
+                                        <strong id="bl0937-cf-rate" style="font-size:11px;">0 Hz</strong>
+                                    </div>
+                                    <div style="display:flex;justify-content:space-between;">
+                                        <span class="muted" style="font-size:11px;">CF Pulses:</span>
+                                        <strong id="bl0937-cf-count" style="font-size:11px;">0</strong>
+                                    </div>
+                                </div>
+                                <div>
+                                    <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+                                        <span class="muted" style="font-size:11px;">Power In:</span>
+                                        <strong id="power-in" style="font-size:11px;">-- W</strong>
+                                    </div>
+                                    <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+                                        <span class="muted" style="font-size:11px;">Energy Imported:</span>
+                                        <strong id="energy-imported" style="font-size:11px;">-- kWh</strong>
+                                    </div>
+                                    <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+                                        <span class="muted" style="font-size:11px;">CF1 Rate:</span>
+                                        <strong id="bl0937-cf1-rate" style="font-size:11px;">0 Hz</strong>
+                                    </div>
+                                    <div style="display:flex;justify-content:space-between;">
+                                        <span class="muted" style="font-size:11px;">CF1 Pulses:</span>
+                                        <strong id="bl0937-cf1-count" style="font-size:11px;">0</strong>
+                                    </div>
+                                </div>
                             </div>
                         </div>
                         
                         <div class="btn-group">
                             <button class="btn btn-sm" id="bl0937-refresh-btn" onclick="loadBL0937Status()">Refresh</button>
                             <button class="btn btn-sm" id="bl0937-autorefresh-btn" onclick="toggleBL0937AutoRefresh()">Auto: OFF</button>
-                            <button class="btn btn-sm" onclick="resetBL0937Counts()">Reset Counts</button>
+                            <button class="btn btn-sm" onclick="resetBL0937Counts()">Reset</button>
                         </div>
                     </div>
                 </div>

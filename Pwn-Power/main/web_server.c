@@ -66,6 +66,9 @@ static bool s_smartplug_inited = false;
 #define BL0937_CF1_PIN   3
 #define BL0937_SEL_PIN   5
 
+#define BL0937_CF_WATTS_PER_HZ   1.0f
+#define BL0937_CF1_WATTS_PER_HZ  1.0f
+
 typedef struct {
     volatile uint32_t cf_pulses;
     volatile uint32_t cf1_pulses;
@@ -73,6 +76,10 @@ typedef struct {
     volatile uint32_t cf1_last_time;
     volatile float cf_freq;
     volatile float cf1_freq;
+    volatile float power_out_w;
+    volatile float power_in_w;
+    volatile float energy_out_wh;
+    volatile float energy_in_wh;
     int sel_state;
     bool inited;
     uint32_t last_read_time;
@@ -1589,10 +1596,20 @@ static esp_err_t general_capture_handler(httpd_req_t *req) {
     }
     cJSON_Delete(root);
     TaskHandle_t gc_task_handle = NULL;
-    typedef struct { int channel; int duration; } gc_args_t;
-    static gc_args_t gc_args;
-    gc_args.channel = channel;
-    gc_args.duration = duration;
+    gc_args_t *task_args = (gc_args_t*)malloc(sizeof(gc_args_t));
+    if (!task_args) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+        return ESP_FAIL;
+    }
+    task_args->channel = channel;
+    task_args->duration = duration;
+
+    if (xTaskCreate(gc_task, "gc_task", 4096, task_args, 5, &gc_task_handle) != pdPASS) {
+        free(task_args);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to start capture task");
+        return ESP_FAIL;
+    }
+
     cJSON *res = cJSON_CreateObject();
     cJSON_AddStringToObject(res, "status", "started");
     char *out = cJSON_PrintUnformatted(res);
@@ -1600,7 +1617,6 @@ static esp_err_t general_capture_handler(httpd_req_t *req) {
     httpd_resp_sendstr(req, out);
     cJSON_free(out);
     cJSON_Delete(res);
-    xTaskCreate(gc_task, "gc_task", 4096, &gc_args, 5, &gc_task_handle);
     return ESP_OK;
 }
 
@@ -1871,6 +1887,20 @@ static esp_err_t bl0937_status_handler(httpd_req_t *req) {
         cf1_rate = (cf1_count - s_bl0937.last_cf1_count) * 1000 / dt_ms;
     }
     
+    float cf_rate_f = (float)cf_rate;
+    float cf1_rate_f = (float)cf1_rate;
+    s_bl0937.power_out_w = cf_rate_f * BL0937_CF_WATTS_PER_HZ;
+    s_bl0937.power_in_w = cf1_rate_f * BL0937_CF1_WATTS_PER_HZ;
+    
+    if (dt_ms > 0) {
+        float dt_hours = dt_ms / 3600000.0f;
+        s_bl0937.energy_out_wh += s_bl0937.power_out_w * dt_hours;
+        s_bl0937.energy_in_wh += s_bl0937.power_in_w * dt_hours;
+    }
+    
+    float power_net_w = s_bl0937.power_out_w - s_bl0937.power_in_w;
+    float energy_net_wh = s_bl0937.energy_out_wh - s_bl0937.energy_in_wh;
+    
     s_bl0937.last_read_time = now;
     s_bl0937.last_cf_count = cf_count;
     s_bl0937.last_cf1_count = cf1_count;
@@ -1897,9 +1927,18 @@ static esp_err_t bl0937_status_handler(httpd_req_t *req) {
     cJSON_AddNumberToObject(counts, "cf_freq_est", (double)s_bl0937.cf_freq);
     cJSON_AddNumberToObject(counts, "cf1_freq_est", (double)s_bl0937.cf1_freq);
     
+    cJSON *power = cJSON_AddObjectToObject(res, "power");
+    cJSON_AddNumberToObject(power, "power_out_w", (double)s_bl0937.power_out_w);
+    cJSON_AddNumberToObject(power, "power_in_w", (double)s_bl0937.power_in_w);
+    cJSON_AddNumberToObject(power, "power_net_w", (double)power_net_w);
+    cJSON_AddNumberToObject(power, "energy_out_kwh", (double)(s_bl0937.energy_out_wh / 1000.0f));
+    cJSON_AddNumberToObject(power, "energy_in_kwh", (double)(s_bl0937.energy_in_wh / 1000.0f));
+    cJSON_AddNumberToObject(power, "energy_net_kwh", (double)(energy_net_wh / 1000.0f));
+    
     cJSON_AddNumberToObject(res, "interval_ms", dt_ms);
     cJSON_AddStringToObject(res, "sel_mode", sel_level ? "voltage" : "current");
     cJSON_AddBoolToObject(res, "inited", s_bl0937.inited);
+    cJSON_AddBoolToObject(res, "relay_on", s_smartplug_level > 0);
     
     char *out = cJSON_PrintUnformatted(res);
     httpd_resp_set_type(req, "application/json");
@@ -1918,6 +1957,10 @@ static esp_err_t bl0937_reset_handler(httpd_req_t *req) {
     s_bl0937.cf1_last_time = 0;
     s_bl0937.last_cf_count = 0;
     s_bl0937.last_cf1_count = 0;
+    s_bl0937.power_out_w = 0;
+    s_bl0937.power_in_w = 0;
+    s_bl0937.energy_out_wh = 0;
+    s_bl0937.energy_in_wh = 0;
     
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"reset\"}");
