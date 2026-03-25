@@ -1,3 +1,4 @@
+#include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "scan_storage.h"
@@ -11,10 +12,19 @@
 #include "cJSON.h"
 #include "ouis.h"
 #include "esp_http_server.h"
+#include <stdio.h>
+#include <errno.h>
 #include <string.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <time.h>
+
+#if CONFIG_PWNPOWER_HISTORY_STORAGE_SDMMC
+#include "driver/sdspi_host.h"
+#include "driver/spi_master.h"
+#include "esp_vfs_fat.h"
+#include "sdmmc_cmd.h"
+#endif
 
 #define TAG "ScanStorage"
 #define NVS_NAMESPACE "scan_idx"
@@ -24,12 +34,32 @@
 #define INDEX_SIZE 4096
 #define DATA_OFFSET 4096
 #define FLASH_SECTOR_SIZE 4096
+
+#if CONFIG_PWNPOWER_HISTORY_STORAGE_SDMMC
+#define HISTORY_OFFSET 0
+#define HISTORY_SIZE 0
+#define EVENTS_OFFSET (((DATA_OFFSET + RECORD_SIZE + FLASH_SECTOR_SIZE - 1) / FLASH_SECTOR_SIZE) * FLASH_SECTOR_SIZE)
+#else
 #define HISTORY_OFFSET (((DATA_OFFSET + RECORD_SIZE + FLASH_SECTOR_SIZE - 1) / FLASH_SECTOR_SIZE) * FLASH_SECTOR_SIZE)
 #define HISTORY_SIZE (sizeof(history_sample_t) * MAX_HISTORY_SAMPLES)
 #define EVENTS_OFFSET (HISTORY_OFFSET + HISTORY_SIZE)
+#endif
 #define EVENTS_SIZE (sizeof(device_event_t) * MAX_DEVICE_EVENTS)
 #define DEVICES_OFFSET (EVENTS_OFFSET + EVENTS_SIZE)
 #define DEVICES_SIZE (sizeof(device_presence_t) * MAX_TRACKED_DEVICES)
+#define STORAGE_LAYOUT_SIZE (DEVICES_OFFSET + DEVICES_SIZE)
+
+#if CONFIG_PWNPOWER_HISTORY_STORAGE_SDMMC
+#define HISTORY_FILE_MAGIC 0x59545348U
+#define HISTORY_FILE_VERSION 1U
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t write_idx;
+    uint32_t count;
+} history_file_header_t;
+#endif
 
 static flash_manager_t flash_mgr;
 static storage_index_t storage_index;
@@ -52,6 +82,15 @@ static uint32_t device_updates_since_save = 0;
 
 static uint8_t device_write_buffer[sizeof(uint32_t) + (sizeof(device_presence_t) * MAX_TRACKED_DEVICES)];
 
+#if CONFIG_PWNPOWER_HISTORY_STORAGE_SDMMC
+static SemaphoreHandle_t history_fs_mutex;
+static bool history_storage_ready = false;
+static bool history_storage_warned = false;
+static sdmmc_card_t *history_sd_card;
+static bool history_spi_bus_ready = false;
+static char history_file_path[96];
+#endif
+
 scan_record_t shared_scan_buffer;
 
 // Pending background scan record for queuing updates during manual scans
@@ -71,6 +110,14 @@ scan_record_t pending_background_record;
 // forward declarations
 static uint32_t get_uptime_sec(void);
 static void device_cleanup_task(void *arg);
+
+#if CONFIG_PWNPOWER_HISTORY_STORAGE_SDMMC
+static esp_err_t history_storage_init_sd_card(void);
+static esp_err_t history_storage_reset_file_locked(void);
+static esp_err_t history_storage_read_sample_locked(uint32_t physical_idx, history_sample_t *sample);
+static esp_err_t history_storage_write_sample_locked(const history_sample_t *sample);
+static esp_err_t history_storage_read_window_locked(uint32_t start_idx, uint32_t count, history_sample_t *samples, uint32_t *actual_count);
+#endif
 
 extern bool pwnpower_time_is_synced(void);
 
@@ -107,6 +154,275 @@ static esp_err_t read_storage_index(void) {
     nvs_close(handle);
     return err;
 }
+
+#if CONFIG_PWNPOWER_HISTORY_STORAGE_SDMMC
+static esp_err_t history_storage_reset_file_locked(void) {
+    FILE *fp = fopen(history_file_path, "wb");
+    if (!fp) {
+        ESP_LOGE(TAG, "failed to create history file: %s (errno=%d: %s)",
+                 history_file_path,
+                 errno,
+                 strerror(errno));
+        return ESP_FAIL;
+    }
+
+    history_file_header_t header = {
+        .magic = HISTORY_FILE_MAGIC,
+        .version = HISTORY_FILE_VERSION,
+        .write_idx = 0,
+        .count = 0,
+    };
+
+    size_t written = fwrite(&header, 1, sizeof(header), fp);
+    fclose(fp);
+    if (written != sizeof(header)) {
+        ESP_LOGE(TAG, "failed to initialize history file header");
+        return ESP_FAIL;
+    }
+
+    history_ring.write_idx = 0;
+    history_ring.count = 0;
+    storage_index.history_write_idx = 0;
+    storage_index.history_count = 0;
+    return ESP_OK;
+}
+
+static esp_err_t history_storage_read_sample_locked(uint32_t physical_idx, history_sample_t *sample) {
+    if (!sample || !history_storage_ready || physical_idx >= history_ring.max_items) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    FILE *fp = fopen(history_file_path, "rb");
+    if (!fp) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    long offset = (long)sizeof(history_file_header_t) + ((long)physical_idx * (long)sizeof(history_sample_t));
+    if (fseek(fp, offset, SEEK_SET) != 0) {
+        fclose(fp);
+        return ESP_FAIL;
+    }
+
+    size_t nread = fread(sample, 1, sizeof(*sample), fp);
+    fclose(fp);
+    return (nread == sizeof(*sample)) ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t history_storage_write_sample_locked(const history_sample_t *sample) {
+    if (!sample || !history_storage_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (history_ring.count > 0) {
+        history_sample_t last_sample;
+        uint32_t last_idx = (history_ring.count < history_ring.max_items)
+            ? (history_ring.count - 1)
+            : ((history_ring.write_idx + history_ring.max_items - 1) % history_ring.max_items);
+        if (history_storage_read_sample_locked(last_idx, &last_sample) == ESP_OK &&
+            sample->timestamp == last_sample.timestamp) {
+            ESP_LOGD(TAG, "skipping duplicate history sample ts=%lu", (unsigned long)sample->timestamp);
+            return ESP_OK;
+        }
+    }
+
+    FILE *fp = fopen(history_file_path, "r+b");
+    if (!fp) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    uint32_t write_idx = history_ring.write_idx;
+    long sample_offset = (long)sizeof(history_file_header_t) + ((long)write_idx * (long)sizeof(history_sample_t));
+    if (fseek(fp, sample_offset, SEEK_SET) != 0) {
+        fclose(fp);
+        return ESP_FAIL;
+    }
+
+    if (fwrite(sample, 1, sizeof(*sample), fp) != sizeof(*sample)) {
+        fclose(fp);
+        return ESP_FAIL;
+    }
+
+    history_ring.write_idx = (write_idx + 1) % history_ring.max_items;
+    if (history_ring.count < history_ring.max_items) {
+        history_ring.count++;
+    }
+
+    history_file_header_t header = {
+        .magic = HISTORY_FILE_MAGIC,
+        .version = HISTORY_FILE_VERSION,
+        .write_idx = history_ring.write_idx,
+        .count = history_ring.count,
+    };
+    rewind(fp);
+    if (fwrite(&header, 1, sizeof(header), fp) != sizeof(header)) {
+        fclose(fp);
+        return ESP_FAIL;
+    }
+
+    fclose(fp);
+    storage_index.history_write_idx = history_ring.write_idx;
+    storage_index.history_count = history_ring.count;
+    return ESP_OK;
+}
+
+static esp_err_t history_storage_read_window_locked(uint32_t start_idx, uint32_t count, history_sample_t *samples, uint32_t *actual_count) {
+    if (!samples || !actual_count) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint32_t total = history_ring.count;
+    if (start_idx >= total || count == 0) {
+        *actual_count = 0;
+        return ESP_OK;
+    }
+
+    uint32_t read_count = count;
+    if (start_idx + read_count > total) {
+        read_count = total - start_idx;
+    }
+
+    FILE *fp = fopen(history_file_path, "rb");
+    if (!fp) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    uint32_t oldest_idx = (history_ring.count < history_ring.max_items) ? 0 : history_ring.write_idx;
+    for (uint32_t i = 0; i < read_count; i++) {
+        uint32_t physical_idx = (oldest_idx + start_idx + i) % history_ring.max_items;
+        long sample_offset = (long)sizeof(history_file_header_t) + ((long)physical_idx * (long)sizeof(history_sample_t));
+        if (fseek(fp, sample_offset, SEEK_SET) != 0 ||
+            fread(&samples[i], 1, sizeof(history_sample_t), fp) != sizeof(history_sample_t)) {
+            fclose(fp);
+            return ESP_FAIL;
+        }
+    }
+
+    fclose(fp);
+    *actual_count = read_count;
+    return ESP_OK;
+}
+
+static esp_err_t history_storage_init_sd_card(void) {
+    if (!history_fs_mutex) {
+        history_fs_mutex = xSemaphoreCreateMutex();
+        if (!history_fs_mutex) {
+            ESP_LOGE(TAG, "failed to create SD history mutex");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    if (!history_spi_bus_ready) {
+        spi_bus_config_t bus_config = {
+            .mosi_io_num = CONFIG_PWNPOWER_SDMMC_PIN_CMD,
+            .miso_io_num = CONFIG_PWNPOWER_SDMMC_PIN_D0,
+            .sclk_io_num = CONFIG_PWNPOWER_SDMMC_PIN_CLK,
+            .quadwp_io_num = -1,
+            .quadhd_io_num = -1,
+            .max_transfer_sz = 4096,
+        };
+
+        esp_err_t bus_err = spi_bus_initialize(SPI2_HOST, &bus_config, SPI_DMA_CH_AUTO);
+        if (bus_err != ESP_OK && bus_err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "history SPI bus init failed (%s); history samples disabled", esp_err_to_name(bus_err));
+            history_storage_ready = false;
+            history_ring.write_idx = 0;
+            history_ring.count = 0;
+            storage_index.history_write_idx = 0;
+            storage_index.history_count = 0;
+            return ESP_OK;
+        }
+        history_spi_bus_ready = true;
+    }
+
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot = SPI2_HOST;
+
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.host_id = SPI2_HOST;
+    slot_config.gpio_cs = CONFIG_PWNPOWER_SDMMC_PIN_D3;
+    slot_config.gpio_cd = SDSPI_SLOT_NO_CD;
+    slot_config.gpio_wp = SDSPI_SLOT_NO_WP;
+    slot_config.gpio_int = SDSPI_SLOT_NO_INT;
+
+    ESP_LOGI(TAG, "mounting history storage via SDSPI clk=%d cmd=%d d0=%d cs=%d",
+             CONFIG_PWNPOWER_SDMMC_PIN_CLK,
+             CONFIG_PWNPOWER_SDMMC_PIN_CMD,
+             CONFIG_PWNPOWER_SDMMC_PIN_D0,
+             CONFIG_PWNPOWER_SDMMC_PIN_D3);
+
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        .format_if_mount_failed = true,
+        .max_files = 4,
+        .allocation_unit_size = 512,
+    };
+
+    esp_err_t err = esp_vfs_fat_sdspi_mount(CONFIG_PWNPOWER_SDMMC_MOUNT_POINT, &host, &slot_config, &mount_config, &history_sd_card);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "history SD mount failed (%s); history samples disabled", esp_err_to_name(err));
+        history_storage_ready = false;
+        history_ring.write_idx = 0;
+        history_ring.count = 0;
+        storage_index.history_write_idx = 0;
+        storage_index.history_count = 0;
+        return ESP_OK;
+    }
+
+    snprintf(history_file_path, sizeof(history_file_path), "%s/%s",
+             CONFIG_PWNPOWER_SDMMC_MOUNT_POINT,
+             CONFIG_PWNPOWER_SDMMC_HISTORY_FILENAME);
+
+    char probe_path[96];
+    snprintf(probe_path, sizeof(probe_path), "%s/PROBE.TXT", CONFIG_PWNPOWER_SDMMC_MOUNT_POINT);
+    FILE *probe = fopen(probe_path, "wb");
+    if (!probe) {
+        ESP_LOGE(TAG, "history storage probe create failed: %s (errno=%d: %s)",
+                 probe_path,
+                 errno,
+                 strerror(errno));
+    } else {
+        static const char probe_data[] = "ok";
+        size_t probe_written = fwrite(probe_data, 1, sizeof(probe_data) - 1, probe);
+        fclose(probe);
+        remove(probe_path);
+        ESP_LOGI(TAG, "history storage probe succeeded: %s (%u bytes)",
+                 probe_path,
+                 (unsigned)probe_written);
+    }
+
+    history_storage_ready = true;
+    history_storage_warned = false;
+    xSemaphoreTake(history_fs_mutex, portMAX_DELAY);
+
+    FILE *fp = fopen(history_file_path, "rb");
+    if (!fp) {
+        err = history_storage_reset_file_locked();
+        xSemaphoreGive(history_fs_mutex);
+        return err;
+    }
+
+    history_file_header_t header;
+    size_t nread = fread(&header, 1, sizeof(header), fp);
+    fclose(fp);
+    if (nread != sizeof(header) ||
+        header.magic != HISTORY_FILE_MAGIC ||
+        header.version != HISTORY_FILE_VERSION ||
+        header.write_idx >= history_ring.max_items ||
+        header.count > history_ring.max_items) {
+        err = history_storage_reset_file_locked();
+        xSemaphoreGive(history_fs_mutex);
+        return err;
+    }
+
+    history_ring.write_idx = header.write_idx;
+    history_ring.count = header.count;
+    storage_index.history_write_idx = header.write_idx;
+    storage_index.history_count = header.count;
+    xSemaphoreGive(history_fs_mutex);
+
+    ESP_LOGI(TAG, "history storage mounted at %s (%lu samples)", history_file_path, (unsigned long)history_ring.count);
+    return ESP_OK;
+}
+#endif
 
 static esp_err_t save_tracked_devices(void) {
     if (!flash_mgr.partition) {
@@ -206,6 +522,14 @@ esp_err_t scan_storage_init(void) {
         return err;
     }
 
+    if (flash_mgr.partition->size < STORAGE_LAYOUT_SIZE) {
+        ESP_LOGE(TAG, "partition '%s' too small: need %lu bytes, have %lu bytes",
+                 SCAN_STORAGE_PARTITION,
+                 (unsigned long)STORAGE_LAYOUT_SIZE,
+                 (unsigned long)flash_mgr.partition->size);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
     // initialize ring buffer contexts
     history_ring.base_offset = HISTORY_OFFSET;
     history_ring.item_size = sizeof(history_sample_t);
@@ -280,6 +604,7 @@ esp_err_t scan_storage_init(void) {
         events_ring.write_idx = storage_index.event_write_idx;
         events_ring.count = storage_index.event_count;
         
+        #if !CONFIG_PWNPOWER_HISTORY_STORAGE_SDMMC
         // validate history ring by checking oldest sample (index 0 if ring hasn't wrapped)
         if (history_ring.count > 0) {
             uint32_t oldest_idx = (history_ring.count < history_ring.max_items) ? 0 : history_ring.write_idx;
@@ -298,7 +623,16 @@ esp_err_t scan_storage_init(void) {
                 }
             }
         }
+        #endif
     }
+
+#if CONFIG_PWNPOWER_HISTORY_STORAGE_SDMMC
+    err = history_storage_init_sd_card();
+    if (err != ESP_OK) {
+        return err;
+    }
+    write_storage_index();
+#endif
 
     // Start device cleanup task
     xTaskCreate(device_cleanup_task, "device_cleanup", 2048, NULL, 3, NULL);
@@ -625,6 +959,17 @@ esp_err_t scan_storage_clear(void) {
         history_ring.count = 0;
         events_ring.write_idx = 0;
         events_ring.count = 0;
+
+#if CONFIG_PWNPOWER_HISTORY_STORAGE_SDMMC
+        if (history_storage_ready && history_fs_mutex) {
+            xSemaphoreTake(history_fs_mutex, portMAX_DELAY);
+            err = history_storage_reset_file_locked();
+            xSemaphoreGive(history_fs_mutex);
+            if (err != ESP_OK) {
+                return err;
+            }
+        }
+#endif
         
         err = write_storage_index();
     }
@@ -1585,7 +1930,24 @@ uint32_t scan_storage_get_history_base_epoch(void) {
 
 esp_err_t scan_storage_append_history_sample(const history_sample_t *sample) {
     if (!sample) return ESP_ERR_INVALID_ARG;
-    
+
+    ESP_LOGI(TAG, "writing history sample: ts=%lu aps=%u clients=%u flags=0x%02x",
+             (unsigned long)sample->timestamp, sample->ap_count, sample->client_count, sample->flags);
+
+    esp_err_t err;
+#if CONFIG_PWNPOWER_HISTORY_STORAGE_SDMMC
+    if (!history_storage_ready) {
+        if (!history_storage_warned) {
+            ESP_LOGW(TAG, "history storage unavailable; skipping history sample writes");
+            history_storage_warned = true;
+        }
+        return ESP_OK;
+    }
+
+    xSemaphoreTake(history_fs_mutex, portMAX_DELAY);
+    err = history_storage_write_sample_locked(sample);
+    xSemaphoreGive(history_fs_mutex);
+#else
     // Deduplicate against last persisted sample to avoid double writes
     if (history_ring.count > 0) {
         history_sample_t last_sample;
@@ -1597,7 +1959,6 @@ esp_err_t scan_storage_append_history_sample(const history_sample_t *sample) {
         }
         uint32_t offset = history_ring.base_offset + (last_idx * history_ring.item_size);
         if (flash_manager_read(&flash_mgr, offset, &last_sample, sizeof(last_sample)) == ESP_OK) {
-            // Check if timestamps are identical (1-second precision)
             if (sample->timestamp == last_sample.timestamp) {
                 ESP_LOGD(TAG, "skipping duplicate history sample ts=%lu", (unsigned long)sample->timestamp);
                 return ESP_OK;
@@ -1605,10 +1966,8 @@ esp_err_t scan_storage_append_history_sample(const history_sample_t *sample) {
         }
     }
 
-    ESP_LOGI(TAG, "writing history sample: ts=%lu aps=%u clients=%u flags=0x%02x",
-             (unsigned long)sample->timestamp, sample->ap_count, sample->client_count, sample->flags);
-    
-    esp_err_t err = flash_manager_ring_write(&flash_mgr, &history_ring, sample);
+    err = flash_manager_ring_write(&flash_mgr, &history_ring, sample);
+#endif
     if (err != ESP_OK) {
         return err;
     }
@@ -1696,19 +2055,30 @@ static uint32_t sanitize_history_samples(history_sample_t *samples, uint32_t cou
 
 esp_err_t scan_storage_get_history_samples_window(uint32_t start_idx, uint32_t max_count, history_sample_t *samples, uint32_t *actual_count) {
     if (!samples || !actual_count) return ESP_ERR_INVALID_ARG;
-    
+
+    esp_err_t err;
+#if CONFIG_PWNPOWER_HISTORY_STORAGE_SDMMC
+    if (!history_storage_ready) {
+        *actual_count = 0;
+        return ESP_OK;
+    }
+    xSemaphoreTake(history_fs_mutex, portMAX_DELAY);
+    err = history_storage_read_window_locked(start_idx, max_count, samples, actual_count);
+    xSemaphoreGive(history_fs_mutex);
+#else
     uint32_t total = history_ring.count;
     if (start_idx >= total || max_count == 0) {
         *actual_count = 0;
         return ESP_OK;
     }
-    
+
     uint32_t count = max_count;
     if (start_idx + count > total) {
         count = total - start_idx;
     }
-    
-    esp_err_t err = flash_manager_ring_read(&flash_mgr, &history_ring, start_idx, count, samples, actual_count);
+
+    err = flash_manager_ring_read(&flash_mgr, &history_ring, start_idx, count, samples, actual_count);
+#endif
     if (err != ESP_OK) return err;
     
     *actual_count = sanitize_history_samples(samples, *actual_count);

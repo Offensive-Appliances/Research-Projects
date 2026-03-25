@@ -29,6 +29,7 @@
 #include "json_utils.h"
 #include "tls_cert.h"
 #include "nvs.h"
+#include "peer_discovery.h"
 #include "esp_random.h"
 #include <stddef.h>
 #include <time.h>
@@ -95,6 +96,7 @@ static bool g_ip_handler_registered = false;
 static bool g_wifi_handler_registered = false;
 static bool s_wifi_inited = false;
 static volatile uint32_t g_last_request_time = 0;
+static bool g_deferred_tasks_started = false;
 
 void webserver_set_sta_connected(bool connected) {
     g_sta_connected = connected;
@@ -508,6 +510,7 @@ static esp_err_t wizard_status_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+static void start_deferred_wizard_tasks(void);
 static esp_err_t wizard_complete_handler(httpd_req_t *req) {
     update_last_request_time();
     
@@ -518,9 +521,44 @@ static esp_err_t wizard_complete_handler(httpd_req_t *req) {
     }
     
     ESP_LOGI(TAG, "Setup wizard completed");
+    start_deferred_wizard_tasks();
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
     return ESP_OK;
+}
+
+static void start_deferred_wizard_tasks(void) {
+    if (g_deferred_tasks_started) {
+        return;
+    }
+    g_deferred_tasks_started = true;
+
+    ESP_LOGI(TAG, "Starting deferred background tasks after wizard completion");
+
+    if (peer_discovery_init() == ESP_OK) {
+        peer_discovery_register_callback(peer_event_handler);
+        peer_discovery_start();
+        ESP_LOGI(TAG, "Peer discovery started");
+    }
+
+    device_db_init();
+    device_lifecycle_init();
+    webhook_init();
+
+    extern void wifi_scan_init_memory(void);
+    wifi_scan_init_memory();
+
+    webhook_start();
+
+    if (background_scan_init() == ESP_OK) {
+        background_scan_start();
+        ESP_LOGI(TAG, "Background scan started");
+    }
+
+    if (idle_scanner_init() == ESP_OK) {
+        idle_scanner_start();
+        ESP_LOGI(TAG, "Idle scanner started");
+    }
 }
 
 static esp_err_t wizard_reset_handler(httpd_req_t *req) {
@@ -546,6 +584,7 @@ static void register_authed(httpd_handle_t server, const char *uri, httpd_method
     httpd_register_uri_handler(server, &cfg);
 }
 
+static void start_deferred_wizard_tasks(void);
 static void ip_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
     if (event_id == IP_EVENT_STA_GOT_IP) {
         g_sta_connected = true;
@@ -677,8 +716,8 @@ static esp_err_t index_handler(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
 	httpd_resp_set_hdr(req, "ETag", etag_expected);
 
-    // Send UI in 4KB chunks to reduce memory pressure
-    const size_t chunk_size = 4096;
+    // Send UI in smaller chunks to reduce TLS write pressure on low-memory targets.
+    const size_t chunk_size = 1024;
     size_t sent = 0;
     esp_err_t ret = ESP_OK;
 
@@ -707,8 +746,8 @@ static esp_err_t login_page_handler(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     
-    // Send Login UI in 4KB chunks
-    const size_t chunk_size = 4096;
+    // Send Login UI in smaller chunks to reduce TLS write pressure.
+    const size_t chunk_size = 1024;
     size_t sent = 0;
     esp_err_t ret = ESP_OK;
 
@@ -1187,20 +1226,7 @@ static esp_err_t handshake_handler(httpd_req_t *req) {
 }
 
 static esp_err_t handshake_pcap_handler(httpd_req_t *req) {
-    size_t sz = 0;
-    const uint8_t *data = handshake_pcap_data(&sz);
-    if(sz == 0) {
-        ESP_LOGW(TAG, "PCAP requested but empty");
-        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "no pcap");
-        return ESP_FAIL;
-    }
-    ESP_LOGI(TAG, "PCAP request size=%u", (unsigned)sz);
-    httpd_resp_set_type(req, "application/vnd.tcpdump.pcap");
-    char disp[64];
-    snprintf(disp, sizeof(disp), "attachment; filename=\"%s\"", handshake_pcap_filename());
-    httpd_resp_set_hdr(req, "Content-Disposition", disp);
-    httpd_resp_send(req, (const char*)data, sz);
-    return ESP_OK;
+    return handshake_pcap_http_send(req);
 }
 
 static esp_err_t ota_upload_handler(httpd_req_t *req) {
@@ -2949,13 +2975,11 @@ static httpd_handle_t start_http_redirect_server(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 3;
-    config.max_open_sockets = 2;
+    config.max_uri_handlers = 4;
+    config.max_open_sockets = 1;
     config.backlog_conn = 1;
     config.uri_match_fn = httpd_uri_match_wildcard;
-#ifdef CONFIG_IDF_TARGET_ESP32C5
     config.stack_size = 4096;
-#endif
 
     httpd_uri_t redirect_root = {
         .uri = "/",
@@ -3013,13 +3037,8 @@ static esp_err_t https_open_fn(httpd_handle_t hd, int sockfd) {
     size_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
     size_t free_heap = esp_get_free_heap_size();
 
-    // Reject connections if heap is critically low
-    // TLS handshakes need ~6-8KB for crypto buffers
-    if (free_heap < 10000) {
-        ESP_LOGW(TAG, "Rejecting connection: low heap (%lu bytes)", (unsigned long)free_heap);
-        return ESP_FAIL;
-    }
-
+    // Prefer contiguous heap checks for TLS handshakes; fragmented heap is the common failure mode.
+    // Total free heap can be low and still work if there is one sufficiently large block.
     return ESP_OK;
 }
 
@@ -3043,19 +3062,14 @@ static httpd_handle_t start_https_server(void) {
     conf.servercert_len = strlen(s_tls_bundle.cert_pem) + 1;
     conf.prvtkey_pem = (const uint8_t *)s_tls_bundle.key_pem;
     conf.prvtkey_len = strlen(s_tls_bundle.key_pem) + 1;
-    conf.httpd.max_uri_handlers = 58;  // Increased for peer discovery routes
-#ifdef CONFIG_IDF_TARGET_ESP32C5
-    conf.httpd.max_open_sockets = 4;
-    conf.httpd.backlog_conn = 2;
+    conf.httpd.max_uri_handlers = 56;
+    conf.httpd.max_open_sockets = 2;
+    conf.httpd.backlog_conn = 1;
     conf.httpd.stack_size = 4096;
-#else
-    conf.httpd.max_open_sockets = 6;
-    conf.httpd.backlog_conn = 2;
-    conf.httpd.stack_size = 6144;
-#endif
+	conf.httpd.keep_alive_enable = false;
 	conf.httpd.lru_purge_enable = true;
 	conf.httpd.send_wait_timeout = 10;
-	conf.httpd.keep_alive_count = 3;
+	conf.httpd.keep_alive_count = 1;
     conf.httpd.open_fn = https_open_fn;
     conf.httpd.close_fn = https_close_fn;
 

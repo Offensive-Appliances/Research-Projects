@@ -1,0 +1,58 @@
+menu "PwnPower"
+
+config PWNPOWER_HISTORY_STORAGE_SDMMC
+    bool "Store history samples on SDMMC/FAT"
+    default n
+    help
+        Store history chart samples on removable storage instead of in the
+        flash scandata partition. On ESP32-C5 this uses SD card SPI mode with
+        CLK, CMD, D0, and D3 from the configured pin set.
+
+if PWNPOWER_HISTORY_STORAGE_SDMMC
+
+config PWNPOWER_SDMMC_BUS_WIDTH
+    int "SDMMC bus width"
+    range 1 4
+    default 1
+
+config PWNPOWER_SDMMC_PIN_CLK
+    int "SDMMC CLK GPIO"
+    range 0 28
+    default 9
+
+config PWNPOWER_SDMMC_PIN_CMD
+    int "SDMMC CMD GPIO"
+    range 0 28
+    default 10
+
+config PWNPOWER_SDMMC_PIN_D0
+    int "SDMMC D0 GPIO"
+    range 0 28
+    default 8
+
+config PWNPOWER_SDMMC_PIN_D1
+    int "SDMMC D1 GPIO"
+    range 0 28
+    default 7
+
+config PWNPOWER_SDMMC_PIN_D2
+    int "SDMMC D2 GPIO"
+    range 0 28
+    default 14
+
+config PWNPOWER_SDMMC_PIN_D3
+    int "SDMMC D3 GPIO"
+    range 0 28
+    default 13
+
+config PWNPOWER_SDMMC_MOUNT_POINT
+    string "SDMMC mount point"
+    default "/sdcard"
+
+config PWNPOWER_SDMMC_HISTORY_FILENAME
+    string "History storage filename"
+    default "HIST.BIN"
+
+endif
+
+endmenu

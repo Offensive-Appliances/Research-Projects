@@ -51,11 +51,153 @@ static uint8_t known_ap_bssids[100][6];
 static uint8_t known_ap_channels[64];
 static int known_ap_count = 0;
 static int known_channel_count = 0;
+static wifi_ap_record_t *s_scan_ap_records = NULL;
+static int8_t *s_scan_rssi_values = NULL;
+static size_t s_scan_scratch_capacity = 0;
 
 static volatile uint32_t s_deauth_count = 0;
 static volatile uint32_t s_deauth_last_seen = 0;
 static volatile uint32_t s_hidden_ap_count = 0;
 static volatile uint32_t s_probe_request_count = 0;
+
+static bool ensure_scan_scratch_capacity(size_t required_count) {
+    if (required_count == 0) {
+        return true;
+    }
+
+    if (required_count <= s_scan_scratch_capacity && s_scan_ap_records && s_scan_rssi_values) {
+        return true;
+    }
+
+    size_t new_capacity = s_scan_scratch_capacity ? s_scan_scratch_capacity : 16;
+    while (new_capacity < required_count) {
+        new_capacity *= 2;
+    }
+
+    wifi_ap_record_t *new_ap_records = malloc(sizeof(wifi_ap_record_t) * new_capacity);
+    int8_t *new_rssi_values = malloc(sizeof(int8_t) * new_capacity);
+    if (!new_ap_records || !new_rssi_values) {
+        free(new_ap_records);
+        free(new_rssi_values);
+        ESP_LOGW(TAG, "Failed to grow Wi-Fi scan scratch to %u entries",
+                 (unsigned)new_capacity);
+        return false;
+    }
+
+    free(s_scan_ap_records);
+    free(s_scan_rssi_values);
+    s_scan_ap_records = new_ap_records;
+    s_scan_rssi_values = new_rssi_values;
+    s_scan_scratch_capacity = new_capacity;
+    ESP_LOGI(TAG, "Wi-Fi scan scratch capacity=%u entries", (unsigned)new_capacity);
+    return true;
+}
+
+static cJSON *create_station_json_entry(const station_info_t *info) {
+    if (!info) {
+        return NULL;
+    }
+
+    cJSON *station = cJSON_CreateObject();
+    if (!station) {
+        return NULL;
+    }
+
+    cJSON_AddStringToObject(station, "mac", mac_to_str(info->station_mac));
+    cJSON_AddNumberToObject(station, "rssi", info->rssi);
+    cJSON_AddNumberToObject(station, "last_seen", info->last_seen);
+    cJSON_AddNumberToObject(station, "probe_count", info->probe_count);
+
+    if (info->has_fingerprint) {
+        cJSON_AddBoolToObject(station, "has_fingerprint", true);
+        if (strlen(info->device_vendor) > 0) {
+            cJSON_AddStringToObject(station, "device_vendor", info->device_vendor);
+        } else {
+            cJSON_AddStringToObject(station, "device_vendor", "Unknown");
+        }
+        if (strlen(info->device_fingerprint) > 0) {
+            cJSON_AddStringToObject(station, "device_fingerprint", info->device_fingerprint);
+        }
+    } else {
+        char sta_vendor[64] = "Unknown";
+        cJSON_AddBoolToObject(station, "has_fingerprint", false);
+        ouis_lookup_vendor(info->station_mac, sta_vendor, sizeof(sta_vendor));
+        cJSON_AddStringToObject(station, "device_vendor", sta_vendor);
+    }
+
+    if (info->is_grouped && info->grouped_mac_count > 0) {
+        cJSON *grouped_macs_array = cJSON_AddArrayToObject(station, "grouped_macs");
+        if (grouped_macs_array) {
+            for (int g = 0; g < info->grouped_mac_count && g < 5; g++) {
+                cJSON_AddItemToArray(grouped_macs_array, cJSON_CreateString(mac_to_str(info->grouped_macs[g])));
+            }
+        }
+        cJSON_AddNumberToObject(station, "grouped_count", info->grouped_mac_count + 1);
+    }
+
+    return station;
+}
+
+static cJSON *find_ap_entry_by_bssid(cJSON *rows, const uint8_t *bssid) {
+    if (!rows || !bssid) {
+        return NULL;
+    }
+
+    char ap_key[18];
+    snprintf(ap_key, sizeof(ap_key), "%02X:%02X:%02X:%02X:%02X:%02X",
+             bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+
+    cJSON *ap_entry = NULL;
+    cJSON_ArrayForEach(ap_entry, rows) {
+        cJSON *mac_item = cJSON_GetObjectItem(ap_entry, "MAC");
+        if (cJSON_IsString(mac_item) && mac_item->valuestring && strcmp(mac_item->valuestring, ap_key) == 0) {
+            return ap_entry;
+        }
+    }
+
+    return NULL;
+}
+
+static int merge_stations_into_ap_rows(cJSON *rows) {
+    if (!rows || !stations_mutex) {
+        return 0;
+    }
+
+    int merged_aps = 0;
+
+    xSemaphoreTake(stations_mutex, portMAX_DELAY);
+    for (size_t i = 0; i < stations_count; i++) {
+        cJSON *ap_entry = find_ap_entry_by_bssid(rows, stations[i].ap_bssid);
+        if (!ap_entry) {
+            continue;
+        }
+
+        cJSON *ssid_item = cJSON_GetObjectItem(ap_entry, "SSID");
+        if (cJSON_IsString(ssid_item) && ssid_item->valuestring) {
+            scan_storage_update_device_presence(stations[i].station_mac, stations[i].rssi, ssid_item->valuestring);
+        }
+
+        cJSON *stations_array = cJSON_GetObjectItem(ap_entry, "stations");
+        if (!cJSON_IsArray(stations_array)) {
+            stations_array = cJSON_AddArrayToObject(ap_entry, "stations");
+            if (stations_array) {
+                merged_aps++;
+            }
+        }
+
+        if (!stations_array) {
+            continue;
+        }
+
+        cJSON *station = create_station_json_entry(&stations[i]);
+        if (station) {
+            cJSON_AddItemToArray(stations_array, station);
+        }
+    }
+    xSemaphoreGive(stations_mutex);
+
+    return merged_aps;
+}
 
 static void restore_wifi_mode_with_retry(wifi_mode_t target_mode, const char *context) {
     esp_err_t err = ESP_FAIL;
@@ -502,18 +644,18 @@ void wifi_scan() {
         }
         
         ESP_LOGI(TAG, "Found %d Wi-Fi networks on channel %d (dwell: %d ms)", ap_count, channel, ap_dwell);
-        wifi_ap_record_t *ap_records = (wifi_ap_record_t *)malloc(sizeof(wifi_ap_record_t) * ap_count);
-        if (!ap_records) {
+        if (!ensure_scan_scratch_capacity(ap_count)) {
             ESP_LOGE(TAG, "Memory allocation failed!");
             // Update channel activity with count but no RSSI data
             update_channel_activity(channel, ap_count, NULL, 0);
             cJSON_AddItemToArray(rows, cJSON_CreateObject());
             continue;
         }
+        wifi_ap_record_t *ap_records = s_scan_ap_records;
+        int8_t *rssi_values = s_scan_rssi_values;
         err = esp_wifi_scan_get_ap_records(&ap_count, ap_records);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Failed to get scan results on channel %d: %s", channel, esp_err_to_name(err));
-            free(ap_records);
             // Update channel activity with count but no RSSI data
             update_channel_activity(channel, ap_count, NULL, 0);
             cJSON_AddItemToArray(rows, cJSON_CreateObject());
@@ -524,19 +666,12 @@ void wifi_scan() {
         peer_discovery_process_scan_results(ap_records, ap_count);
         
         // Collect RSSI values for filtering
-        int8_t *rssi_values = malloc(sizeof(int8_t) * ap_count);
-        if (rssi_values) {
-            for (int j = 0; j < ap_count; j++) {
-                rssi_values[j] = ap_records[j].rssi;
-            }
+        for (int j = 0; j < ap_count; j++) {
+            rssi_values[j] = ap_records[j].rssi;
         }
         
         // Update channel activity with RSSI filtering
         update_channel_activity(channel, ap_count, rssi_values, ap_count);
-
-        if (rssi_values) {
-            free(rssi_values);
-        }
 
         uint32_t now_sec = get_current_timestamp();
         for (int j = 0; j < ap_count; j++) {
@@ -588,7 +723,6 @@ void wifi_scan() {
             for(int k=0;k<known_channel_count;k++){ if(known_ap_channels[k]==ch){ ch_exists=true; break; } }
             if(!ch_exists && known_channel_count < (int)(sizeof(known_ap_channels))){ known_ap_channels[known_channel_count++] = ch; }
         }
-        free(ap_records);
     }
 
     // SAVE AP-ONLY RESULTS FIRST for fast UX feedback
@@ -605,84 +739,8 @@ void wifi_scan() {
 
     // NOW DO STATION SCAN (runs while UI can already show AP results)
     wifi_scan_stations();
-    const char *station_json = wifi_scan_get_station_results();
-    ESP_LOGI(TAG, "Station scan complete. Station JSON: %s", station_json);
-    cJSON *station_root = cJSON_Parse(station_json);
-    if (!station_root) {
-        ESP_LOGE(TAG, "Failed to parse station JSON");
-        station_root = cJSON_CreateObject();
-    } else {
-        ESP_LOGI(TAG, "Station JSON parsed successfully, merging with AP data");
-    }
-
-    // Update device presence tracking for all found stations
-    cJSON *station_ap_entry = NULL;
-    cJSON_ArrayForEach(station_ap_entry, station_root) {
-        cJSON *stations = cJSON_GetObjectItem(station_ap_entry, "stations");
-        if (stations && cJSON_IsArray(stations)) {
-            cJSON *station = NULL;
-            cJSON_ArrayForEach(station, stations) {
-                cJSON *mac_item = cJSON_GetObjectItem(station, "mac");
-                cJSON *rssi_item = cJSON_GetObjectItem(station, "rssi");
-                if (mac_item && rssi_item) {
-                    // Parse MAC address
-                    uint8_t mac[6];
-                    if (sscanf(mac_item->valuestring, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-                              &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6) {
-                        cJSON *ap_mac_item = cJSON_GetObjectItem(station_ap_entry, "bssid");
-                        if (ap_mac_item) {
-                            cJSON *scan_ap_entry = NULL;
-                            cJSON_ArrayForEach(scan_ap_entry, rows) {
-                                cJSON *scan_mac_item = cJSON_GetObjectItem(scan_ap_entry, "MAC");
-                                if (scan_mac_item && scan_mac_item->valuestring && ap_mac_item->valuestring) {
-                                    char scan_mac_upper[18];
-                                    char ap_mac_upper[18];
-                                    strncpy(scan_mac_upper, scan_mac_item->valuestring, sizeof(scan_mac_upper));
-                                    scan_mac_upper[sizeof(scan_mac_upper) - 1] = '\0';
-                                    strncpy(ap_mac_upper, ap_mac_item->valuestring, sizeof(ap_mac_upper));
-                                    ap_mac_upper[sizeof(ap_mac_upper) - 1] = '\0';
-
-                                    for (int m = 0; scan_mac_upper[m]; m++) scan_mac_upper[m] = toupper((unsigned char)scan_mac_upper[m]);
-                                    for (int m = 0; ap_mac_upper[m]; m++) ap_mac_upper[m] = toupper((unsigned char)ap_mac_upper[m]);
-
-                                    if (strcmp(scan_mac_upper, ap_mac_upper) != 0) {
-                                        continue;
-                                    }
-                                    cJSON *ssid_item = cJSON_GetObjectItem(scan_ap_entry, "SSID");
-                                    if (ssid_item) {
-                                        scan_storage_update_device_presence(mac, rssi_item->valueint, ssid_item->valuestring);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Merge station data into AP entries
-    int merge_count = 0;
+    int merge_count = merge_stations_into_ap_rows(rows);
     cJSON *ap_entry = NULL;
-    cJSON_ArrayForEach(ap_entry, rows) {
-        cJSON *mac_item = cJSON_GetObjectItem(ap_entry, "MAC");
-        if(mac_item) {
-            char upper_mac[18];
-            strncpy(upper_mac, mac_item->valuestring, sizeof(upper_mac));
-            upper_mac[sizeof(upper_mac) - 1] = '\0';
-            for(int i=0; upper_mac[i]; i++) upper_mac[i] = toupper(upper_mac[i]);
-
-            cJSON *station_data = cJSON_GetObjectItem(station_root, upper_mac);
-            if(station_data) {
-                cJSON *stations = cJSON_DetachItemFromObject(station_data, "stations");
-                if (stations) {
-                    cJSON_AddItemToObject(ap_entry, "stations", stations);
-                    merge_count++;
-                }
-            }
-        }
-    }
     if (merge_count > 0) {
         ESP_LOGI(TAG, "Merged stations for %d APs", merge_count);
     }
@@ -742,8 +800,6 @@ void wifi_scan() {
 
     // cleanup
     cJSON_Delete(root);
-    cJSON_Delete(station_root);
-
     // Sync deauth detection results to intelligence system
     scan_storage_update_security_events(wifi_scan_get_deauth_count());
 
@@ -1410,43 +1466,10 @@ const char* wifi_scan_get_station_results() {
             cJSON_AddArrayToObject(ap_entry, "stations");
         }
 
-        // Add station to AP's list
-        cJSON *station = cJSON_CreateObject();
-        cJSON_AddStringToObject(station, "mac", 
-            (char*)mac_to_str(stations[i].station_mac));
-        cJSON_AddNumberToObject(station, "rssi", stations[i].rssi);
-        cJSON_AddNumberToObject(station, "last_seen", stations[i].last_seen);
-        cJSON_AddNumberToObject(station, "probe_count", stations[i].probe_count);
-        
-        // Add fingerprinting data
-        if (stations[i].has_fingerprint) {
-            cJSON_AddBoolToObject(station, "has_fingerprint", true);
-            if (strlen(stations[i].device_vendor) > 0) {
-                cJSON_AddStringToObject(station, "device_vendor", stations[i].device_vendor);
-            } else {
-                cJSON_AddStringToObject(station, "device_vendor", "Unknown");
-            }
-            if (strlen(stations[i].device_fingerprint) > 0) {
-                cJSON_AddStringToObject(station, "device_fingerprint", stations[i].device_fingerprint);
-            }
-        } else {
-            cJSON_AddBoolToObject(station, "has_fingerprint", false);
-            // Fallback to basic OUI lookup
-            char sta_vendor[64] = "Unknown";
-            ouis_lookup_vendor(stations[i].station_mac, sta_vendor, sizeof(sta_vendor));
-            cJSON_AddStringToObject(station, "device_vendor", sta_vendor);
+        cJSON *station = create_station_json_entry(&stations[i]);
+        if (station) {
+            cJSON_AddItemToArray(cJSON_GetObjectItem(ap_entry, "stations"), station);
         }
-        
-        // Add grouped MAC addresses if this device has multiple MACs
-        if (stations[i].is_grouped && stations[i].grouped_mac_count > 0) {
-            cJSON *grouped_macs_array = cJSON_AddArrayToObject(station, "grouped_macs");
-            for (int g = 0; g < stations[i].grouped_mac_count && g < 5; g++) {
-                cJSON_AddItemToArray(grouped_macs_array, cJSON_CreateString(mac_to_str(stations[i].grouped_macs[g])));
-            }
-            cJSON_AddNumberToObject(station, "grouped_count", stations[i].grouped_mac_count + 1);
-        }
-        
-        cJSON_AddItemToArray(cJSON_GetObjectItem(ap_entry, "stations"), station);
     }
     xSemaphoreGive(stations_mutex);
     

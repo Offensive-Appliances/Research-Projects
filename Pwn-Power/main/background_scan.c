@@ -46,6 +46,42 @@ static SemaphoreHandle_t scan_sem = NULL;
 static uint32_t last_scan_time = 0;
 static bool task_running = false;
 static bool trigger_pending = false;
+static wifi_ap_record_t *s_bg_ap_list = NULL;
+static int8_t *s_bg_rssi_values = NULL;
+static size_t s_bg_scratch_capacity = 0;
+
+static bool ensure_bg_scan_scratch_capacity(size_t required_count) {
+    if (required_count == 0) {
+        return true;
+    }
+
+    if (required_count <= s_bg_scratch_capacity && s_bg_ap_list && s_bg_rssi_values) {
+        return true;
+    }
+
+    size_t new_capacity = s_bg_scratch_capacity ? s_bg_scratch_capacity : 16;
+    while (new_capacity < required_count) {
+        new_capacity *= 2;
+    }
+
+    wifi_ap_record_t *new_ap_list = malloc(sizeof(wifi_ap_record_t) * new_capacity);
+    int8_t *new_rssi_values = malloc(sizeof(int8_t) * new_capacity);
+    if (!new_ap_list || !new_rssi_values) {
+        free(new_ap_list);
+        free(new_rssi_values);
+        ESP_LOGW(TAG, "Failed to grow background scan scratch to %u entries",
+                 (unsigned)new_capacity);
+        return false;
+    }
+
+    free(s_bg_ap_list);
+    free(s_bg_rssi_values);
+    s_bg_ap_list = new_ap_list;
+    s_bg_rssi_values = new_rssi_values;
+    s_bg_scratch_capacity = new_capacity;
+    ESP_LOGI(TAG, "Background scan scratch capacity=%u entries", (unsigned)new_capacity);
+    return true;
+}
 
 static uint32_t get_uptime_sec(void) {
     return (uint32_t)(esp_timer_get_time() / 1000000ULL);
@@ -211,31 +247,25 @@ static void populate_scan_record(scan_record_t *record) {
             continue;
         }
         
-        wifi_ap_record_t *ap_list = malloc(sizeof(wifi_ap_record_t) * ap_count);
-        if (!ap_list) {
+        if (!ensure_bg_scan_scratch_capacity(ap_count)) {
             // Update channel activity with count but no RSSI data
             update_channel_activity(ch, ap_count, NULL, 0);
             continue;
         }
+        wifi_ap_record_t *ap_list = s_bg_ap_list;
+        int8_t *rssi_values = s_bg_rssi_values;
         
         if (esp_wifi_scan_get_ap_records(&ap_count, ap_list) == ESP_OK) {
             // Process scan results for Peer Discovery
             peer_discovery_process_scan_results(ap_list, ap_count);
 
             // Collect RSSI values for filtering
-            int8_t *rssi_values = malloc(sizeof(int8_t) * ap_count);
-            if (rssi_values) {
-                for (uint16_t i = 0; i < ap_count; i++) {
-                    rssi_values[i] = ap_list[i].rssi;
-                }
+            for (uint16_t i = 0; i < ap_count; i++) {
+                rssi_values[i] = ap_list[i].rssi;
             }
             
             // Update channel activity with RSSI filtering
             update_channel_activity(ch, ap_count, rssi_values, ap_count);
-            
-            if (rssi_values) {
-                free(rssi_values);
-            }
             
             for (uint16_t i = 0; i < ap_count && ap_idx < MAX_APS_PER_SCAN; i++) {
                 bool exists = false;
@@ -277,7 +307,6 @@ static void populate_scan_record(scan_record_t *record) {
                 }
             }
         }
-        free(ap_list);
     }
 
     record->header.ap_count = ap_idx;

@@ -578,18 +578,21 @@ esp_err_t peer_discovery_stop(void) {
 }
 
 peer_role_t peer_discovery_get_role(void) {
+    if (!s_initialized) return PEER_ROLE_LEADER;
     return s_current_role;
 }
 
 esp_err_t peer_discovery_get_self(peer_info_t *info) {
     if (!info) return ESP_ERR_INVALID_ARG;
+    if (!s_initialized) { memset(info, 0, sizeof(peer_info_t)); return ESP_OK; }
     memcpy(info, &s_self, sizeof(peer_info_t));
     return ESP_OK;
 }
 
 esp_err_t peer_discovery_get_peers(peer_info_t *peers, size_t max_peers, size_t *count) {
     if (!peers || !count) return ESP_ERR_INVALID_ARG;
-    
+    if (!s_initialized) { *count = 0; return ESP_OK; }
+
     xSemaphoreTake(s_peer_mutex, portMAX_DELAY);
     
     size_t copy_count = (s_peer_count < max_peers) ? s_peer_count : max_peers;
@@ -603,7 +606,8 @@ esp_err_t peer_discovery_get_peers(peer_info_t *peers, size_t max_peers, size_t 
 
 esp_err_t peer_discovery_get_leader(peer_info_t *leader) {
     if (!leader) return ESP_ERR_INVALID_ARG;
-    
+    if (!s_initialized) return ESP_ERR_INVALID_STATE;
+
     xSemaphoreTake(s_peer_mutex, portMAX_DELAY);
     
     for (size_t i = 0; i < s_peer_count; i++) {

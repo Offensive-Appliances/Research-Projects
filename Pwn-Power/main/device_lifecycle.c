@@ -183,7 +183,8 @@ static void generate_event(const uint8_t *mac, device_event_type_t event_type, i
 
 esp_err_t device_lifecycle_update(const uint8_t *mac, int8_t rssi, const char *ap_ssid, const char *vendor) {
     if (!mac) return ESP_ERR_INVALID_ARG;
-    
+    if (!lifecycle_mutex) return ESP_OK;
+
     xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
     
     device_state_t *state = find_or_create_state(mac);
@@ -220,6 +221,7 @@ esp_err_t device_lifecycle_update(const uint8_t *mac, int8_t rssi, const char *a
 }
 
 esp_err_t device_lifecycle_check_departures(void) {
+    if (!lifecycle_mutex) return ESP_OK;
     xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
     
     uint32_t now = get_uptime_sec();
@@ -242,6 +244,7 @@ esp_err_t device_lifecycle_check_departures(void) {
 
 bool device_lifecycle_is_present(const uint8_t *mac) {
     if (!mac) return false;
+    if (!lifecycle_mutex) return false;
     
     xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
     
@@ -261,6 +264,7 @@ bool device_lifecycle_is_present(const uint8_t *mac) {
 
 esp_err_t device_lifecycle_restore_device(const uint8_t *mac) {
     if (!mac) return ESP_ERR_INVALID_ARG;
+    if (!lifecycle_mutex) return ESP_ERR_INVALID_STATE;
     
     xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
     

@@ -233,7 +233,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 }
 
 // Peer discovery event callback - handle role changes and peer events
-static void peer_event_handler(peer_event_type_t event, const peer_info_t *peer) {
+void peer_event_handler(peer_event_type_t event, const peer_info_t *peer) {
     switch (event) {
         case PEER_EVENT_ROLE_CHANGED:
             ESP_LOGI(TAG, "Peer role changed to: %s", 
@@ -489,46 +489,57 @@ void app_main() {
     mdns_service_init("pwnpower");
     ESP_LOGI(TAG, "Heap after mDNS: %lu bytes", (unsigned long)esp_get_free_heap_size());
 
-    // Initialize and start peer discovery for multi-device coordination
-    if (peer_discovery_init() == ESP_OK) {
-        // Register callback to update mDNS hostname when role changes
-        peer_discovery_register_callback(peer_event_handler);
-        peer_discovery_start();
-        ESP_LOGI(TAG, "Peer discovery started. Role: %s, Hostname: %s",
-                 peer_discovery_get_role() == PEER_ROLE_LEADER ? "leader" : "follower",
-                 peer_discovery_get_hostname());
+    bool wizard_done = false;
+    {
+        nvs_handle_t h;
+        if (nvs_open("wizard", NVS_READONLY, &h) == ESP_OK) {
+            uint8_t v = 0;
+            nvs_get_u8(h, "complete", &v);
+            nvs_close(h);
+            wizard_done = (v != 0);
+        }
     }
-    ESP_LOGI(TAG, "Heap after peer discovery: %lu bytes", (unsigned long)esp_get_free_heap_size());
+    ESP_LOGI(TAG, "Wizard completed: %s", wizard_done ? "yes" : "no");
 
-    // initialize device tracking
-    device_db_init();
-    ESP_LOGI(TAG, "Heap after DeviceDB: %lu bytes", (unsigned long)esp_get_free_heap_size());
+    if (wizard_done) {
+        if (peer_discovery_init() == ESP_OK) {
+            peer_discovery_register_callback(peer_event_handler);
+            peer_discovery_start();
+            ESP_LOGI(TAG, "Peer discovery started. Role: %s, Hostname: %s",
+                     peer_discovery_get_role() == PEER_ROLE_LEADER ? "leader" : "follower",
+                     peer_discovery_get_hostname());
+        }
+        ESP_LOGI(TAG, "Heap after peer discovery: %lu bytes", (unsigned long)esp_get_free_heap_size());
 
-    device_lifecycle_init();
-    ESP_LOGI(TAG, "Heap after DeviceLifecycle: %lu bytes", (unsigned long)esp_get_free_heap_size());
+        device_db_init();
+        ESP_LOGI(TAG, "Heap after DeviceDB: %lu bytes", (unsigned long)esp_get_free_heap_size());
 
-    // initialize and start webhook dispatcher
-    webhook_init();
-    ESP_LOGI(TAG, "Heap after webhook_init: %lu bytes", (unsigned long)esp_get_free_heap_size());
+        device_lifecycle_init();
+        ESP_LOGI(TAG, "Heap after DeviceLifecycle: %lu bytes", (unsigned long)esp_get_free_heap_size());
 
-    // initialize wifi scan memory
-    extern void wifi_scan_init_memory(void);
-    wifi_scan_init_memory();
-    ESP_LOGI(TAG, "Heap after wifi_scan_init_memory: %lu bytes", (unsigned long)esp_get_free_heap_size());
+        webhook_init();
+        ESP_LOGI(TAG, "Heap after webhook_init: %lu bytes", (unsigned long)esp_get_free_heap_size());
 
-    webhook_start();
-    ESP_LOGI(TAG, "Heap after webhook_start (task): %lu bytes", (unsigned long)esp_get_free_heap_size());
+        extern void wifi_scan_init_memory(void);
+        wifi_scan_init_memory();
+        ESP_LOGI(TAG, "Heap after wifi_scan_init_memory: %lu bytes", (unsigned long)esp_get_free_heap_size());
 
-    if (background_scan_init() == ESP_OK) {
-        ESP_LOGI(TAG, "Heap after background_scan_init: %lu bytes", (unsigned long)esp_get_free_heap_size());
-        background_scan_start();
-        ESP_LOGI(TAG, "Heap after background_scan_start (task): %lu bytes", (unsigned long)esp_get_free_heap_size());
-    }
+        webhook_start();
+        ESP_LOGI(TAG, "Heap after webhook_start (task): %lu bytes", (unsigned long)esp_get_free_heap_size());
 
-    if (idle_scanner_init() == ESP_OK) {
-        ESP_LOGI(TAG, "Heap after idle_scanner_init: %lu bytes", (unsigned long)esp_get_free_heap_size());
-        idle_scanner_start();
-        ESP_LOGI(TAG, "Heap after idle_scanner_start (task): %lu bytes", (unsigned long)esp_get_free_heap_size());
+        if (background_scan_init() == ESP_OK) {
+            ESP_LOGI(TAG, "Heap after background_scan_init: %lu bytes", (unsigned long)esp_get_free_heap_size());
+            background_scan_start();
+            ESP_LOGI(TAG, "Heap after background_scan_start (task): %lu bytes", (unsigned long)esp_get_free_heap_size());
+        }
+
+        if (idle_scanner_init() == ESP_OK) {
+            ESP_LOGI(TAG, "Heap after idle_scanner_init: %lu bytes", (unsigned long)esp_get_free_heap_size());
+            idle_scanner_start();
+            ESP_LOGI(TAG, "Heap after idle_scanner_start (task): %lu bytes", (unsigned long)esp_get_free_heap_size());
+        }
+    } else {
+        ESP_LOGI(TAG, "Wizard not complete - deferring peer discovery, background scan, idle scanner, and webhooks");
     }
 
     // start periodic sta reconnect task

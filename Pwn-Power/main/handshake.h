@@ -2,6 +2,7 @@
 #define HANDSHAKE_H
 
 #include "esp_err.h"
+#include "esp_http_server.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -10,6 +11,7 @@ esp_err_t start_handshake_capture(uint8_t bssid[6], int channel, int duration_se
 esp_err_t start_handshake_capture_preserve(uint8_t bssid[6], int channel, int duration_seconds, uint8_t (*stas)[6], int sta_count, int *eapol_count_out, bool preserve_eapol);
 
 const uint8_t* handshake_pcap_data(size_t *out_size);
+esp_err_t handshake_pcap_http_send(httpd_req_t *req);
 void handshake_clear_pcap(void);
 bool handshake_has_eapol_frames(void);
 

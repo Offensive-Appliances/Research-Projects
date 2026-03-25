@@ -6,6 +6,8 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "sdkconfig.h"
+#include "esp_http_server.h"
+#include <stdio.h>
 #include <string.h>
 #include "deauth.h"
 #include "device_lifecycle.h"
@@ -44,6 +46,12 @@ static wifi_promiscuous_filter_t s_prev_filter;
 static bool s_prev_filter_valid = false;
 static wifi_promiscuous_cb_t s_prev_cb = NULL;
 
+#if CONFIG_IDF_TARGET_ESP32C5 && CONFIG_PWNPOWER_HISTORY_STORAGE_SDMMC
+#define HS_PCAP_FILE_BACKED 1
+#else
+#define HS_PCAP_FILE_BACKED 0
+#endif
+
 #if CONFIG_IDF_TARGET_ESP32C5
 #define HS_PCAP_MAX_BYTES (16*1024)
 #elif CONFIG_IDF_TARGET_ESP32C3
@@ -51,9 +59,31 @@ static wifi_promiscuous_cb_t s_prev_cb = NULL;
 #else
 #define HS_PCAP_MAX_BYTES (32*1024)
 #endif
+
+#if HS_PCAP_FILE_BACKED
+#define HS_PCAP_QUEUE_DEPTH 4
+#define HS_PCAP_PACKET_MAX_BYTES 2048
+
+typedef struct {
+    size_t len;
+    uint8_t data[HS_PCAP_PACKET_MAX_BYTES];
+} hs_pcap_slot_t;
+
+static hs_pcap_slot_t s_pcap_queue[HS_PCAP_QUEUE_DEPTH];
+static uint8_t s_pcap_queue_head = 0;
+static uint8_t s_pcap_queue_tail = 0;
+static uint8_t s_pcap_queue_count = 0;
+static uint32_t s_pcap_queue_drops = 0;
+static portMUX_TYPE s_pcap_queue_lock = portMUX_INITIALIZER_UNLOCKED;
+static FILE *s_pcap_file = NULL;
+static char s_pcap_path[96] = {0};
+static uint8_t s_pcap_drain_buf[HS_PCAP_PACKET_MAX_BYTES];
+#else
 static uint8_t s_pcap_buf[HS_PCAP_MAX_BYTES];
+#endif
 static size_t s_pcap_len = 0;
 static char s_pcap_name[32] = "handshake.pcap";
+static char s_pcap_storage_name[16] = "HS.CAP";
 
 static uint32_t s_wifi_callback_count = 0;
 static uint32_t s_mgmt_written = 0;
@@ -64,6 +94,12 @@ static uint8_t s_hs_count = 0;
 static uint8_t s_hs_insert_idx = 0;
 static uint32_t s_handshake_pairs = 0;
 static bool s_capture_all = false;
+
+static void pcap_write_global_header(void);
+static void pcap_write_packet(const uint8_t *data, uint32_t caplen);
+static esp_err_t pcap_prepare_storage(bool truncate_file);
+static esp_err_t pcap_flush_pending_packets(void);
+static void pcap_close_storage(void);
 
 typedef struct {
     uint8_t bssid[6];
@@ -125,7 +161,18 @@ static bool hs_beacon_should_write(const uint8_t *bssid, bool ssid_has_text){
 static void pcap_write_global_header(void) {
     if (s_pcap_len != 0) return;
     const uint8_t gh[] = { 0xd4,0xc3,0xb2,0xa1, 0x02,0x00,0x04,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xff,0xff,0x00,0x00, 0x69,0x00,0x00,0x00 };
+#if HS_PCAP_FILE_BACKED
+    if (!s_pcap_file) {
+        return;
+    }
+    if (fwrite(gh, 1, sizeof(gh), s_pcap_file) != sizeof(gh)) {
+        ESP_LOGW(TAG, "failed to write pcap header to %s", s_pcap_path);
+        return;
+    }
+    fflush(s_pcap_file);
+#else
     memcpy(s_pcap_buf, gh, sizeof(gh));
+#endif
     s_pcap_len = sizeof(gh);
     ESP_LOGD(TAG, "pcap header written");
 }
@@ -133,6 +180,26 @@ static void pcap_write_global_header(void) {
 static void pcap_write_packet(const uint8_t *data, uint32_t caplen) {
     if (!data || caplen == 0) return;
     if (s_pcap_len == 0) pcap_write_global_header();
+#if HS_PCAP_FILE_BACKED
+    if (!s_pcap_file) return;
+    if (caplen > HS_PCAP_PACKET_MAX_BYTES) {
+        s_pcap_queue_drops++;
+        return;
+    }
+
+    portENTER_CRITICAL(&s_pcap_queue_lock);
+    if (s_pcap_queue_count >= HS_PCAP_QUEUE_DEPTH) {
+        s_pcap_queue_drops++;
+        portEXIT_CRITICAL(&s_pcap_queue_lock);
+        return;
+    }
+    hs_pcap_slot_t *slot = &s_pcap_queue[s_pcap_queue_head];
+    slot->len = caplen;
+    memcpy(slot->data, data, caplen);
+    s_pcap_queue_head = (uint8_t)((s_pcap_queue_head + 1) % HS_PCAP_QUEUE_DEPTH);
+    s_pcap_queue_count++;
+    portEXIT_CRITICAL(&s_pcap_queue_lock);
+#else
     struct __attribute__((packed)) hdr { uint32_t ts_sec, ts_usec, incl_len, orig_len; } h;
     uint64_t us = esp_timer_get_time();
     h.ts_sec = (uint32_t)(us / 1000000ULL);
@@ -148,14 +215,31 @@ static void pcap_write_packet(const uint8_t *data, uint32_t caplen) {
     if ((s_pcap_len & 0xFFF) == 0) {
         ESP_LOGD(TAG, "pcap bytes=%u", (unsigned)s_pcap_len);
     }
+#endif
 }
 
 const uint8_t* handshake_pcap_data(size_t *out_size) {
     if (out_size) *out_size = s_pcap_len;
+#if HS_PCAP_FILE_BACKED
+    return NULL;
+#else
     return s_pcap_buf;
+#endif
 }
 
 void handshake_clear_pcap(void) {
+#if HS_PCAP_FILE_BACKED
+    pcap_close_storage();
+    if (s_pcap_path[0] != '\0') {
+        remove(s_pcap_path);
+    }
+    portENTER_CRITICAL(&s_pcap_queue_lock);
+    s_pcap_queue_head = 0;
+    s_pcap_queue_tail = 0;
+    s_pcap_queue_count = 0;
+    s_pcap_queue_drops = 0;
+    portEXIT_CRITICAL(&s_pcap_queue_lock);
+#endif
     s_pcap_len = 0;
 }
 
@@ -165,6 +249,117 @@ bool handshake_has_eapol_frames(void) {
 
 const char* handshake_pcap_filename(void) {
     return s_pcap_name;
+}
+
+static esp_err_t pcap_prepare_storage(bool truncate_file) {
+#if HS_PCAP_FILE_BACKED
+    snprintf(s_pcap_path, sizeof(s_pcap_path), "%s/%s", CONFIG_PWNPOWER_SDMMC_MOUNT_POINT, s_pcap_storage_name);
+
+    if (s_pcap_file) {
+        fclose(s_pcap_file);
+        s_pcap_file = NULL;
+    }
+
+    const char *mode = truncate_file ? "wb" : "ab";
+    s_pcap_file = fopen(s_pcap_path, mode);
+    if (!s_pcap_file) {
+        ESP_LOGE(TAG, "failed to open pcap storage: %s", s_pcap_path);
+        return ESP_FAIL;
+    }
+
+    if (truncate_file || s_pcap_len == 0) {
+        s_pcap_len = 0;
+        pcap_write_global_header();
+    }
+#else
+    (void)truncate_file;
+#endif
+    return ESP_OK;
+}
+
+static esp_err_t pcap_flush_pending_packets(void) {
+#if HS_PCAP_FILE_BACKED
+    if (!s_pcap_file) {
+        return ESP_OK;
+    }
+
+    while (true) {
+        size_t packet_len = 0;
+        portENTER_CRITICAL(&s_pcap_queue_lock);
+        if (s_pcap_queue_count == 0) {
+            portEXIT_CRITICAL(&s_pcap_queue_lock);
+            break;
+        }
+        hs_pcap_slot_t *slot = &s_pcap_queue[s_pcap_queue_tail];
+        packet_len = slot->len;
+        memcpy(s_pcap_drain_buf, slot->data, packet_len);
+        s_pcap_queue_tail = (uint8_t)((s_pcap_queue_tail + 1) % HS_PCAP_QUEUE_DEPTH);
+        s_pcap_queue_count--;
+        portEXIT_CRITICAL(&s_pcap_queue_lock);
+
+        struct __attribute__((packed)) hdr { uint32_t ts_sec, ts_usec, incl_len, orig_len; } h;
+        uint64_t us = esp_timer_get_time();
+        h.ts_sec = (uint32_t)(us / 1000000ULL);
+        h.ts_usec = (uint32_t)(us % 1000000ULL);
+        h.incl_len = packet_len;
+        h.orig_len = packet_len;
+
+        if (fwrite(&h, 1, sizeof(h), s_pcap_file) != sizeof(h) ||
+            fwrite(s_pcap_drain_buf, 1, packet_len, s_pcap_file) != packet_len) {
+            ESP_LOGE(TAG, "failed writing packet to %s", s_pcap_path);
+            return ESP_FAIL;
+        }
+
+        s_pcap_len += sizeof(h) + packet_len;
+    }
+
+    fflush(s_pcap_file);
+#endif
+    return ESP_OK;
+}
+
+static void pcap_close_storage(void) {
+#if HS_PCAP_FILE_BACKED
+    if (s_pcap_file) {
+        fclose(s_pcap_file);
+        s_pcap_file = NULL;
+    }
+#endif
+}
+
+esp_err_t handshake_pcap_http_send(httpd_req_t *req) {
+    if (s_pcap_len == 0) {
+        ESP_LOGW(TAG, "PCAP requested but empty");
+        return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "no pcap");
+    }
+
+    ESP_LOGI(TAG, "PCAP request size=%u", (unsigned)s_pcap_len);
+    httpd_resp_set_type(req, "application/vnd.tcpdump.pcap");
+    char disp[64];
+    snprintf(disp, sizeof(disp), "attachment; filename=\"%s\"", handshake_pcap_filename());
+    httpd_resp_set_hdr(req, "Content-Disposition", disp);
+
+#if HS_PCAP_FILE_BACKED
+    FILE *fp = fopen(s_pcap_path, "rb");
+    if (!fp) {
+        ESP_LOGE(TAG, "failed to open pcap for download: %s", s_pcap_path);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "pcap unavailable");
+    }
+
+    char chunk[1024];
+    size_t nread = 0;
+    while ((nread = fread(chunk, 1, sizeof(chunk), fp)) > 0) {
+        esp_err_t err = httpd_resp_send_chunk(req, chunk, nread);
+        if (err != ESP_OK) {
+            fclose(fp);
+            return err;
+        }
+    }
+    fclose(fp);
+    return httpd_resp_send_chunk(req, NULL, 0);
+#else
+    return httpd_resp_send(req, (const char *)s_pcap_buf, s_pcap_len);
+#endif
 }
 
 static void sniff_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
@@ -254,6 +449,8 @@ static void sniff_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
 esp_err_t start_handshake_capture(uint8_t bssid[6], int channel, int duration_seconds, uint8_t (*stas)[6], int sta_count, int *eapol_count_out) {
     strncpy(s_pcap_name, "handshake.pcap", sizeof(s_pcap_name)-1);
     s_pcap_name[sizeof(s_pcap_name)-1] = '\0';
+    strncpy(s_pcap_storage_name, "HS.CAP", sizeof(s_pcap_storage_name)-1);
+    s_pcap_storage_name[sizeof(s_pcap_storage_name)-1] = '\0';
     if (!bssid || channel < 1 || channel > 165 || duration_seconds <= 0) return ESP_ERR_INVALID_ARG;
     if (eapol_count_out) *eapol_count_out = 0;
 
@@ -274,6 +471,10 @@ esp_err_t start_handshake_capture(uint8_t bssid[6], int channel, int duration_se
 
     s_eapol_count = 0;
     handshake_clear_pcap();
+    if (pcap_prepare_storage(true) != ESP_OK) {
+        restore_wifi_mode_with_retry(original_mode, "start_handshake_capture_open");
+        return ESP_FAIL;
+    }
     s_mgmt_written = 0;
     wifi_promiscuous_filter_t filter = {
         .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA
@@ -299,9 +500,12 @@ esp_err_t start_handshake_capture(uint8_t bssid[6], int channel, int duration_se
     // passive capture only; do not trigger deauth during handshake capture
 
     int ms = duration_seconds * 1000;
-    const int step = 50;
+    const int step = HS_PCAP_FILE_BACKED ? 10 : 50;
     for (int t = 0; t < ms; t += step) {
         vTaskDelay(pdMS_TO_TICKS(step));
+        if (pcap_flush_pending_packets() != ESP_OK) {
+            break;
+        }
     }
 
     // end passive capture window
@@ -312,6 +516,12 @@ esp_err_t start_handshake_capture(uint8_t bssid[6], int channel, int duration_se
     }
     esp_wifi_set_promiscuous_rx_cb(NULL);
     ESP_LOGI(TAG, "promisc disabled");
+
+    pcap_flush_pending_packets();
+    pcap_close_storage();
+    if (s_pcap_queue_drops > 0) {
+        ESP_LOGW(TAG, "pcap queue dropped %lu packets during capture", (unsigned long)s_pcap_queue_drops);
+    }
 
     restore_wifi_mode_with_retry(original_mode, "start_handshake_capture");
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -336,6 +546,8 @@ esp_err_t start_handshake_capture(uint8_t bssid[6], int channel, int duration_se
 esp_err_t start_handshake_capture_preserve(uint8_t bssid[6], int channel, int duration_seconds, uint8_t (*stas)[6], int sta_count, int *eapol_count_out, bool preserve_eapol) {
     strncpy(s_pcap_name, "handshake.pcap", sizeof(s_pcap_name)-1);
     s_pcap_name[sizeof(s_pcap_name)-1] = '\0';
+    strncpy(s_pcap_storage_name, "HS.CAP", sizeof(s_pcap_storage_name)-1);
+    s_pcap_storage_name[sizeof(s_pcap_storage_name)-1] = '\0';
     if (!bssid || channel < 1 || channel > 165 || duration_seconds <= 0) return ESP_ERR_INVALID_ARG;
     if (eapol_count_out) *eapol_count_out = 0;
 
@@ -362,9 +574,17 @@ esp_err_t start_handshake_capture_preserve(uint8_t bssid[6], int channel, int du
     if (!preserve_eapol || !had_eapol) {
         s_eapol_count = 0;
         handshake_clear_pcap();
+        if (pcap_prepare_storage(true) != ESP_OK) {
+            restore_wifi_mode_with_retry(original_mode, "start_handshake_capture_preserve_open");
+            return ESP_FAIL;
+        }
     } else {
         ESP_LOGI(TAG, "Preserving existing %d EAPOL frames and %u PCAP bytes", 
                  (int)s_eapol_count, (unsigned int)s_pcap_len);
+        if (pcap_prepare_storage(false) != ESP_OK) {
+            restore_wifi_mode_with_retry(original_mode, "start_handshake_capture_preserve_append");
+            return ESP_FAIL;
+        }
     }
     
     s_mgmt_written = 0;
@@ -396,9 +616,12 @@ esp_err_t start_handshake_capture_preserve(uint8_t bssid[6], int channel, int du
     // passive capture only; do not trigger deauth during handshake capture
 
     int ms = duration_seconds * 1000;
-    const int step = 50;
+    const int step = HS_PCAP_FILE_BACKED ? 10 : 50;
     for (int t = 0; t < ms; t += step) {
         vTaskDelay(pdMS_TO_TICKS(step));
+        if (pcap_flush_pending_packets() != ESP_OK) {
+            break;
+        }
     }
 
     // end passive capture window
@@ -409,6 +632,12 @@ esp_err_t start_handshake_capture_preserve(uint8_t bssid[6], int channel, int du
     }
     esp_wifi_set_promiscuous_rx_cb(NULL);
     ESP_LOGI(TAG, "promisc disabled");
+
+    pcap_flush_pending_packets();
+    pcap_close_storage();
+    if (s_pcap_queue_drops > 0) {
+        ESP_LOGW(TAG, "pcap queue dropped %lu packets during preserve capture", (unsigned long)s_pcap_queue_drops);
+    }
 
     restore_wifi_mode_with_retry(original_mode, "start_handshake_capture_preserve");
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -436,6 +665,8 @@ esp_err_t start_handshake_capture_preserve(uint8_t bssid[6], int channel, int du
 esp_err_t start_general_capture(int channel, int duration_seconds) {
     strncpy(s_pcap_name, "capture.pcap", sizeof(s_pcap_name)-1);
     s_pcap_name[sizeof(s_pcap_name)-1] = '\0';
+    strncpy(s_pcap_storage_name, "CAP.CAP", sizeof(s_pcap_storage_name)-1);
+    s_pcap_storage_name[sizeof(s_pcap_storage_name)-1] = '\0';
     if (channel < 1 || channel > 165 || duration_seconds <= 0) return ESP_ERR_INVALID_ARG;
     wifi_mode_t original_mode;
     esp_wifi_get_mode(&original_mode);
@@ -448,6 +679,10 @@ esp_err_t start_general_capture(int channel, int duration_seconds) {
         }
     }
     handshake_clear_pcap();
+    if (pcap_prepare_storage(true) != ESP_OK) {
+        restore_wifi_mode_with_retry(original_mode, "start_general_capture_open");
+        return ESP_FAIL;
+    }
     s_capture_all = true;
     wifi_promiscuous_filter_t filter = {
         .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA | WIFI_PROMIS_FILTER_MASK_CTRL
@@ -463,15 +698,23 @@ esp_err_t start_general_capture(int channel, int duration_seconds) {
     esp_wifi_set_promiscuous_rx_cb(sniff_cb);
     esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
     int ms = duration_seconds * 1000;
-    const int step = 50;
+    const int step = HS_PCAP_FILE_BACKED ? 10 : 50;
     for (int t = 0; t < ms; t += step) {
         vTaskDelay(pdMS_TO_TICKS(step));
+        if (pcap_flush_pending_packets() != ESP_OK) {
+            break;
+        }
     }
     esp_wifi_set_promiscuous(false);
     if (s_prev_filter_valid) {
         esp_wifi_set_promiscuous_filter(&s_prev_filter);
     }
     esp_wifi_set_promiscuous_rx_cb(NULL);
+    pcap_flush_pending_packets();
+    pcap_close_storage();
+    if (s_pcap_queue_drops > 0) {
+        ESP_LOGW(TAG, "pcap queue dropped %lu packets during general capture", (unsigned long)s_pcap_queue_drops);
+    }
     s_capture_all = false;
     restore_wifi_mode_with_retry(original_mode, "start_general_capture");
     vTaskDelay(pdMS_TO_TICKS(100));

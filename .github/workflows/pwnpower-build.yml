@@ -97,14 +97,16 @@ jobs:
           cp build/bootloader/bootloader.bin release/
           cp build/partition_table/partition-table.bin release/partitions.bin
           cp build/pwnpower.bin release/firmware.bin
-          
+          cp build/ota_data_initial.bin release/
+
           # Both targets use OTA layout - flash to ota_0 partition at 0x20000
           python3 -m esptool --chip ${{ matrix.target.idf_target }} merge_bin \
             --output release/pwnpower-merged.bin \
             --flash_mode dio \
             --flash_size ${{ matrix.target.idf_target == 'esp32c5' && '8MB' || '4MB' }} \
-            0x0 release/bootloader.bin \
+            0x2000 release/bootloader.bin \
             0x8000 release/partitions.bin \
+            0x15000 release/ota_data_initial.bin \
             0x20000 release/firmware.bin
           
           cd release && zip -j ../${{ matrix.target.zip_name }} *
@@ -173,8 +175,9 @@ jobs:
           ## Flashing Instructions
           PwnPower uses OTA partition layouts:
           - Application: firmware.bin at **0x20000**
-          - Bootloader: bootloader.bin at **0x0**
+          - Bootloader: bootloader.bin at **0x2000**
           - Partition Table: partitions.bin at **0x8000**
+          - OTA Data: ota_data_initial.bin at **0x15000**
           - Flash Size: 4MB (ESP32-C3) or 8MB (ESP32-C5)
 
           **Important:** Do NOT use factory offsets (0x10000 for app).
@@ -261,8 +264,9 @@ jobs:
           ## Flashing Instructions
           PwnPower uses OTA partition layouts:
           - Application: firmware.bin at **0x20000**
-          - Bootloader: bootloader.bin at **0x0**
+          - Bootloader: bootloader.bin at **0x2000**
           - Partition Table: partitions.bin at **0x8000**
+          - OTA Data: ota_data_initial.bin at **0x15000**
           - Flash Size: 4MB (ESP32-C3) or 8MB (ESP32-C5)
 
           **Important:** Do NOT use factory offsets (0x10000 for app).

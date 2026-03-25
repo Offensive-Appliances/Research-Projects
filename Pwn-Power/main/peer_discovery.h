@@ -98,6 +98,8 @@ esp_err_t peer_discovery_get_leader(peer_info_t *leader);
  */
 void peer_discovery_register_callback(peer_event_callback_t callback);
 
+void peer_event_handler(peer_event_type_t event, const peer_info_t *peer);
+
 /**
  * @brief Set AP coordination mode
  * @param mode The AP coordination mode to use

@@ -39,6 +39,10 @@ idf_component_register(
         app_update
         spi_flash
         esp_partition
+        fatfs
+        sdmmc
+        esp_driver_sdspi
+        esp_driver_spi
         json
         esp_timer
         esp_driver_gpio
