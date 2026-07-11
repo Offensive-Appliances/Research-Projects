@@ -34,6 +34,7 @@
 - Fixed wizard state not being reset when re-entering the wizard, which could leave it on a stale step.
 
 ### Changed
+- Grew OTA partitions from 0x190000 to 0x1A0000 each (scandata shrunk from 0xC0000 to 0xA0000) to accommodate the larger ESP-IDF v6.0 binary on 4MB flash.
 - Reduced static JSON buffer allocations by ~14KB RAM (report_json, intelligence_json, device_presence_buf, unified_buf).
 - Reduced background scan temp_stations buffer from 128 to 64 entries (~900 bytes saved).
 - `showToast()` now accepts an optional type parameter (`'error'`, `'warning'`, `'success'`) with a colored left border to distinguish severity.
