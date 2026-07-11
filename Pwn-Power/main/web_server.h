@@ -12,6 +12,7 @@ httpd_handle_t start_webserver(void);
 void webserver_set_sta_connected(bool connected);
 bool webserver_get_sta_connected(void);
 uint32_t webserver_get_last_request_time(void);
+void gpio_restore_state(void);
 
 #ifdef __cplusplus
 }

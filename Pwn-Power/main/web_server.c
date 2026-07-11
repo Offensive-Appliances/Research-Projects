@@ -64,6 +64,34 @@ extern bool pwnpower_time_is_synced(void);
 static int s_smartplug_level = 0;
 static bool s_smartplug_inited = false;
 
+#define NVS_GPIO_NAMESPACE "gpio"
+#define NVS_GPIO_KEY "relay_state"
+
+static void gpio_save_state(int val) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_GPIO_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, NVS_GPIO_KEY, (uint8_t)(val ? 1 : 0));
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+void gpio_restore_state(void) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_GPIO_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        uint8_t v = 0;
+        if (nvs_get_u8(h, NVS_GPIO_KEY, &v) == ESP_OK) {
+            s_smartplug_level = v ? 1 : 0;
+        }
+        nvs_close(h);
+    }
+    gpio_pad_select_gpio(SMARTPLUG_GPIO);
+    gpio_set_direction(SMARTPLUG_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(SMARTPLUG_GPIO, s_smartplug_level);
+    s_smartplug_inited = true;
+    ESP_LOGI(TAG, "Restored relay GPIO%d to %s", SMARTPLUG_GPIO, s_smartplug_level ? "ON" : "OFF");
+}
+
 #ifndef HTTPD_503_SERVICE_UNAVAILABLE
 #define HTTPD_503_SERVICE_UNAVAILABLE 503
 #endif
@@ -343,6 +371,7 @@ static esp_err_t auth_login_handler(httpd_req_t *req) {
     if (s_ui_password[0] != '\0' && strcmp(pass->valuestring, s_ui_password) != 0) {
         cJSON_Delete(root);
         httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_type(req, "application/json");
         httpd_resp_sendstr(req, "{\"error\":\"invalid\"}");
         return ESP_FAIL;
     }
@@ -356,9 +385,8 @@ static esp_err_t auth_login_handler(httpd_req_t *req) {
     cJSON_Delete(res);
 
     // also set cookie for browsers to auto-send
-    httpd_resp_set_hdr(req, "Set-Cookie", "auth_token=");
-    char cookie_val[96];
-    snprintf(cookie_val, sizeof(cookie_val), "auth_token=%s; Path=/; HttpOnly", s_auth_token);
+    char cookie_val[128];
+    snprintf(cookie_val, sizeof(cookie_val), "auth_token=%s; Path=/; HttpOnly; SameSite=Strict", s_auth_token);
     httpd_resp_set_hdr(req, "Set-Cookie", cookie_val);
 
     httpd_resp_set_type(req, "application/json");
@@ -605,8 +633,9 @@ static bool attempt_sta_connect(const char *ssid, const char *password,
                                 uint32_t wait_ms) {
     if (!s_wifi_inited) {
         wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-        if (esp_wifi_init(&cfg) != ESP_OK) {
-            ESP_LOGE(TAG, "esp_wifi_init failed");
+        esp_err_t init_err = esp_wifi_init(&cfg);
+        if (init_err != ESP_OK && init_err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "esp_wifi_init failed: %s", esp_err_to_name(init_err));
             return false;
         }
         s_wifi_inited = true;
@@ -987,6 +1016,7 @@ static esp_err_t startattack_handler(httpd_req_t *req) {
 
     // Log attack state change
     if(strcmp(state_str, "started") == 0) {
+        bool any_started = false;
         if(!has_specific_targets) {
             // no sta provided - scan and attack all + broadcast
             wifi_scan_stations();
@@ -1011,11 +1041,11 @@ static esp_err_t startattack_handler(httpd_req_t *req) {
                         &sta_mac[0], &sta_mac[1], &sta_mac[2],
                         &sta_mac[3], &sta_mac[4], &sta_mac[5]);
                         
-                    wifi_manager_start_deauth(target_bssid, target_channel, sta_mac);
+                    if (wifi_manager_start_deauth(target_bssid, target_channel, sta_mac)) any_started = true;
                 }
             }
             // ADD BROADCAST ATTACK
-            wifi_manager_start_deauth(target_bssid, target_channel, NULL);
+            if (wifi_manager_start_deauth(target_bssid, target_channel, NULL)) any_started = true;
             cJSON_Delete(root);
         } else {
             // direct targeted attack to specific clients + broadcast
@@ -1032,10 +1062,14 @@ static esp_err_t startattack_handler(httpd_req_t *req) {
                     i, target_stas[i][0], target_stas[i][1], target_stas[i][2],
                     target_stas[i][3], target_stas[i][4], target_stas[i][5]);
                     
-                wifi_manager_start_deauth(target_bssid, target_channel, target_stas[i]);
+                if (wifi_manager_start_deauth(target_bssid, target_channel, target_stas[i])) any_started = true;
             }
             // Also add broadcast attack
-            wifi_manager_start_deauth(target_bssid, target_channel, NULL);
+            if (wifi_manager_start_deauth(target_bssid, target_channel, NULL)) any_started = true;
+        }
+        if (!any_started) {
+            httpd_resp_send_err(req, HTTPD_503_SERVICE_UNAVAILABLE, "All attack slots are full (max 5)");
+            return ESP_FAIL;
         }
     } else if(strcmp(state_str, "stopped") == 0) {
         ESP_LOGI(TAG, "STOPPING attack on %s", mac_str);
@@ -1166,7 +1200,7 @@ static esp_err_t handshake_handler(httpd_req_t *req) {
         channel = channel_json->valueint;
     }
     int duration = duration_json->valueint;
-    if(channel < 1 || channel > 165 || duration <= 0) {
+    if(channel < 1 || channel > 165 || duration <= 0 || duration > MAX_CAPTURE_DURATION_SEC) {
         cJSON_Delete(root);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad params");
         return ESP_FAIL;
@@ -1556,7 +1590,7 @@ static esp_err_t general_capture_handler(httpd_req_t *req) {
     }
     int channel = atoi(channel_json->valuestring);
     int duration = duration_json->valueint;
-    if(channel < 1 || channel > 165 || duration <= 0) {
+    if(channel < 1 || channel > 165 || duration <= 0 || duration > MAX_CAPTURE_DURATION_SEC) {
         cJSON_Delete(root);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad params");
         return ESP_FAIL;
@@ -1564,9 +1598,13 @@ static esp_err_t general_capture_handler(httpd_req_t *req) {
     cJSON_Delete(root);
     TaskHandle_t gc_task_handle = NULL;
     typedef struct { int channel; int duration; } gc_args_t;
-    static gc_args_t gc_args;
-    gc_args.channel = channel;
-    gc_args.duration = duration;
+    gc_args_t *gc_args = (gc_args_t*)malloc(sizeof(gc_args_t));
+    if (!gc_args) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+        return ESP_FAIL;
+    }
+    gc_args->channel = channel;
+    gc_args->duration = duration;
     cJSON *res = cJSON_CreateObject();
     cJSON_AddStringToObject(res, "status", "started");
     char *out = cJSON_PrintUnformatted(res);
@@ -1574,7 +1612,11 @@ static esp_err_t general_capture_handler(httpd_req_t *req) {
     httpd_resp_sendstr(req, out);
     cJSON_free(out);
     cJSON_Delete(res);
-    xTaskCreate(gc_task, "gc_task", 4096, &gc_args, 5, &gc_task_handle);
+    if (xTaskCreate(gc_task, "gc_task", 4096, gc_args, 5, &gc_task_handle) != pdPASS) {
+        free(gc_args);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to start capture task");
+        return ESP_FAIL;
+    }
     return ESP_OK;
 }
 
@@ -1680,9 +1722,8 @@ static esp_err_t wifi_status_handler(httpd_req_t *req) {
         cJSON_AddBoolToObject(res, "ap_while_connected", true);
     }
     
-    uint32_t uptime = monitor_uptime_get_boot_uptime();
     uint32_t boot_uptime = monitor_uptime_get_boot_uptime();
-    cJSON_AddNumberToObject(res, "uptime", uptime);
+    cJSON_AddNumberToObject(res, "uptime", boot_uptime);
     cJSON_AddNumberToObject(res, "boot_uptime", boot_uptime);
     cJSON_AddBoolToObject(res, "time_synced", pwnpower_time_is_synced());
     if (pwnpower_time_is_synced()) {
@@ -1778,6 +1819,7 @@ static esp_err_t gpio_set_handler(httpd_req_t *req) {
     }
     gpio_set_level(pin, val);
     s_smartplug_level = val;
+    gpio_save_state(val);
 
     cJSON *res = cJSON_CreateObject();
     cJSON_AddStringToObject(res, "status", "ok");

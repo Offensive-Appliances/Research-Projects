@@ -38,6 +38,21 @@ async function downloadReport() {
         if (headers.length) lines.push(headers.join(','));
     };
 
+    // CSV cell encoder: quotes the cell, escapes embedded quotes, and prefixes
+    // a single quote on values that could be interpreted as formulas (=, +, -, @, TAB, CR).
+    // Protects spreadsheets from injected SSIDs/vendor strings.
+    const csv = (val) => {
+        if (val === null || val === undefined) return '';
+        let s = String(val);
+        if (s.length > 0 && '=+-\t\r@'.includes(s[0])) {
+            s = `'${s}`;
+        }
+        if (/[",\n\r]/.test(s)) {
+            s = `"${s.replace(/"/g, '""')}"`;
+        }
+        return s;
+    };
+
     addSection('Report Summary', ['Metric', 'Value', 'Unit']);
     lines.push(`Report Generated,${now.toISOString()},timestamp`);
     lines.push(`Monitoring Duration,${duration},time`);
@@ -115,7 +130,7 @@ async function downloadReport() {
         secStats.hidden_aps.forEach(h => {
             const status = h.revealed ? 'Revealed' : 'Unknown';
             const ssid = h.revealed && h.ssid ? h.ssid : '(not revealed)';
-            lines.push(`${h.bssid},${status},"${ssid}"`);
+            lines.push(`${h.bssid},${status},${csv(ssid)}`);
         });
     }
 
@@ -147,7 +162,7 @@ async function downloadReport() {
             const ssid = net.ssid || "(Hidden)";
             const vendor = net.vendor || "Unknown";
             const lastSeen = computeLastSeenTimestamp(status, net.last_seen);
-            lines.push(`"${ssid}",${net.bssid},"${vendor}",${net.channel},${net.rssi},${net.security},${net.stations},${hidden},${lastSeen}`);
+            lines.push(`${csv(ssid)},${net.bssid},${csv(vendor)},${net.channel},${net.rssi},${net.security},${net.stations},${hidden},${lastSeen}`);
         });
     }
 
@@ -160,7 +175,7 @@ async function downloadReport() {
                     const cVendor = client.vendor || "Unknown";
                     const cSsid = net.ssid || "(Hidden)";
                     const lastSeen = computeLastSeenTimestamp(status, client.last_seen);
-                    lines.push(`${client.mac},"${cVendor}",${net.bssid},"${cSsid}",${client.rssi},${randomMac},${lastSeen}`);
+                    lines.push(`${client.mac},${csv(cVendor)},${net.bssid},${csv(cSsid)},${client.rssi},${randomMac},${lastSeen}`);
                 });
             }
         });
@@ -180,7 +195,7 @@ async function downloadReport() {
             const ssid = net.ssid || "(Hidden)";
             const vendor = net.vendor || "Unknown";
             const threatLevel = net.score >= 15 ? 'Critical' : net.score >= 10 ? 'High' : net.score >= 5 ? 'Medium' : 'Low';
-            lines.push(`"${ssid}",${net.bssid},"${vendor}",${net.channel},${net.rssi},${net.stations},${net.score},${threatLevel}`);
+            lines.push(`${csv(ssid)},${net.bssid},${csv(vendor)},${net.channel},${net.rssi},${net.stations},${net.score},${threatLevel}`);
         });
         if (vulnerable.length === 0) lines.push('No vulnerable networks detected');
     }

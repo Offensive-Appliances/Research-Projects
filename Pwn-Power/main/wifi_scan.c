@@ -48,7 +48,7 @@ static SemaphoreHandle_t scan_mutex = NULL;
 static TaskHandle_t s_wifi_scan_task_handle = NULL;
 static void wifi_scan_task(void *arg);
 static uint8_t known_ap_bssids[100][6];
-static uint8_t known_ap_channels[64];
+static uint8_t known_ap_channels[100];
 static int known_ap_count = 0;
 static int known_channel_count = 0;
 static wifi_ap_record_t *s_scan_ap_records = NULL;
@@ -1056,6 +1056,8 @@ static void stations_sniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
     wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
     wifi_pkt_rx_ctrl_t *rx_ctrl = &pkt->rx_ctrl;
     uint8_t *payload = pkt->payload;
+    // Need at least the 2-byte Frame Control before any dereference
+    if (rx_ctrl->sig_len < 2) return;
     uint8_t fc0 = payload[0];
     uint8_t fc1 = payload[1];
     uint8_t frame_type = (fc0 >> 2) & 0x03;

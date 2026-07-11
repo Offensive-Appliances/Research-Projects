@@ -68,7 +68,7 @@ static char s_ap_ssid[PEER_HOSTNAME_MAX_LEN] = "PwnPower";  // AP SSID (differen
 static uint32_t s_boot_time = 0;
 static bool s_found_other_aps = false;  // True if we detected other PwnPower APs via WiFi scan
 static uint32_t s_last_pwnpower_ap_seen = 0;
-#define PWNPOWER_AP_TIMEOUT_SEC 300 // 5 minutes without seeing AP -> revert to Leader
+#define PWNPOWER_AP_TIMEOUT_MS 300000 // 5 minutes without seeing AP -> revert to Leader
 
 
 // Forward declarations
@@ -402,8 +402,8 @@ static void discovery_task(void *arg) {
         // Periodic scan for other PwnPower APs is now handled by system background scans
         // We just check for timeout here
         if (s_found_other_aps) {
-            if (now - s_last_pwnpower_ap_seen > PWNPOWER_AP_TIMEOUT_SEC) {
-                ESP_LOGI(TAG, "No PwnPower AP seen for %d seconds - reverting to Leader", PWNPOWER_AP_TIMEOUT_SEC);
+            if (now - s_last_pwnpower_ap_seen > PWNPOWER_AP_TIMEOUT_MS) {
+                ESP_LOGI(TAG, "No PwnPower AP seen for %d ms - reverting to Leader", PWNPOWER_AP_TIMEOUT_MS);
                 s_found_other_aps = false;
                 if (s_peer_count <= 1) {
                     s_current_role = PEER_ROLE_LEADER;

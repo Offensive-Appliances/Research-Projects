@@ -167,7 +167,10 @@
                 if (data.authorized || data.has_password === false) {
                     window.location.href = '/';
                 }
-            } catch (e) {}
+            } catch (e) {
+                const err = document.getElementById('error');
+                if (err) { err.textContent = 'Unable to connect to device.'; err.style.display = 'block'; }
+            }
         })();
     </script>
 </body>

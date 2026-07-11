@@ -43,7 +43,7 @@ idf_component_register(
         sdmmc
         esp_driver_sdspi
         esp_driver_spi
-        json
+        cJSON
         esp_timer
         esp_driver_gpio
         mbedtls

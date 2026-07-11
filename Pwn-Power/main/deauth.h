@@ -5,7 +5,7 @@
 #include "freertos/task.h"
 
 // Attack control functions
-void wifi_manager_start_deauth(uint8_t bssid[6], int channel, uint8_t *target_sta);
+bool wifi_manager_start_deauth(uint8_t bssid[6], int channel, uint8_t *target_sta);
 void wifi_manager_stop_deauth(uint8_t bssid[6]);
 
 // Mutex for thread safety

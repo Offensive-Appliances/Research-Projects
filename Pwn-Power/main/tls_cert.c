@@ -3,21 +3,17 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_system.h"
-#include "esp_random.h"
-#include "mbedtls/ctr_drbg.h"
-#include "mbedtls/entropy.h"
 #include "mbedtls/pk.h"
 #include "mbedtls/x509_crt.h"
 #include "mbedtls/x509_csr.h"
 #include "mbedtls/oid.h"
+#include "psa/crypto.h"
 #include <string.h>
 
 #define TAG "TLSCERT"
 #define NVS_NAMESPACE "tls"
 #define NVS_KEY_CERT "cert"
 #define NVS_KEY_KEY  "key"
-
-static int rng_cb(void *ctx, unsigned char *buf, size_t len);
 
 static void clear_nvs_tls_namespace(void) {
     nvs_handle_t h;
@@ -42,13 +38,13 @@ static bool validate_bundle(const tls_cert_bundle_t *bundle) {
         goto fail;
     }
 
-    ret = mbedtls_pk_parse_key(&key, (const unsigned char *)bundle->key_pem, strlen(bundle->key_pem) + 1, NULL, 0, rng_cb, NULL);
+    ret = mbedtls_pk_parse_key(&key, (const unsigned char *)bundle->key_pem, strlen(bundle->key_pem) + 1, NULL, 0);
     if (ret != 0) {
         ESP_LOGW(TAG, "Cached key parse failed: -0x%04x", -ret);
         goto fail;
     }
 
-    ret = mbedtls_pk_check_pair(&crt.pk, &key, rng_cb, NULL);
+    ret = mbedtls_pk_check_pair(&crt.pk, &key);
     if (ret != 0) {
         ESP_LOGW(TAG, "Cached cert/key mismatch: -0x%04x", -ret);
         goto fail;
@@ -95,16 +91,6 @@ static bool load_from_nvs(tls_cert_bundle_t *bundle) {
     return true;
 }
 
-static int rng_cb(void *ctx, unsigned char *buf, size_t len) {
-    (void)ctx;
-    for (size_t i = 0; i < len; i += sizeof(uint32_t)) {
-        uint32_t r = esp_random();
-        size_t copy = (len - i) < sizeof(uint32_t) ? (len - i) : sizeof(uint32_t);
-        memcpy(buf + i, &r, copy);
-    }
-    return 0;
-}
-
 static bool save_to_nvs(const tls_cert_bundle_t *bundle) {
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
@@ -125,41 +111,35 @@ static bool save_to_nvs(const tls_cert_bundle_t *bundle) {
 
 static bool generate_cert(tls_cert_bundle_t *bundle) {
     bool ok = false;
-    mbedtls_ctr_drbg_context drbg;
-    mbedtls_entropy_context entropy;
     mbedtls_pk_context key;
     mbedtls_x509write_cert crt;
+    psa_key_attributes_t key_attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_key_id_t key_id = PSA_KEY_ID_NULL;
     unsigned char serial_raw[8];
 
-    mbedtls_ctr_drbg_init(&drbg);
-    mbedtls_entropy_init(&entropy);
     mbedtls_pk_init(&key);
     mbedtls_x509write_crt_init(&crt);
     memset(serial_raw, 0, sizeof(serial_raw));
 
-    const char *pers = "pwnpower_tls";
-    int ret = mbedtls_ctr_drbg_seed(&drbg, mbedtls_entropy_func, &entropy,
-                                    (const unsigned char *)pers, strlen(pers));
-    if (ret != 0) {
-        ESP_LOGE(TAG, "ctr_drbg_seed failed: -0x%04x", -ret);
+    psa_set_key_type(&key_attributes, PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
+    psa_set_key_bits(&key_attributes, 256);
+    psa_set_key_usage_flags(&key_attributes, PSA_KEY_USAGE_SIGN_HASH | PSA_KEY_USAGE_EXPORT);
+    psa_set_key_algorithm(&key_attributes, PSA_ALG_ECDSA(PSA_ALG_SHA_256));
+    psa_status_t status = psa_generate_key(&key_attributes, &key_id);
+    if (status != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "psa_generate_key failed: %d", status);
         goto cleanup;
     }
 
-    ret = mbedtls_pk_setup(&key, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY));
+    int ret = mbedtls_pk_wrap_psa(&key, key_id);
     if (ret != 0) {
-        ESP_LOGE(TAG, "pk_setup failed: -0x%04x", -ret);
+        ESP_LOGE(TAG, "pk_wrap_psa failed: -0x%04x", -ret);
         goto cleanup;
     }
 
-    ret = mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, mbedtls_pk_ec(key), mbedtls_ctr_drbg_random, &drbg);
-    if (ret != 0) {
-        ESP_LOGE(TAG, "ecp_gen_key failed: -0x%04x", -ret);
-        goto cleanup;
-    }
-
-    ret = mbedtls_ctr_drbg_random(&drbg, serial_raw, sizeof(serial_raw));
-    if (ret != 0) {
-        ESP_LOGE(TAG, "serial gen failed: -0x%04x", -ret);
+    status = psa_generate_random(serial_raw, sizeof(serial_raw));
+    if (status != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "psa_generate_random failed: %d", status);
         goto cleanup;
     }
 
@@ -215,7 +195,7 @@ static bool generate_cert(tls_cert_bundle_t *bundle) {
         goto cleanup;
     }
 
-    ret = mbedtls_x509write_crt_pem(&crt, (unsigned char *)bundle->cert_pem, sizeof(bundle->cert_pem), mbedtls_ctr_drbg_random, &drbg);
+    ret = mbedtls_x509write_crt_pem(&crt, (unsigned char *)bundle->cert_pem, sizeof(bundle->cert_pem));
     if (ret != 0) {
         ESP_LOGE(TAG, "write_crt_pem failed: -0x%04x", -ret);
         goto cleanup;
@@ -227,13 +207,20 @@ static bool generate_cert(tls_cert_bundle_t *bundle) {
 cleanup:
     mbedtls_x509write_crt_free(&crt);
     mbedtls_pk_free(&key);
-    mbedtls_ctr_drbg_free(&drbg);
-    mbedtls_entropy_free(&entropy);
+    psa_reset_key_attributes(&key_attributes);
+    if (key_id != PSA_KEY_ID_NULL) {
+        psa_destroy_key(key_id);
+    }
     return ok;
 }
 
 bool tls_cert_load_or_generate(tls_cert_bundle_t *bundle) {
     if (!bundle) return false;
+    psa_status_t status = psa_crypto_init();
+    if (status != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "psa_crypto_init failed: %d", status);
+        return false;
+    }
     if (load_from_nvs(bundle)) {
         return true;
     }

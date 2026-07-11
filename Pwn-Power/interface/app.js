@@ -293,7 +293,7 @@ function initApp() {
 }
 
 function showLogin(showUnauthorized) {
-    // Backend handles redirect to /login - this is a no-op now
+    window.location.href = '/login';
 }
 
 function showAppShell() {
@@ -445,9 +445,12 @@ function toggleSection(id) {
     section.classList.toggle('expanded');
 }
 
-function showToast(msg) {
+function showToast(msg, type) {
     const toast = document.createElement('div');
     toast.className = 'toast';
+    if (type === 'error') toast.style.borderLeft = '4px solid #f44';
+    else if (type === 'warning') toast.style.borderLeft = '4px solid #fa0';
+    else if (type === 'success') toast.style.borderLeft = '4px solid #4f4';
     toast.textContent = msg;
     document.body.appendChild(toast);
     setTimeout(() => toast.classList.add('show'), 10);
@@ -878,16 +881,10 @@ let activeScanController = null;
 async function triggerScan() {
     if (isBlockedAction('Manual scan')) return;
 
-    console.log('=== triggerScan() called at', new Date().toISOString(), '===');
-    console.log('Current state: scanInProgress=', scanInProgress);
-    console.trace('Call stack:'); // Show where this was called from
-
     // Check actual backend scan status
     const backendScanning = await checkScanStatus();
-    console.log('Backend scanning status:', backendScanning);
 
     if (scanInProgress || backendScanning) {
-        console.warn('Scan already in progress, aborting');
         setBusyState(true, bgScanBusy);
         showToast('Scan already in progress');
         return;
@@ -895,12 +892,10 @@ async function triggerScan() {
 
     // Abort any previous scan request that might be stuck
     if (activeScanController) {
-        console.log('Aborting previous scan controller');
         activeScanController.abort();
         activeScanController = null;
     }
 
-    console.log('Starting new scan, creating AbortController...');
     scanInProgress = true;
     setBusyState(true, bgScanBusy);
     // Store scan start time in sessionStorage to survive page reloads
@@ -1164,6 +1159,7 @@ async function toggleApWhileConnected() {
 }
 
 async function forgetNetwork() {
+    if (!confirm('Forget saved network? The device will disconnect.')) return;
     await fetchJSON('/wifi/disconnect', { method: 'POST' });
     showToast('Saved network cleared');
     loadNetworkStatus();
@@ -1355,7 +1351,7 @@ async function loadDeviceIntelligence() {
         ]);
 
         if (!intelligence || !presence || !deviceList) {
-            showToast('failed to load device intelligence');
+            showToast('Failed to load device intelligence', 'error');
             return;
         }
 
@@ -1975,6 +1971,44 @@ document.addEventListener('DOMContentLoaded', () => {
     initOtaForm();
 });
 
+function initOtaForm() {
+    const form = document.getElementById('ota-form');
+    if (!form) return;
+    form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const fileInput = document.getElementById('ota-file');
+        const status = document.getElementById('ota-status');
+        const btn = form.querySelector('button[type="submit"]');
+        const file = fileInput?.files?.[0];
+        if (!file) {
+            showToast('Select a .bin file first');
+            return;
+        }
+        otaUploadInProgress = true;
+        if (btn) { btn.disabled = true; btn.textContent = 'Uploading...'; }
+        if (status) status.textContent = 'Uploading ' + file.name + ' (' + (file.size / 1024).toFixed(1) + ' KB)...';
+        try {
+            const headers = { 'Content-Type': 'application/octet-stream' };
+            if (authToken) headers['Authorization'] = 'Bearer ' + authToken;
+            const res = await fetch('/ota', { method: 'POST', headers, body: file });
+            const text = await res.text();
+            if (res.ok) {
+                if (status) status.textContent = 'Upload complete. Rebooting...';
+                showToast('Firmware uploaded successfully. Device rebooting.');
+            } else {
+                if (status) status.textContent = 'Error ' + res.status + ': ' + text;
+                showToast('OTA upload failed');
+            }
+        } catch (err) {
+            if (status) status.textContent = 'Upload failed: ' + err.message;
+            showToast('OTA upload failed: ' + err.message);
+        } finally {
+            otaUploadInProgress = false;
+            if (btn) { btn.disabled = false; btn.textContent = 'Upload & Flash'; }
+        }
+    });
+}
+
 window.addEventListener('beforeunload', cleanupAllResources);
 
 // Network Bottleneck Detector Functions
@@ -2476,13 +2510,13 @@ function updateRecommendations(recommendations) {
     `).join('');
 }
 
-function toggleBottleneckDetails() {
+function toggleBottleneckDetails(event) {
     const breakdown = $('#bottleneck-breakdown');
     const isVisible = breakdown.style.display !== 'none';
     breakdown.style.display = isVisible ? 'none' : 'block';
 
     // Update button text
-    event.target.textContent = isVisible ? 'Details' : 'Hide Details';
+    if (event && event.target) event.target.textContent = isVisible ? 'Details' : 'Hide Details';
 }
 
 let wizardCurrentStep = 1;
@@ -2491,10 +2525,12 @@ let wizardMode = 'standalone';
 
 async function checkWizardStatus() {
     const res = await fetchJSON('/wizard/status');
-    return res ? res.completed : true;
+    return res ? res.completed : false;
 }
 
 function showWizard() {
+    wizardCurrentStep = 1;
+    wizardMode = 'standalone';
     const wizard = document.getElementById('wizard-screen');
     const app = document.getElementById('app-shell');
     const login = document.getElementById('login-screen');
@@ -2615,11 +2651,16 @@ async function finishWizard() {
                     body: JSON.stringify({ ap_while_connected: keepAp, auto_connect: autoConnect })
                 });
 
-                await fetchJSON('/wifi/connect', {
+                const wifiRes = await fetchJSON('/wifi/connect', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ ssid, password: pass })
                 });
+                if (wifiRes && wifiRes.status === 'error') {
+                    showToast('WiFi connection failed: ' + (wifiRes.message || 'Check password'), 'error');
+                    if (nextBtn) { nextBtn.disabled = false; nextBtn.textContent = 'Finish'; }
+                    return;
+                }
             }
         }
 

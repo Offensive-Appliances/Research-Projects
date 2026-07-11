@@ -467,6 +467,9 @@ void app_main() {
     monitor_uptime_init();
     ESP_LOGI(TAG, "Heap after monitor_uptime_init: %lu bytes", (unsigned long)esp_get_free_heap_size());
 
+    // restore relay GPIO state from NVS before web server starts
+    gpio_restore_state();
+
     // mark app valid so rollback doesn't screw us after ota
     esp_ota_mark_app_valid_cancel_rollback();
     attack_mutex = xSemaphoreCreateMutex();
@@ -494,7 +497,7 @@ void app_main() {
         nvs_handle_t h;
         if (nvs_open("wizard", NVS_READONLY, &h) == ESP_OK) {
             uint8_t v = 0;
-            nvs_get_u8(h, "complete", &v);
+            nvs_get_u8(h, "completed", &v);
             nvs_close(h);
             wizard_done = (v != 0);
         }

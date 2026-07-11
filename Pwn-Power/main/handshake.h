@@ -7,6 +7,8 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+#define MAX_CAPTURE_DURATION_SEC 3600  // 1 hour upper bound for handshake/general captures
+
 esp_err_t start_handshake_capture(uint8_t bssid[6], int channel, int duration_seconds, uint8_t (*stas)[6], int sta_count, int *eapol_count_out);
 esp_err_t start_handshake_capture_preserve(uint8_t bssid[6], int channel, int duration_seconds, uint8_t (*stas)[6], int sta_count, int *eapol_count_out, bool preserve_eapol);
 

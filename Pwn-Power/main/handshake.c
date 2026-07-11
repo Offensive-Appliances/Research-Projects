@@ -402,6 +402,8 @@ static void sniff_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     if (frame_type != 2) return;
     int hdr_len = 24;
     if ((subtype & 0x08) != 0) hdr_len += 2;
+    // Four-address (WDS/mesh) frames: both To DS and From DS set -> +6 bytes for Address 4
+    if (((d[1] & 0x03) == 0x03)) hdr_len += 6;
     if (s_capture_all) {
         pcap_write_packet(d, (uint32_t)len);
         return;
@@ -451,7 +453,7 @@ esp_err_t start_handshake_capture(uint8_t bssid[6], int channel, int duration_se
     s_pcap_name[sizeof(s_pcap_name)-1] = '\0';
     strncpy(s_pcap_storage_name, "HS.CAP", sizeof(s_pcap_storage_name)-1);
     s_pcap_storage_name[sizeof(s_pcap_storage_name)-1] = '\0';
-    if (!bssid || channel < 1 || channel > 165 || duration_seconds <= 0) return ESP_ERR_INVALID_ARG;
+    if (!bssid || channel < 1 || channel > 165 || duration_seconds <= 0 || duration_seconds > MAX_CAPTURE_DURATION_SEC) return ESP_ERR_INVALID_ARG;
     if (eapol_count_out) *eapol_count_out = 0;
 
     ESP_LOGI(TAG, "start: channel=%d duration=%ds sta_count=%d", channel, duration_seconds, sta_count);
@@ -519,9 +521,11 @@ esp_err_t start_handshake_capture(uint8_t bssid[6], int channel, int duration_se
 
     pcap_flush_pending_packets();
     pcap_close_storage();
+#if HS_PCAP_FILE_BACKED
     if (s_pcap_queue_drops > 0) {
         ESP_LOGW(TAG, "pcap queue dropped %lu packets during capture", (unsigned long)s_pcap_queue_drops);
     }
+#endif
 
     restore_wifi_mode_with_retry(original_mode, "start_handshake_capture");
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -548,7 +552,7 @@ esp_err_t start_handshake_capture_preserve(uint8_t bssid[6], int channel, int du
     s_pcap_name[sizeof(s_pcap_name)-1] = '\0';
     strncpy(s_pcap_storage_name, "HS.CAP", sizeof(s_pcap_storage_name)-1);
     s_pcap_storage_name[sizeof(s_pcap_storage_name)-1] = '\0';
-    if (!bssid || channel < 1 || channel > 165 || duration_seconds <= 0) return ESP_ERR_INVALID_ARG;
+    if (!bssid || channel < 1 || channel > 165 || duration_seconds <= 0 || duration_seconds > MAX_CAPTURE_DURATION_SEC) return ESP_ERR_INVALID_ARG;
     if (eapol_count_out) *eapol_count_out = 0;
 
     ESP_LOGI(TAG, "start_preserve: channel=%d duration=%ds sta_count=%d preserve_eapol=%s", 
@@ -635,9 +639,11 @@ esp_err_t start_handshake_capture_preserve(uint8_t bssid[6], int channel, int du
 
     pcap_flush_pending_packets();
     pcap_close_storage();
+#if HS_PCAP_FILE_BACKED
     if (s_pcap_queue_drops > 0) {
         ESP_LOGW(TAG, "pcap queue dropped %lu packets during preserve capture", (unsigned long)s_pcap_queue_drops);
     }
+#endif
 
     restore_wifi_mode_with_retry(original_mode, "start_handshake_capture_preserve");
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -667,7 +673,7 @@ esp_err_t start_general_capture(int channel, int duration_seconds) {
     s_pcap_name[sizeof(s_pcap_name)-1] = '\0';
     strncpy(s_pcap_storage_name, "CAP.CAP", sizeof(s_pcap_storage_name)-1);
     s_pcap_storage_name[sizeof(s_pcap_storage_name)-1] = '\0';
-    if (channel < 1 || channel > 165 || duration_seconds <= 0) return ESP_ERR_INVALID_ARG;
+    if (channel < 1 || channel > 165 || duration_seconds <= 0 || duration_seconds > MAX_CAPTURE_DURATION_SEC) return ESP_ERR_INVALID_ARG;
     wifi_mode_t original_mode;
     esp_wifi_get_mode(&original_mode);
     if (original_mode == WIFI_MODE_APSTA) {
@@ -712,9 +718,11 @@ esp_err_t start_general_capture(int channel, int duration_seconds) {
     esp_wifi_set_promiscuous_rx_cb(NULL);
     pcap_flush_pending_packets();
     pcap_close_storage();
+#if HS_PCAP_FILE_BACKED
     if (s_pcap_queue_drops > 0) {
         ESP_LOGW(TAG, "pcap queue dropped %lu packets during general capture", (unsigned long)s_pcap_queue_drops);
     }
+#endif
     s_capture_all = false;
     restore_wifi_mode_with_retry(original_mode, "start_general_capture");
     vTaskDelay(pdMS_TO_TICKS(100));

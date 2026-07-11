@@ -206,14 +206,14 @@ esp_err_t wifi_manager_broadcast_deauth(uint8_t bssid[6], int channel, uint8_t *
     return ESP_OK;
 }
 
-void wifi_manager_start_deauth(uint8_t bssid[6], int channel, uint8_t *station_mac) {
+bool wifi_manager_start_deauth(uint8_t bssid[6], int channel, uint8_t *station_mac) {
     ESP_LOGI(TAG, "Starting deauth attack on BSSID %02X:%02X:%02X:%02X:%02X:%02X (ch%d)",
              bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], channel);
 
     // Skip if trying to deauth the AP itself (invalid)
     if (station_mac && memcmp(station_mac, bssid, 6) == 0) {
         ESP_LOGW(TAG, "Ignoring attempt to deauth AP itself - this is invalid");
-        return;
+        return false;
     }
 
     if (station_mac) {
@@ -229,13 +229,14 @@ void wifi_manager_start_deauth(uint8_t bssid[6], int channel, uint8_t *station_m
         attack_mutex = xSemaphoreCreateMutex();
         if(attack_mutex == NULL) {
             ESP_LOGE(TAG, "Failed to create attack mutex!");
-            return;
+            return false;
         }
     }
 
     xSemaphoreTake(attack_mutex, portMAX_DELAY);
     
     // Find existing or empty slot
+    bool slot_found = false;
     for(int i=0; i<MAX_ACTIVE_ATTACKS; i++) {
         // Check for an empty slot or a slot with the same attack parameters
         bool slot_match = false;
@@ -269,13 +270,15 @@ void wifi_manager_start_deauth(uint8_t bssid[6], int channel, uint8_t *station_m
             active_attacks[i].active = true;
             active_attacks[i].is_broadcast = (station_mac == NULL);
             ESP_LOGI(TAG, "Added attack to slot %d, is_broadcast=%d", i, active_attacks[i].is_broadcast);
+            slot_found = true;
             break;
         }
-        
-        // If we've checked all slots and found no match, skip this attack if all slots are full
-        if (i == MAX_ACTIVE_ATTACKS - 1) {
-            ESP_LOGW(TAG, "All attack slots are full, skipping this attack");
-        }
+    }
+    
+    if (!slot_found) {
+        ESP_LOGW(TAG, "All attack slots are full, skipping this attack");
+        xSemaphoreGive(attack_mutex);
+        return false;
     }
     
     // Start task if not already running
@@ -286,6 +289,7 @@ void wifi_manager_start_deauth(uint8_t bssid[6], int channel, uint8_t *station_m
     }
     
     xSemaphoreGive(attack_mutex);
+    return true;
 }
 
 void wifi_manager_stop_deauth(uint8_t bssid[6]) {
