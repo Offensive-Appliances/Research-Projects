@@ -2224,8 +2224,25 @@ static esp_err_t history_samples_handler(httpd_req_t *req) {
         }
     }
 
-    // limit samples to prevent oom (process in chunks)
+    // limit samples to prevent oom (process in chunks). This is an upper bound on how
+    // many samples we READ (memory safety); the actual time window is enforced by
+    // cutoff_ts below so the response honours `days` regardless of scan cadence.
     uint32_t max_samples = MIN(5040, (uint32_t)(days * 720.0f));  // 30 samples per hour, cap at 7 days
+
+    // Enforce the requested window by real timestamp rather than sample count. The
+    // count heuristic above assumes a fixed 120s scan interval, but the interval is
+    // user-configurable (60-3600s) and scans are deferred/interrupted, so a count-based
+    // window shows the wrong span (e.g. "last 7 days" returning months of data at a slow
+    // interval). Only applied when the clock is synced; otherwise cutoff_ts stays 0 and
+    // behaviour is unchanged. Samples carry absolute epochs, so this is exact.
+    uint32_t cutoff_ts = 0;
+    time_t now_time = time(NULL);
+    if (now_time > 1700000000) {  // clock is synced (matches sanitize epoch_cutoff)
+        uint32_t window_sec = (uint32_t)(days * 86400.0f);
+        if ((uint32_t)now_time > window_sec) {
+            cutoff_ts = (uint32_t)now_time - window_sec;
+        }
+    }
 
     uint32_t history_count = scan_storage_get_history_count();
     ESP_LOGD(TAG, "history_samples_handler: total_count=%u, max_samples=%u, since_ts=%lu",
@@ -2272,6 +2289,12 @@ static esp_err_t history_samples_handler(httpd_req_t *req) {
 
             // incremental update: skip samples older than or equal to since_ts
             if (since_ts > 0 && epoch_ts > 0 && epoch_ts <= since_ts) {
+                continue;
+            }
+
+            // window enforcement: skip samples older than the requested `days` window
+            // (only active when the clock is synced; see cutoff_ts computation above)
+            if (cutoff_ts > 0 && epoch_ts > 0 && epoch_ts < cutoff_ts) {
                 continue;
             }
 

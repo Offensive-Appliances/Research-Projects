@@ -605,15 +605,26 @@ esp_err_t scan_storage_init(void) {
         events_ring.count = storage_index.event_count;
         
         #if !CONFIG_PWNPOWER_HISTORY_STORAGE_SDMMC
-        // validate history ring by checking oldest sample (index 0 if ring hasn't wrapped)
+        // Validate the history ring by checking the NEWEST sample (the most recently
+        // written slot), which is always intact in normal operation.
+        //
+        // We must NOT check the oldest slot here. Once the ring is full, oldest_idx
+        // equals write_idx, and the ring writer erases an entire flash sector ahead of
+        // write_idx before refilling it one sample at a time (see flash_manager_ring_write).
+        // So the oldest slot reads back as 0xFF (ap_count/client_count == 255) for almost
+        // the entire lap, which used to false-trigger a full reset and wipe ALL history on
+        // nearly every reboot once the buffer had filled. Per-sample CRC8 checks in
+        // sanitize_history_samples() already drop any genuinely-corrupt individual samples
+        // on read, so a coarse boot-time check only needs to detect a wholesale erasure,
+        // which the newest slot reveals reliably.
         if (history_ring.count > 0) {
-            uint32_t oldest_idx = (history_ring.count < history_ring.max_items) ? 0 : history_ring.write_idx;
+            uint32_t newest_idx = (history_ring.write_idx + history_ring.max_items - 1) % history_ring.max_items;
             history_sample_t test_sample;
-            uint32_t offset = history_ring.base_offset + (oldest_idx * history_ring.item_size);
+            uint32_t offset = history_ring.base_offset + (newest_idx * history_ring.item_size);
             if (flash_manager_read(&flash_mgr, offset, &test_sample, sizeof(test_sample)) == ESP_OK) {
                 if (test_sample.ap_count == 255 || test_sample.client_count == 255 ||
                     !HISTORY_IS_TIME_VALID(test_sample.flags)) {
-                    ESP_LOGW(TAG, "history ring oldest sample invalid (flash erased?), resetting count from %lu to 0",
+                    ESP_LOGW(TAG, "history ring newest sample invalid (flash erased?), resetting count from %lu to 0",
                              (unsigned long)history_ring.count);
                     history_ring.count = 0;
                     history_ring.write_idx = 0;
